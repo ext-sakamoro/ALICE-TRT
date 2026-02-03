@@ -1,0 +1,46 @@
+[package]
+name = "alice-trt"
+version = "0.1.0"
+edition = "2021"
+authors = ["Moroya Sakamoto"]
+description = "GPU Ternary Inference Engine - Don't move data. Move the law."
+license = "AGPL-3.0"
+repository = "https://github.com/ext-sakamoro/ALICE-TRT"
+keywords = ["gpu", "inference", "ternary", "bitnet", "wgpu", "cuda", "tensorrt"]
+categories = ["science", "gpu"]
+
+[lib]
+name = "alice_trt"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+cuda = ["dep:cc"]
+
+[dependencies]
+wgpu = "23"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+alice-ml = { path = "../ALICE-ML" }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+
+[[bench]]
+name = "gpu_matmul"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true
+
+[profile.bench]
+lto = true
+opt-level = 3
