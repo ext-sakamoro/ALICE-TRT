@@ -310,6 +310,18 @@ The Tensor Core has no idea it's processing ternary data.
 It sees valid FP16. It computes. We win.
 ```
 
+## Cross-Crate Bridges
+
+ALICE-TRT connects to other ALICE ecosystem crates via feature-gated bridge modules:
+
+| Bridge | Feature | Target Crate | Description |
+|--------|---------|--------------|-------------|
+| `physics_bridge` | `physics` | [ALICE-Physics](../ALICE-Physics) | GPU ternary inference for physics control policies, batched force computation |
+
+### Cargo Profile
+
+Standardized `[profile.bench]` with `lto = "thin"`, `codegen-units = 1`, `debug = false` for consistent benchmarking across ALICE crates.
+
 ## ALICE Ecosystem
 
 | Crate | Role |

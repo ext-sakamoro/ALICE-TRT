@@ -16,12 +16,14 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 cuda = ["dep:cc"]
+physics = ["dep:alice-physics"]  # GPU ternary inference for physics control policies
 
 [dependencies]
 wgpu = "23"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 alice-ml = { path = "../ALICE-ML" }
+alice-physics = { path = "../ALICE-Physics", optional = true, default-features = false, features = ["std"] }
 
 [build-dependencies]
 cc = { version = "1", optional = true }
@@ -42,5 +44,7 @@ panic = "abort"
 strip = true
 
 [profile.bench]
-lto = true
+lto = "thin"
 opt-level = 3
+codegen-units = 1
+debug = false
