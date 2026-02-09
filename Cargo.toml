@@ -17,6 +17,7 @@ crate-type = ["rlib", "cdylib"]
 default = []
 cuda = ["dep:cc"]
 physics = ["dep:alice-physics"]  # GPU ternary inference for physics control policies
+sdf = ["dep:alice-sdf"]  # GPU neural SDF approximation via ternary networks
 
 [dependencies]
 wgpu = "23"
@@ -24,6 +25,7 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 alice-ml = { path = "../ALICE-ML" }
 alice-physics = { path = "../ALICE-Physics", optional = true, default-features = false, features = ["std"] }
+alice-sdf = { path = "../ALICE-SDF", optional = true, default-features = false }
 
 [build-dependencies]
 cc = { version = "1", optional = true }

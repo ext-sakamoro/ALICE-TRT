@@ -105,6 +105,8 @@ pub mod inference;
 pub mod cuda;
 #[cfg(feature = "physics")]
 pub mod physics_bridge;
+#[cfg(feature = "sdf")]
+pub mod sdf_bridge;
 
 // ============================================================================
 // Core Re-exports
