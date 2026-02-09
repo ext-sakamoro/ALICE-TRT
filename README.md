@@ -317,6 +317,33 @@ ALICE-TRT connects to other ALICE ecosystem crates via feature-gated bridge modu
 | Bridge | Feature | Target Crate | Description |
 |--------|---------|--------------|-------------|
 | `physics_bridge` | `physics` | [ALICE-Physics](../ALICE-Physics) | GPU ternary inference for physics control policies, batched force computation |
+| `sdf_bridge` | `sdf` | [ALICE-SDF](../ALICE-SDF) | GPU neural SDF approximation via ternary networks for real-time distance field queries |
+
+### SDF Bridge (feature: `sdf`)
+
+GPU-accelerated neural SDF approximation via ternary networks. Fits a lightweight ternary neural network to approximate an SDF node's distance field, enabling real-time GPU evaluation of complex CSG trees.
+
+```toml
+[dependencies]
+alice-trt = { path = "../ALICE-TRT", features = ["sdf"] }
+```
+
+```rust
+use alice_trt::sdf_bridge::{GpuNeuralSdf, NeuralSdfConfig};
+
+let config = NeuralSdfConfig {
+    hidden_dim: 64,
+    num_layers: 4,
+    training_points: 100_000,
+    ..Default::default()
+};
+
+// Fit ternary NN to SDF
+let neural_sdf = GpuNeuralSdf::fit(&device, &sdf_node, bounds_min, bounds_max, &config)?;
+
+// Batch evaluate on GPU
+let distances = neural_sdf.eval_batch(&device, &compute, &query_points)?;
+```
 
 ### Cargo Profile
 
