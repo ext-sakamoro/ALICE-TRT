@@ -107,6 +107,12 @@ pub mod cuda;
 pub mod physics_bridge;
 #[cfg(feature = "sdf")]
 pub mod sdf_bridge;
+#[cfg(feature = "db")]
+pub mod db_bridge;
+#[cfg(feature = "view")]
+pub mod view_bridge;
+#[cfg(feature = "voice")]
+pub mod voice_bridge;
 
 // ============================================================================
 // Core Re-exports
