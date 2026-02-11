@@ -345,6 +345,36 @@ let neural_sdf = GpuNeuralSdf::fit(&device, &sdf_node, bounds_min, bounds_max, &
 let distances = neural_sdf.eval_batch(&device, &compute, &query_points)?;
 ```
 
+### ALICE-DB Bridge (feature: `db`)
+
+Inference metrics persistence for model performance tracking.
+
+- `InferenceRecord` — 34-byte binary serialization (model_hash, latency_us, batch_size, throughput_fps)
+- `TrtDbStore` — Store/query inference metrics by model and time range
+- `avg_latency_us()` — Compute average latency for a model
+
+Enable: `alice-trt = { features = ["db"] }`
+
+### ALICE-View Bridge (feature: `view`)
+
+Neural upscaling for GPU-rendered content (DLSS-style).
+
+- `NeuralUpscaler` — Quality tiers: Performance (4x) / Balanced (2.5x) / Quality (1.7x) / UltraQuality (1.3x)
+- `render_scale()` / `internal_resolution()` — Compute internal render resolution
+- `estimate_psnr()` — Quality estimation
+
+Enable: `alice-trt = { features = ["view"] }`
+
+### ALICE-Voice Bridge (feature: `voice`)
+
+GPU-accelerated voice feature extraction.
+
+- `GpuVoiceExtractor` — Mel-frequency, energy, ZCR, spectral centroid extraction
+- `MelConfig` — Configurable mel filterbank (n_mels, fmin, fmax)
+- `extract_features()` — Frame-by-frame voice feature extraction
+
+Enable: `alice-trt = { features = ["voice"] }`
+
 ### Cargo Profile
 
 Standardized `[profile.bench]` with `lto = "thin"`, `codegen-units = 1`, `debug = false` for consistent benchmarking across ALICE crates.
