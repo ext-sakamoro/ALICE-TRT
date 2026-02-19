@@ -8,6 +8,7 @@ license = "AGPL-3.0"
 repository = "https://github.com/ext-sakamoro/ALICE-TRT"
 keywords = ["gpu", "inference", "ternary", "bitnet", "wgpu", "cuda", "tensorrt"]
 categories = ["science", "gpu"]
+publish = false
 
 [lib]
 name = "alice_trt"
