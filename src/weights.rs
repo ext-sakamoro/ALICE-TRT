@@ -118,38 +118,43 @@ impl GpuTernaryWeight {
             .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn out_features(&self) -> usize {
         self.out_features
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn in_features(&self) -> usize {
         self.in_features
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn scale(&self) -> f32 {
         self.scale
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn words_per_row(&self) -> usize {
         self.words_per_row
     }
 
     /// VRAM usage in bytes (bitplanes only, excludes params)
-    #[inline]
+    #[inline(always)]
     pub fn memory_bytes(&self) -> usize {
         let total_words = self.out_features * self.words_per_row;
         total_words * 4 * 2 // plus + minus bitplanes, 4 bytes per u32
     }
 
     /// Compression ratio vs FP32
-    #[inline]
+    #[inline(always)]
     pub fn compression_ratio(&self) -> f32 {
         let fp32_size = self.out_features * self.in_features * 4;
-        fp32_size as f32 / self.memory_bytes() as f32
+        let mem = self.memory_bytes();
+        if mem == 0 {
+            return 0.0;
+        }
+        let inv_mem = 1.0 / mem as f32;
+        fp32_size as f32 * inv_mem
     }
 }
 

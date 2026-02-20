@@ -74,7 +74,7 @@ impl GpuInferenceEngine {
     }
 
     /// Number of layers
-    #[inline]
+    #[inline(always)]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
@@ -168,7 +168,8 @@ impl GpuInferenceEngine {
         if actual == 0 {
             0.0
         } else {
-            fp32 as f32 / actual as f32
+            let inv_actual = 1.0 / actual as f32;
+            fp32 as f32 * inv_actual
         }
     }
 }
