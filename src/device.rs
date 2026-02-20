@@ -145,10 +145,13 @@ impl GpuDevice {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
+            // SAFETY: Channel receiver is alive — drop only after recv() below
+            tx.send(result).expect("GPU readback channel closed unexpectedly");
         });
         self.poll_wait();
-        rx.recv().unwrap().unwrap();
+        rx.recv()
+            .expect("GPU map_async callback was never invoked — device may be lost")
+            .expect("GPU buffer mapping failed — BufferAsyncError");
 
         let data = slice.get_mapped_range();
         let result = data.to_vec();
