@@ -505,8 +505,12 @@ impl fmt::Display for CudaTernaryEngine {
     }
 }
 
-// Safety: CudaTernaryEngine holds no thread-local state.
-// The underlying CUDA context is process-global.
-// CUDA API calls are internally synchronized.
+// SAFETY: `DeviceBuffer` and `DeviceWeights` wrap raw CUDA device pointers
+// (`CUdeviceptr` / `*mut f16`).  Sending these across threads is safe because:
+//   1. The underlying CUDA context is process-global and not tied to any
+//      particular OS thread (unlike OpenGL contexts).
+//   2. All CUDA API calls that mutate device memory go through `&mut self`
+//      or are internally serialised by the CUDA driver's own locking.
+//   3. Neither type holds thread-local state or a non-Send OS handle.
 unsafe impl Send for DeviceBuffer {}
 unsafe impl Send for DeviceWeights {}

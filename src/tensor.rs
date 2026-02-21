@@ -90,7 +90,12 @@ impl GpuTensor {
         self.len * std::mem::size_of::<f32>()
     }
 
-    /// Size in bytes (for buffer operations)
+    /// Size in bytes as `u64`, required by the CUDA/Vulkan buffer-allocation
+    /// APIs that accept `VkDeviceSize` / `CUdeviceptr` offsets.  Kept separate
+    /// from [`memory_bytes`] (which returns `usize`) so callers never need a
+    /// cast at the FFI boundary.  Not yet wired up in the current engine path
+    /// but will be used when the planned zero-copy device-buffer pool lands.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn buffer_size(&self) -> u64 {
         (self.len * std::mem::size_of::<f32>()) as u64
