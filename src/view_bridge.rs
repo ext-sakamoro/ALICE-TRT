@@ -8,10 +8,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum UpscaleQuality {
-    Performance = 0,    // 1/4 res → full
-    Balanced = 1,       // 1/2 res → full
-    Quality = 2,        // 3/4 res → full
-    UltraQuality = 3,   // near-native
+    Performance = 0,  // 1/4 res → full
+    Balanced = 1,     // 1/2 res → full
+    Quality = 2,      // 3/4 res → full
+    UltraQuality = 3, // near-native
 }
 
 /// Neural upscale request
@@ -70,7 +70,10 @@ pub struct NeuralUpscaler {
 
 impl NeuralUpscaler {
     pub fn new() -> Self {
-        Self { frames_upscaled: 0, total_inference_us: 0 }
+        Self {
+            frames_upscaled: 0,
+            total_inference_us: 0,
+        }
     }
 
     /// Process an upscale request (returns metadata; actual pixel data via View)
@@ -90,7 +93,9 @@ impl NeuralUpscaler {
     }
 
     pub fn avg_inference_us(&self) -> f64 {
-        if self.frames_upscaled == 0 { return 0.0; }
+        if self.frames_upscaled == 0 {
+            return 0.0;
+        }
         self.total_inference_us as f64 / self.frames_upscaled as f64
     }
 }
@@ -132,6 +137,112 @@ mod tests {
 
     #[test]
     fn test_psnr_quality_correlation() {
-        assert!(estimate_psnr(UpscaleQuality::Performance) < estimate_psnr(UpscaleQuality::UltraQuality));
+        assert!(
+            estimate_psnr(UpscaleQuality::Performance)
+                < estimate_psnr(UpscaleQuality::UltraQuality)
+        );
+    }
+
+    #[test]
+    fn test_internal_resolution_all_qualities() {
+        let qualities = [
+            UpscaleQuality::Performance,
+            UpscaleQuality::Balanced,
+            UpscaleQuality::Quality,
+            UpscaleQuality::UltraQuality,
+        ];
+        for q in qualities {
+            let (w, h) = internal_resolution(3840, 2160, q);
+            assert!(w >= 1, "width must be at least 1 for {:?}", q);
+            assert!(h >= 1, "height must be at least 1 for {:?}", q);
+            assert!(w <= 3840, "width must not exceed output for {:?}", q);
+            assert!(h <= 2160, "height must not exceed output for {:?}", q);
+        }
+    }
+
+    #[test]
+    fn test_internal_resolution_minimum_clamp() {
+        // Even with tiny output, result must be at least 1x1
+        let (w, h) = internal_resolution(1, 1, UpscaleQuality::Performance);
+        assert!(w >= 1);
+        assert!(h >= 1);
+    }
+
+    #[test]
+    fn test_upscaler_avg_inference_zero_frames() {
+        let up = NeuralUpscaler::new();
+        assert_eq!(up.avg_inference_us(), 0.0);
+        assert_eq!(up.frames_upscaled, 0);
+    }
+
+    #[test]
+    fn test_upscaler_multiple_frames() {
+        let mut up = NeuralUpscaler::new();
+        let req = UpscaleRequest {
+            input_width: 960,
+            input_height: 540,
+            output_width: 1920,
+            output_height: 1080,
+            quality: UpscaleQuality::Balanced,
+            motion_vectors: false,
+        };
+        for _ in 0..10 {
+            up.upscale(&req);
+        }
+        assert_eq!(up.frames_upscaled, 10);
+        assert!(up.avg_inference_us() > 0.0);
+    }
+
+    #[test]
+    fn test_upscale_quality_repr() {
+        assert_eq!(UpscaleQuality::Performance as u8, 0);
+        assert_eq!(UpscaleQuality::Balanced as u8, 1);
+        assert_eq!(UpscaleQuality::Quality as u8, 2);
+        assert_eq!(UpscaleQuality::UltraQuality as u8, 3);
+    }
+
+    #[test]
+    fn test_render_scale_bounds() {
+        let qualities = [
+            UpscaleQuality::Performance,
+            UpscaleQuality::Balanced,
+            UpscaleQuality::Quality,
+            UpscaleQuality::UltraQuality,
+        ];
+        for q in qualities {
+            let s = render_scale(q);
+            assert!(
+                s > 0.0 && s < 1.0,
+                "render_scale({:?}) = {} out of (0, 1)",
+                q,
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn test_psnr_all_values_positive() {
+        let qualities = [
+            UpscaleQuality::Performance,
+            UpscaleQuality::Balanced,
+            UpscaleQuality::Quality,
+            UpscaleQuality::UltraQuality,
+        ];
+        for q in qualities {
+            assert!(
+                estimate_psnr(q) > 0.0,
+                "PSNR should be positive for {:?}",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn test_psnr_monotonically_increasing() {
+        let p = estimate_psnr(UpscaleQuality::Performance);
+        let b = estimate_psnr(UpscaleQuality::Balanced);
+        let q = estimate_psnr(UpscaleQuality::Quality);
+        let u = estimate_psnr(UpscaleQuality::UltraQuality);
+        assert!(p < b && b < q && q < u);
     }
 }

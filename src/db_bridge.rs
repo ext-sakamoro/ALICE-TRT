@@ -29,7 +29,9 @@ impl InferenceRecord {
     }
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 34 { return None; }
+        if buf.len() < 34 {
+            return None;
+        }
         let mut model_hash = [0u8; 16];
         model_hash.copy_from_slice(&buf[0..16]);
         Some(Self {
@@ -50,7 +52,10 @@ pub struct TrtDbStore {
 
 impl TrtDbStore {
     pub fn new(db: AliceDB) -> Self {
-        Self { db, total_records: 0 }
+        Self {
+            db,
+            total_records: 0,
+        }
     }
 
     /// Store an inference record keyed by model_hash + timestamp
@@ -79,7 +84,9 @@ impl TrtDbStore {
     /// Compute average latency for a model in a time window
     pub fn avg_latency_us(&self, model_hash: &[u8; 16], from_ms: u64) -> Option<f64> {
         let records = self.query_by_model(model_hash, from_ms);
-        if records.is_empty() { return None; }
+        if records.is_empty() {
+            return None;
+        }
         let sum: u64 = records.iter().map(|r| r.latency_us as u64).sum();
         Some(sum as f64 / records.len() as f64)
     }

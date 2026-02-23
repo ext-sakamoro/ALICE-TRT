@@ -46,15 +46,22 @@ pub fn mel_center_frequencies(n_mels: usize, sample_rate: u32) -> Vec<f32> {
 
 /// Compute frame energy from PCM samples
 pub fn frame_energy(samples: &[f32]) -> f32 {
-    if samples.is_empty() { return 0.0; }
+    if samples.is_empty() {
+        return 0.0;
+    }
     let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
     (sum_sq / samples.len() as f32).sqrt()
 }
 
 /// Extract simple voice features for TRT inference input
 pub fn extract_features(samples: &[f32], config: &MelConfig) -> Vec<f32> {
-    let n_frames = samples.len().saturating_sub(config.n_fft) / config.hop_length + 1;
-    if n_frames == 0 { return vec![]; }
+    if samples.len() < config.n_fft {
+        return vec![];
+    }
+    let n_frames = (samples.len() - config.n_fft) / config.hop_length + 1;
+    if n_frames == 0 {
+        return vec![];
+    }
 
     let mut features = Vec::with_capacity(n_frames * 3);
     for i in 0..n_frames {
@@ -74,9 +81,12 @@ pub fn extract_features(samples: &[f32], config: &MelConfig) -> Vec<f32> {
         let zcr_rate = zcr as f32 / frame.len().max(1) as f32;
 
         // Spectral centroid proxy (energy-weighted position)
-        let centroid: f32 = frame.iter().enumerate()
+        let centroid: f32 = frame
+            .iter()
+            .enumerate()
             .map(|(k, &s)| k as f32 * s.abs())
-            .sum::<f32>() / frame.iter().map(|s| s.abs()).sum::<f32>().max(1e-10);
+            .sum::<f32>()
+            / frame.iter().map(|s| s.abs()).sum::<f32>().max(1e-10);
 
         features.push(energy);
         features.push(zcr_rate);
@@ -93,7 +103,10 @@ pub struct GpuVoiceExtractor {
 
 impl GpuVoiceExtractor {
     pub fn new(config: MelConfig) -> Self {
-        Self { config, frames_processed: 0 }
+        Self {
+            config,
+            frames_processed: 0,
+        }
     }
 
     pub fn extract(&mut self, samples: &[f32]) -> Vec<f32> {
@@ -151,5 +164,64 @@ mod tests {
         let config = MelConfig::default();
         let features = extract_features(&[], &config);
         assert!(features.is_empty());
+    }
+
+    #[test]
+    fn test_mel_config_default_values() {
+        let config = MelConfig::default();
+        assert_eq!(config.sample_rate, 16000);
+        assert_eq!(config.n_fft, 512);
+        assert_eq!(config.n_mels, 40);
+        assert_eq!(config.hop_length, 160);
+    }
+
+    #[test]
+    fn test_frame_energy_empty() {
+        assert_eq!(frame_energy(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_frame_energy_dc_signal() {
+        // Constant signal: RMS = abs(value)
+        let dc = vec![3.0f32; 100];
+        let e = frame_energy(&dc);
+        assert!((e - 3.0).abs() < 1e-4, "DC energy: {}", e);
+    }
+
+    #[test]
+    fn test_mel_frequencies_count() {
+        for n_mels in [10, 20, 40, 80] {
+            let freqs = mel_center_frequencies(n_mels, 16000);
+            assert_eq!(freqs.len(), n_mels);
+        }
+    }
+
+    #[test]
+    fn test_mel_frequencies_below_nyquist() {
+        let freqs = mel_center_frequencies(40, 16000);
+        for f in &freqs {
+            assert!(*f < 8000.0, "frequency {} exceeds Nyquist", f);
+            assert!(*f > 0.0, "frequency {} must be positive", f);
+        }
+    }
+
+    #[test]
+    fn test_short_input_returns_empty() {
+        let config = MelConfig::default(); // n_fft = 512
+                                           // Input shorter than n_fft => no frames
+        let short_input = vec![0.0f32; 100];
+        let features = extract_features(&short_input, &config);
+        assert!(features.is_empty());
+    }
+
+    #[test]
+    fn test_extractor_increments_frames() {
+        let mut ext = GpuVoiceExtractor::new(MelConfig::default());
+        assert_eq!(ext.frames_processed, 0);
+        let samples = vec![0.0f32; 1600];
+        ext.extract(&samples);
+        assert_eq!(ext.frames_processed, 1);
+        ext.extract(&samples);
+        assert_eq!(ext.frames_processed, 2);
     }
 }

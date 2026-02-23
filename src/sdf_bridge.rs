@@ -14,7 +14,9 @@
 
 use alice_sdf::prelude::{eval, SdfNode, Vec3};
 
-use crate::{Activation, GpuDevice, GpuInferenceEngine, GpuTensor, GpuTernaryWeight, TernaryCompute};
+use crate::{
+    Activation, GpuDevice, GpuInferenceEngine, GpuTensor, GpuTernaryWeight, TernaryCompute,
+};
 
 /// A GPU-resident neural approximation of an SDF.
 pub struct GpuNeuralSdf {
@@ -60,17 +62,28 @@ impl GpuNeuralSdf {
         config: &NeuralSdfConfig,
     ) -> Self {
         // Sample training data
-        let (points, distances) = sample_training_data(sdf, bounds_min, bounds_max, config.num_samples);
+        let (points, distances) =
+            sample_training_data(sdf, bounds_min, bounds_max, config.num_samples);
 
         // Compute distance scale for normalization
-        let max_abs_dist = distances.iter().map(|d| d.abs()).fold(0.0f32, f32::max).max(1.0);
+        let max_abs_dist = distances
+            .iter()
+            .map(|d| d.abs())
+            .fold(0.0f32, f32::max)
+            .max(1.0);
 
         // Build ternary weights via sign-based quantization of random projections
         let mut engine = GpuInferenceEngine::new();
         let in_features = 3;
 
         // Input → Hidden
-        let w0 = random_ternary_weights(device, config.hidden_width, in_features, &points, &distances);
+        let w0 = random_ternary_weights(
+            device,
+            config.hidden_width,
+            in_features,
+            &points,
+            &distances,
+        );
         engine.add_layer(w0, Activation::ReLU);
 
         // Hidden → Hidden
@@ -211,12 +224,7 @@ mod tests {
     #[test]
     fn test_sample_training_data() {
         let sdf = SdfNode::sphere(1.0);
-        let (pts, dists) = sample_training_data(
-            &sdf,
-            Vec3::splat(-2.0),
-            Vec3::splat(2.0),
-            27,
-        );
+        let (pts, dists) = sample_training_data(&sdf, Vec3::splat(-2.0), Vec3::splat(2.0), 27);
         assert_eq!(pts.len(), 27 * 3);
         assert_eq!(dists.len(), 27);
     }

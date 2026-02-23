@@ -65,7 +65,10 @@ fn check(code: i32, op: &'static str) -> CudaResult<()> {
     if code == 0 {
         Ok(())
     } else {
-        Err(CudaError { code, operation: op })
+        Err(CudaError {
+            code,
+            operation: op,
+        })
     }
 }
 
@@ -96,7 +99,9 @@ impl DeviceBuffer {
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { ffi::alice_trt_free(self.ptr); }
+            unsafe {
+                ffi::alice_trt_free(self.ptr);
+            }
         }
     }
 }
@@ -232,10 +237,7 @@ impl CudaTernaryEngine {
         let bytes = count * std::mem::size_of::<f32>();
         let mut ptr: *mut c_void = ptr::null_mut();
         unsafe {
-            check(
-                ffi::alice_trt_alloc(&mut ptr, bytes),
-                "alice_trt_alloc",
-            )?;
+            check(ffi::alice_trt_alloc(&mut ptr, bytes), "alice_trt_alloc")?;
         }
         Ok(DeviceBuffer { ptr, bytes })
     }
@@ -245,11 +247,7 @@ impl CudaTernaryEngine {
         let buf = self.alloc_f32(data.len())?;
         unsafe {
             check(
-                ffi::alice_trt_memcpy_h2d(
-                    buf.ptr,
-                    data.as_ptr() as *const c_void,
-                    buf.bytes,
-                ),
+                ffi::alice_trt_memcpy_h2d(buf.ptr, data.as_ptr() as *const c_void, buf.bytes),
                 "alice_trt_memcpy_h2d",
             )?;
         }
@@ -299,24 +297,36 @@ impl CudaTernaryEngine {
         // Allocate + upload plus_bits
         let mut plus_ptr: *mut c_void = ptr::null_mut();
         unsafe {
-            check(ffi::alice_trt_alloc(&mut plus_ptr, bytes), "alloc plus_bits")?;
+            check(
+                ffi::alice_trt_alloc(&mut plus_ptr, bytes),
+                "alloc plus_bits",
+            )?;
             check(
                 ffi::alice_trt_memcpy_h2d(plus_ptr, plus_bits.as_ptr() as *const c_void, bytes),
                 "upload plus_bits",
             )?;
         }
-        let plus_buf = DeviceBuffer { ptr: plus_ptr, bytes };
+        let plus_buf = DeviceBuffer {
+            ptr: plus_ptr,
+            bytes,
+        };
 
         // Allocate + upload minus_bits
         let mut minus_ptr: *mut c_void = ptr::null_mut();
         unsafe {
-            check(ffi::alice_trt_alloc(&mut minus_ptr, bytes), "alloc minus_bits")?;
+            check(
+                ffi::alice_trt_alloc(&mut minus_ptr, bytes),
+                "alloc minus_bits",
+            )?;
             check(
                 ffi::alice_trt_memcpy_h2d(minus_ptr, minus_bits.as_ptr() as *const c_void, bytes),
                 "upload minus_bits",
             )?;
         }
-        let minus_buf = DeviceBuffer { ptr: minus_ptr, bytes };
+        let minus_buf = DeviceBuffer {
+            ptr: minus_ptr,
+            bytes,
+        };
 
         let desc = ffi::AliceTrtWeights {
             plus_bits: plus_buf.ptr,
@@ -371,7 +381,9 @@ impl CudaTernaryEngine {
                     input.ptr as *const f32,
                     &weights.desc,
                     output.ptr as *mut f32,
-                    m, n, k,
+                    m,
+                    n,
+                    k,
                 ),
                 "alice_trt_gemm",
             )
@@ -394,7 +406,9 @@ impl CudaTernaryEngine {
                     input.ptr as *const f32,
                     &weights.desc,
                     output.ptr as *mut f32,
-                    m, n, k,
+                    m,
+                    n,
+                    k,
                 ),
                 "alice_trt_gemm_wmma",
             )
@@ -417,7 +431,9 @@ impl CudaTernaryEngine {
                     input.ptr as *const f32,
                     &weights.desc,
                     output.ptr as *mut f32,
-                    m, n, k,
+                    m,
+                    n,
+                    k,
                 ),
                 "alice_trt_gemm_dp4a",
             )
@@ -440,7 +456,9 @@ impl CudaTernaryEngine {
                     input.ptr as *const f32,
                     &weights.desc,
                     output.ptr as *mut f32,
-                    m, n, k,
+                    m,
+                    n,
+                    k,
                 ),
                 "alice_trt_gemm_popc",
             )
@@ -460,14 +478,14 @@ impl CudaTernaryEngine {
     /// Convenience: single-vector inference (matvec).
     ///
     /// Uploads input, runs GEMM, downloads output.
-    pub fn infer_matvec(
-        &self,
-        input: &[f32],
-        weights: &DeviceWeights,
-    ) -> CudaResult<Vec<f32>> {
+    pub fn infer_matvec(&self, input: &[f32], weights: &DeviceWeights) -> CudaResult<Vec<f32>> {
         let k = weights.in_features();
         let n = weights.out_features();
-        assert_eq!(input.len(), k as usize, "input length must equal in_features");
+        assert_eq!(
+            input.len(),
+            k as usize,
+            "input length must equal in_features"
+        );
 
         let input_buf = self.upload_f32(input)?;
         let output_buf = self.alloc_f32(n as usize)?;
@@ -480,7 +498,9 @@ impl CudaTernaryEngine {
 
 impl Drop for CudaTernaryEngine {
     fn drop(&mut self) {
-        unsafe { ffi::alice_trt_shutdown(); }
+        unsafe {
+            ffi::alice_trt_shutdown();
+        }
     }
 }
 

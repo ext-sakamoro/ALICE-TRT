@@ -12,8 +12,8 @@ use crate::kernel::GpuParams;
 /// Ternary weights on GPU (bitplane representation)
 ///
 /// Two storage buffers:
-/// - `plus_bits[row * words_per_row + word]`: bit i = 1 means weight[row][word*32+i] = +1
-/// - `minus_bits[row * words_per_row + word]`: bit i = 1 means weight[row][word*32+i] = -1
+/// - `plus_bits[row * words_per_row + word]`: bit i = 1 means `weight[row][word*32+i] = +1`
+/// - `minus_bits[row * words_per_row + word]`: bit i = 1 means `weight[row][word*32+i] = -1`
 /// - Both bits 0 means weight = 0 (free compute via sparsity)
 pub struct GpuTernaryWeight {
     pub(crate) plus_buffer: wgpu::Buffer,
@@ -35,14 +35,10 @@ impl GpuTernaryWeight {
         let words_per_row = kernel.words_per_row();
         let scale = kernel.scale();
 
-        let plus_buffer = device.create_buffer_init(
-            "trt_plus_bits",
-            bytemuck::cast_slice(kernel.plus_bits()),
-        );
-        let minus_buffer = device.create_buffer_init(
-            "trt_minus_bits",
-            bytemuck::cast_slice(kernel.minus_bits()),
-        );
+        let plus_buffer =
+            device.create_buffer_init("trt_plus_bits", bytemuck::cast_slice(kernel.plus_bits()));
+        let minus_buffer =
+            device.create_buffer_init("trt_minus_bits", bytemuck::cast_slice(kernel.minus_bits()));
 
         let params = GpuParams {
             in_features: in_features as u32,
@@ -52,8 +48,7 @@ impl GpuTernaryWeight {
             batch_size: 1,
             _pad: [0; 3],
         };
-        let params_buffer =
-            device.create_uniform_buffer("trt_params", bytemuck::bytes_of(&params));
+        let params_buffer = device.create_uniform_buffer("trt_params", bytemuck::bytes_of(&params));
 
         Self {
             plus_buffer,
@@ -81,8 +76,7 @@ impl GpuTernaryWeight {
         out_features: usize,
         in_features: usize,
     ) -> Self {
-        let kernel =
-            alice_ml::TernaryWeightKernel::from_ternary(values, out_features, in_features);
+        let kernel = alice_ml::TernaryWeightKernel::from_ternary(values, out_features, in_features);
         Self::from_kernel(device, &kernel)
     }
 

@@ -34,7 +34,7 @@
 //! println!("{engine}");
 //! ```
 
-pub mod ffi;
 pub mod engine;
+pub mod ffi;
 
-pub use engine::{CudaTernaryEngine, CudaError, CudaResult, DeviceBuffer, DeviceWeights};
+pub use engine::{CudaError, CudaResult, CudaTernaryEngine, DeviceBuffer, DeviceWeights};

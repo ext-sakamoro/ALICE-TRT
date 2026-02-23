@@ -48,7 +48,7 @@ impl TernaryCompute {
 
     /// Ternary matrix-vector multiplication (auto-selects kernel)
     ///
-    /// Returns GPU tensor with shape [out_features].
+    /// Returns GPU tensor with shape `[out_features]`.
     pub fn matvec(
         &self,
         device: &GpuDevice,
@@ -72,32 +72,34 @@ impl TernaryCompute {
             (&self.matvec_pipeline, &self.matvec_layout)
         };
 
-        let bind_group = device.device().create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("matvec_bg"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: weights.plus_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: weights.minus_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: output.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: weights.params_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = device
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("matvec_bg"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: weights.plus_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: weights.minus_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: weights.params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
 
         let mut encoder = device
             .device()
@@ -118,7 +120,7 @@ impl TernaryCompute {
                 pass.dispatch_workgroups(weights.out_features() as u32, 1, 1);
             } else {
                 // Simple: one thread per row, groups of 256
-                let groups = (weights.out_features() as u32 + 255) / 256;
+                let groups = (weights.out_features() as u32).div_ceil(256);
                 pass.dispatch_workgroups(groups, 1, 1);
             }
         }
@@ -150,32 +152,34 @@ impl TernaryCompute {
         // Update params with batch size
         weights.update_params(device, batch_size as u32);
 
-        let bind_group = device.device().create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("matmul_bg"),
-            layout: &self.matmul_batch_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: weights.plus_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: weights.minus_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: output.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: weights.params_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = device
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("matmul_bg"),
+                layout: &self.matmul_batch_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: weights.plus_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: weights.minus_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: weights.params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
 
         let mut encoder = device
             .device()
@@ -191,7 +195,7 @@ impl TernaryCompute {
             pass.set_pipeline(&self.matmul_batch_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
 
-            let groups_x = (weights.out_features() as u32 + 255) / 256;
+            let groups_x = (weights.out_features() as u32).div_ceil(256);
             pass.dispatch_workgroups(groups_x, batch_size as u32, 1);
         }
 
@@ -212,20 +216,22 @@ impl TernaryCompute {
         let params_buffer =
             device.create_uniform_buffer("relu_params", bytemuck::bytes_of(&params));
 
-        let bind_group = device.device().create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("relu_bg"),
-            layout: &self.relu_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: tensor.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = device
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("relu_bg"),
+                layout: &self.relu_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: tensor.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
 
         let mut encoder = device
             .device()
@@ -241,7 +247,7 @@ impl TernaryCompute {
             pass.set_pipeline(&self.relu_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
 
-            let groups = (tensor.len() as u32 + 255) / 256;
+            let groups = (tensor.len() as u32).div_ceil(256);
             pass.dispatch_workgroups(groups, 1, 1);
         }
 
@@ -264,69 +270,68 @@ impl TernaryCompute {
                 source: wgpu::ShaderSource::Wgsl(shader_src.into()),
             });
 
-        let layout =
-            device
-                .device()
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some(&format!("{label}_layout")),
-                    entries: &[
-                        // binding 0: input (read-only storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let layout = device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(&format!("{label}_layout")),
+                entries: &[
+                    // binding 0: input (read-only storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 1: plus_bits (read-only storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 1: plus_bits (read-only storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 2: minus_bits (read-only storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 2: minus_bits (read-only storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 3: output (read-write storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 3: output (read-write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 4: params (uniform)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 4: params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                    ],
-                });
+                        count: None,
+                    },
+                ],
+            });
 
         let pipeline_layout =
             device
@@ -337,24 +342,21 @@ impl TernaryCompute {
                     push_constant_ranges: &[],
                 });
 
-        let pipeline =
-            device
-                .device()
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(&format!("{label}_pipeline")),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let pipeline = device
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(&format!("{label}_pipeline")),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         (pipeline, layout)
     }
 
-    fn create_relu_pipeline(
-        device: &GpuDevice,
-    ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    fn create_relu_pipeline(device: &GpuDevice) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
         let shader = device
             .device()
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -362,36 +364,35 @@ impl TernaryCompute {
                 source: wgpu::ShaderSource::Wgsl(RELU_SHADER.into()),
             });
 
-        let layout =
-            device
-                .device()
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("relu_layout"),
-                    entries: &[
-                        // binding 0: data (read-write storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let layout = device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("relu_layout"),
+                entries: &[
+                    // binding 0: data (read-write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 1: params (uniform)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 1: params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                    ],
-                });
+                        count: None,
+                    },
+                ],
+            });
 
         let pipeline_layout =
             device
@@ -402,17 +403,16 @@ impl TernaryCompute {
                     push_constant_ranges: &[],
                 });
 
-        let pipeline =
-            device
-                .device()
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("relu_pipeline"),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let pipeline = device
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("relu_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         (pipeline, layout)
     }
@@ -420,6 +420,9 @@ impl TernaryCompute {
 
 impl std::fmt::Display for TernaryCompute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TernaryCompute[4 pipelines: matvec, matvec_tiled, matmul_batch, relu]")
+        write!(
+            f,
+            "TernaryCompute[4 pipelines: matvec, matvec_tiled, matmul_batch, relu]"
+        )
     }
 }

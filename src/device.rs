@@ -59,7 +59,11 @@ impl GpuDevice {
             .await
             .map_err(|e| format!("Failed to create device: {e}"))?;
 
-        Ok(Self { device, queue, info })
+        Ok(Self {
+            device,
+            queue,
+            info,
+        })
     }
 
     /// Get wgpu device reference
@@ -83,23 +87,25 @@ impl GpuDevice {
     /// Create a storage buffer with initial data
     pub fn create_buffer_init(&self, label: &str, data: &[u8]) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: data,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-        })
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: data,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            })
     }
 
     /// Create a uniform buffer with initial data
     pub fn create_uniform_buffer(&self, label: &str, data: &[u8]) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: data,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        })
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: data,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
     }
 
     /// Create an empty storage buffer
@@ -146,7 +152,8 @@ impl GpuDevice {
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             // SAFETY: Channel receiver is alive — drop only after recv() below
-            tx.send(result).expect("GPU readback channel closed unexpectedly");
+            tx.send(result)
+                .expect("GPU readback channel closed unexpectedly");
         });
         self.poll_wait();
         rx.recv()

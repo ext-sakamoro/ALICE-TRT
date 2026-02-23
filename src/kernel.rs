@@ -172,7 +172,7 @@ fn main(
 
 /// Batched Ternary MatMul: One thread per (batch, row) pair
 ///
-/// Computes: output[b][row] = sum_col(input[b][col] * weight[row][col]) * scale
+/// Computes: `output[b][row] = sum_col(input[b][col] * weight[row][col]) * scale`
 ///
 /// Dispatch: (ceil(out_features/256), batch_size, 1)
 pub const TERNARY_MATMUL_BATCH_SHADER: &str = r#"
@@ -281,5 +281,87 @@ mod tests {
         assert_eq!(params.in_features, 0);
         assert_eq!(params.out_features, 0);
         assert_eq!(params.scale, 0.0);
+    }
+
+    #[test]
+    fn test_gpu_params_alignment() {
+        // Uniform buffers require 16-byte alignment on most GPUs
+        assert_eq!(core::mem::align_of::<GpuParams>(), 4);
+        assert_eq!(core::mem::size_of::<GpuParams>() % 16, 0);
+    }
+
+    #[test]
+    fn test_relu_params_alignment() {
+        assert_eq!(core::mem::size_of::<ReluParams>() % 16, 0);
+    }
+
+    #[test]
+    fn test_gpu_params_bytemuck_roundtrip() {
+        let params = GpuParams {
+            in_features: 1024,
+            out_features: 512,
+            words_per_row: 32,
+            scale: 0.75,
+            batch_size: 4,
+            _pad: [0; 3],
+        };
+        let bytes: &[u8] = bytemuck::bytes_of(&params);
+        assert_eq!(bytes.len(), 32);
+        let restored: &GpuParams = bytemuck::from_bytes(bytes);
+        assert_eq!(restored.in_features, 1024);
+        assert_eq!(restored.out_features, 512);
+        assert_eq!(restored.words_per_row, 32);
+        assert!((restored.scale - 0.75).abs() < 1e-6);
+        assert_eq!(restored.batch_size, 4);
+    }
+
+    #[test]
+    fn test_relu_params_bytemuck_roundtrip() {
+        let params = ReluParams {
+            len: 65536,
+            _pad: [0; 3],
+        };
+        let bytes: &[u8] = bytemuck::bytes_of(&params);
+        let restored: &ReluParams = bytemuck::from_bytes(bytes);
+        assert_eq!(restored.len, 65536);
+    }
+
+    #[test]
+    fn test_shader_sources_not_empty() {
+        assert!(!TERNARY_MATVEC_SHADER.is_empty());
+        assert!(!TERNARY_MATVEC_TILED_SHADER.is_empty());
+        assert!(!TERNARY_MATMUL_BATCH_SHADER.is_empty());
+        assert!(!RELU_SHADER.is_empty());
+    }
+
+    #[test]
+    fn test_shader_contains_main_entrypoint() {
+        assert!(TERNARY_MATVEC_SHADER.contains("fn main("));
+        assert!(TERNARY_MATVEC_TILED_SHADER.contains("fn main("));
+        assert!(TERNARY_MATMUL_BATCH_SHADER.contains("fn main("));
+        assert!(RELU_SHADER.contains("fn main("));
+    }
+
+    #[test]
+    fn test_shader_workgroup_size() {
+        // All shaders use workgroup_size(256)
+        assert!(TERNARY_MATVEC_SHADER.contains("@workgroup_size(256)"));
+        assert!(TERNARY_MATVEC_TILED_SHADER.contains("@workgroup_size(256)"));
+        assert!(TERNARY_MATMUL_BATCH_SHADER.contains("@workgroup_size(256)"));
+        assert!(RELU_SHADER.contains("@workgroup_size(256)"));
+    }
+
+    #[test]
+    fn test_gpu_params_large_values() {
+        let params = GpuParams {
+            in_features: u32::MAX,
+            out_features: u32::MAX,
+            words_per_row: u32::MAX,
+            scale: f32::MAX,
+            batch_size: u32::MAX,
+            _pad: [0; 3],
+        };
+        assert_eq!(params.in_features, u32::MAX);
+        assert_eq!(params.scale, f32::MAX);
     }
 }

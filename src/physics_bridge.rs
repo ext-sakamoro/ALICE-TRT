@@ -4,8 +4,10 @@
 //! Uses the GPU to evaluate neural controllers that produce forces/torques
 //! for physics bodies, enabling ML-driven physics simulation.
 
-use alice_physics::{Vec3Fix, Fix128, RigidBody};
-use crate::{GpuDevice, GpuTernaryWeight, GpuTensor, TernaryCompute, GpuInferenceEngine, Activation};
+use crate::{
+    Activation, GpuDevice, GpuInferenceEngine, GpuTensor, GpuTernaryWeight, TernaryCompute,
+};
+use alice_physics::{Fix128, RigidBody, Vec3Fix};
 
 /// GPU-accelerated physics controller.
 ///
@@ -36,7 +38,11 @@ impl GpuPhysicsController {
     ) -> Self {
         let mut engine = GpuInferenceEngine::new();
         let input_dim = if layers.is_empty() { 6 } else { layers[0].2 };
-        let output_dim = if layers.is_empty() { 3 } else { layers[layers.len() - 1].1 };
+        let output_dim = if layers.is_empty() {
+            3
+        } else {
+            layers[layers.len() - 1].1
+        };
 
         for (i, &(weights, rows, cols)) in layers.iter().enumerate() {
             let w = GpuTernaryWeight::from_ternary(device, weights, rows, cols);
@@ -44,7 +50,11 @@ impl GpuPhysicsController {
             engine.add_layer(w, act);
         }
 
-        Self { engine, input_dim, output_dim }
+        Self {
+            engine,
+            input_dim,
+            output_dim,
+        }
     }
 
     /// Infer forces for a single body.
@@ -89,7 +99,9 @@ impl GpuPhysicsController {
         }
 
         let input = GpuTensor::from_f32(device, &flat_input, &[bodies.len(), self.input_dim]);
-        let output = self.engine.forward_batch(device, compute, &input, bodies.len());
+        let output = self
+            .engine
+            .forward_batch(device, compute, &input, bodies.len());
         let result = output.download(device);
 
         result
@@ -105,9 +117,13 @@ impl GpuPhysicsController {
     }
 
     /// Input dimension.
-    pub fn input_dim(&self) -> usize { self.input_dim }
+    pub fn input_dim(&self) -> usize {
+        self.input_dim
+    }
     /// Output dimension.
-    pub fn output_dim(&self) -> usize { self.output_dim }
+    pub fn output_dim(&self) -> usize {
+        self.output_dim
+    }
 }
 
 /// Convert a rigid body's state to neural network input features.
@@ -123,10 +139,7 @@ mod tests {
 
     #[test]
     fn test_body_to_input() {
-        let body = RigidBody::new_dynamic(
-            Vec3Fix::from_int(1, 2, 3),
-            Fix128::ONE,
-        );
+        let body = RigidBody::new_dynamic(Vec3Fix::from_int(1, 2, 3), Fix128::ONE);
 
         let input = body_to_input(&body);
         assert_eq!(input.len(), 6);
@@ -145,7 +158,9 @@ mod tests {
         };
 
         // 6 → 4 → 3 network
-        let w1: Vec<i8> = vec![1, -1, 0, 1, 0, -1, 1, 1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 0, 1, -1, 1, 0, -1]; // 4×6
+        let w1: Vec<i8> = vec![
+            1, -1, 0, 1, 0, -1, 1, 1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 0, 1, -1, 1, 0, -1,
+        ]; // 4×6
         let w2: Vec<i8> = vec![1, -1, 0, 1, 0, -1, 1, 1, 1, 0, -1, 1]; // 3×4
 
         let controller = GpuPhysicsController::new(

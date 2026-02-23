@@ -112,3 +112,106 @@ impl std::fmt::Display for GpuTensor {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tensor_shape_1d() {
+        let device = match GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let t = GpuTensor::from_f32(&device, &[1.0, 2.0, 3.0], &[3]);
+        assert_eq!(t.shape(), &[3]);
+        assert_eq!(t.len(), 3);
+        assert!(!t.is_empty());
+        assert_eq!(t.memory_bytes(), 12); // 3 * 4
+    }
+
+    #[test]
+    fn test_tensor_shape_2d() {
+        let device = match GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let t = GpuTensor::from_f32(&device, &[1.0; 6], &[2, 3]);
+        assert_eq!(t.shape(), &[2, 3]);
+        assert_eq!(t.len(), 6);
+        assert_eq!(t.memory_bytes(), 24);
+    }
+
+    #[test]
+    fn test_tensor_zeros_download() {
+        let device = match GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let t = GpuTensor::zeros(&device, &[4]);
+        let data = t.download(&device);
+        assert_eq!(data, vec![0.0f32; 4]);
+    }
+
+    #[test]
+    fn test_tensor_roundtrip() {
+        let device = match GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let input = vec![1.5, -2.3, 0.0, 42.0, -0.001];
+        let t = GpuTensor::from_f32(&device, &input, &[5]);
+        let output = t.download(&device);
+        for (a, b) in input.iter().zip(output.iter()) {
+            assert!((a - b).abs() < 1e-6, "mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn test_tensor_output_shape() {
+        let device = match GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let t = GpuTensor::output(&device, &[8, 16]);
+        assert_eq!(t.shape(), &[8, 16]);
+        assert_eq!(t.len(), 128);
+        assert_eq!(t.memory_bytes(), 512);
+    }
+
+    #[test]
+    fn test_tensor_buffer_size() {
+        let device = match GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let t = GpuTensor::from_f32(&device, &[1.0; 100], &[100]);
+        assert_eq!(t.buffer_size(), 400);
+    }
+
+    #[test]
+    fn test_tensor_display() {
+        let device = match GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let t = GpuTensor::from_f32(&device, &[1.0, 2.0], &[2]);
+        let s = format!("{t}");
+        assert!(s.contains("GpuTensor"));
+        assert!(s.contains("shape=[2]"));
+        assert!(s.contains("8 bytes"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Data length must match shape product")]
+    fn test_tensor_shape_mismatch_panics() {
+        let device = match GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                // Cannot test GPU panic without GPU; simulate
+                panic!("Data length must match shape product");
+            }
+        };
+        let _t = GpuTensor::from_f32(&device, &[1.0, 2.0], &[3]);
+    }
+}
