@@ -4,7 +4,7 @@
 //! into a static library that Rust links against.
 //!
 //! Requirements (cuda feature only):
-//! - NVIDIA CUDA Toolkit (nvcc on PATH or CUDA_TOOLKIT_ROOT_DIR set)
+//! - NVIDIA CUDA Toolkit (nvcc on PATH or `CUDA_TOOLKIT_ROOT_DIR` set)
 //! - cc crate
 
 fn main() {
