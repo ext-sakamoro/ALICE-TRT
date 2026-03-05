@@ -25,7 +25,7 @@ pub struct GpuLayer {
 
 impl GpuLayer {
     /// Create layer with activation
-    pub fn new(weights: GpuTernaryWeight, activation: Activation) -> Self {
+    pub const fn new(weights: GpuTernaryWeight, activation: Activation) -> Self {
         Self {
             weights,
             activation,
@@ -65,7 +65,7 @@ pub struct GpuInferenceEngine {
 impl GpuInferenceEngine {
     /// Create empty engine
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { layers: Vec::new() }
     }
 
@@ -77,7 +77,7 @@ impl GpuInferenceEngine {
     /// Number of layers
     #[inline(always)]
     #[must_use]
-    pub fn num_layers(&self) -> usize {
+    pub const fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
@@ -217,6 +217,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_engine_compression_ratio_empty() {
         let engine = GpuInferenceEngine::new();
         assert_eq!(engine.compression_ratio(), 0.0);
@@ -248,10 +249,7 @@ mod tests {
 
     #[test]
     fn test_engine_add_layers_and_count() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let mut engine = GpuInferenceEngine::new();
         assert_eq!(engine.num_layers(), 0);
 
@@ -266,10 +264,7 @@ mod tests {
 
     #[test]
     fn test_engine_weight_bytes() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let mut engine = GpuInferenceEngine::new();
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 64], 8, 8);
         let single_bytes = w.memory_bytes();
@@ -280,10 +275,7 @@ mod tests {
 
     #[test]
     fn test_engine_equivalent_fp32() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let mut engine = GpuInferenceEngine::new();
         // 4x4 = 16 weights, FP32 = 16 * 4 = 64 bytes
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 16], 4, 4);
@@ -294,9 +286,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "Engine has no layers")]
     fn test_engine_forward_empty_panics() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => panic!("Engine has no layers"), // simulate for no-GPU
+        let Ok(device) = GpuDevice::new() else {
+            panic!("Engine has no layers");
         };
         let compute = TernaryCompute::new(&device);
         let engine = GpuInferenceEngine::new();
@@ -306,15 +297,168 @@ mod tests {
 
     #[test]
     fn test_engine_display_with_layers() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let mut engine = GpuInferenceEngine::new();
         let w = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
         engine.add_layer(w, Activation::ReLU);
         let s = format!("{engine}");
         assert!(s.contains("1 layers"));
         assert!(s.contains("compression"));
+    }
+
+    #[test]
+    fn test_engine_forward_batch_single() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // W = [[1, -1], [0, 1]], batch_size = 1
+        // input = [2.0, 3.0] => y = [-1.0, 3.0]
+        let w = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
+        let mut engine = GpuInferenceEngine::new();
+        engine.add_layer(w, Activation::None);
+        let input = GpuTensor::from_f32(&device, &[2.0, 3.0], &[1, 2]);
+        let output = engine.forward_batch(&device, &compute, &input, 1);
+        let result = output.download(&device);
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - (-1.0)).abs() < 1e-4, "got {}", result[0]);
+        assert!((result[1] - 3.0).abs() < 1e-4, "got {}", result[1]);
+    }
+
+    #[test]
+    fn test_engine_forward_batch_two_items() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // W = [[1, 1]], 1 output, 2 inputs, batch = 2
+        // batch[0] = [1,2] => 3.0
+        // batch[1] = [3,4] => 7.0
+        let w = GpuTernaryWeight::from_ternary(&device, &[1, 1], 1, 2);
+        let mut engine = GpuInferenceEngine::new();
+        engine.add_layer(w, Activation::None);
+        let input = GpuTensor::from_f32(&device, &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let output = engine.forward_batch(&device, &compute, &input, 2);
+        let result = output.download(&device);
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - 3.0).abs() < 1e-4, "got {}", result[0]);
+        assert!((result[1] - 7.0).abs() < 1e-4, "got {}", result[1]);
+    }
+
+    #[test]
+    fn test_engine_three_layers() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // 3-layer: 2->2->2->1
+        // L1: [[1,1],[-1,1]], ReLU
+        // L2: [[1,-1],[1,1]], ReLU
+        // L3: [[1,1]],        None
+        let w1 = GpuTernaryWeight::from_ternary(&device, &[1, 1, -1, 1], 2, 2);
+        let w2 = GpuTernaryWeight::from_ternary(&device, &[1, -1, 1, 1], 2, 2);
+        let w3 = GpuTernaryWeight::from_ternary(&device, &[1, 1], 1, 2);
+        let mut engine = GpuInferenceEngine::new();
+        engine.add_layer(w1, Activation::ReLU);
+        engine.add_layer(w2, Activation::ReLU);
+        engine.add_layer(w3, Activation::None);
+        assert_eq!(engine.num_layers(), 3);
+        let input = GpuTensor::from_f32(&device, &[1.0, 2.0], &[2]);
+        let output = engine.forward(&device, &compute, &input);
+        let result = output.download(&device);
+        assert_eq!(result.len(), 1);
+        // L1: [1+2, -1+2] = [3, 1] -> ReLU -> [3, 1]
+        // L2: [3-1, 3+1]  = [2, 4] -> ReLU -> [2, 4]
+        // L3: 2+4 = 6
+        assert!((result[0] - 6.0).abs() < 1e-4, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_engine_all_none_activations() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // Two None layers: negative values must not be clamped
+        // W1 = [[-1,-1]], W2 = [[1]]
+        let w1 = GpuTernaryWeight::from_ternary(&device, &[-1, -1], 1, 2);
+        let w2 = GpuTernaryWeight::from_ternary(&device, &[1], 1, 1);
+        let mut engine = GpuInferenceEngine::new();
+        engine.add_layer(w1, Activation::None);
+        engine.add_layer(w2, Activation::None);
+        let input = GpuTensor::from_f32(&device, &[1.0, 2.0], &[2]);
+        let output = engine.forward(&device, &compute, &input);
+        let result = output.download(&device);
+        // L1: -(1+2) = -3, no ReLU
+        // L2: 1*(-3) = -3
+        assert!((result[0] - (-3.0)).abs() < 1e-4, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_engine_total_weight_bytes_two_layers() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let mut engine = GpuInferenceEngine::new();
+        let w1 = GpuTernaryWeight::from_ternary(&device, &[1; 4], 2, 2);
+        let w2 = GpuTernaryWeight::from_ternary(&device, &[1; 9], 3, 3);
+        let bytes1 = w1.memory_bytes();
+        let bytes2 = w2.memory_bytes();
+        engine.add_layer(w1, Activation::None);
+        engine.add_layer(w2, Activation::None);
+        assert_eq!(engine.total_weight_bytes(), bytes1 + bytes2);
+    }
+
+    #[test]
+    fn test_engine_equivalent_fp32_two_layers() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let mut engine = GpuInferenceEngine::new();
+        // Layer 1: 2x2 = 4 weights => 16 bytes FP32
+        let w1 = GpuTernaryWeight::from_ternary(&device, &[1; 4], 2, 2);
+        // Layer 2: 3x3 = 9 weights => 36 bytes FP32
+        let w2 = GpuTernaryWeight::from_ternary(&device, &[1; 9], 3, 3);
+        engine.add_layer(w1, Activation::None);
+        engine.add_layer(w2, Activation::None);
+        assert_eq!(engine.equivalent_fp32_bytes(), 16 + 36);
+    }
+
+    #[test]
+    fn test_engine_compression_ratio_non_empty() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let mut engine = GpuInferenceEngine::new();
+        // 1 row, 256 cols => high compression
+        let values: Vec<i8> = vec![1; 256];
+        let w = GpuTernaryWeight::from_ternary(&device, &values, 1, 256);
+        engine.add_layer(w, Activation::None);
+        let ratio = engine.compression_ratio();
+        assert!(ratio > 1.0, "expected ratio > 1, got {ratio}");
+    }
+
+    #[test]
+    fn test_gpu_layer_new_constructs() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let w = GpuTernaryWeight::from_ternary(&device, &[1, 0, -1, 1], 2, 2);
+        // GpuLayer::new is pub; ensure it constructs without panic
+        let _layer = GpuLayer::new(w, Activation::ReLU);
+    }
+
+    #[test]
+    fn test_engine_single_layer_relu_clamps_negatives() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // W = [[-1,-1]], input = [2.0, 3.0] => -5 -> ReLU -> 0
+        let w = GpuTernaryWeight::from_ternary(&device, &[-1, -1], 1, 2);
+        let mut engine = GpuInferenceEngine::new();
+        engine.add_layer(w, Activation::ReLU);
+        let input = GpuTensor::from_f32(&device, &[2.0, 3.0], &[2]);
+        let output = engine.forward(&device, &compute, &input);
+        let result = output.download(&device);
+        assert!(
+            (result[0]).abs() < 1e-4,
+            "expected 0 after ReLU, got {}",
+            result[0]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Engine has no layers")]
+    fn test_engine_forward_batch_empty_panics() {
+        let Ok(device) = GpuDevice::new() else {
+            panic!("Engine has no layers");
+        };
+        let compute = TernaryCompute::new(&device);
+        let engine = GpuInferenceEngine::new();
+        let input = GpuTensor::from_f32(&device, &[1.0], &[1, 1]);
+        let _out = engine.forward_batch(&device, &compute, &input, 1);
     }
 }

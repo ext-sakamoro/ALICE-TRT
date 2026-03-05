@@ -275,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_gpu_params_zeroed() {
         use bytemuck::Zeroable;
         let params = GpuParams::zeroed();
@@ -352,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_gpu_params_large_values() {
         let params = GpuParams {
             in_features: u32::MAX,
@@ -363,5 +365,84 @@ mod tests {
         };
         assert_eq!(params.in_features, u32::MAX);
         assert_eq!(params.scale, f32::MAX);
+    }
+
+    #[test]
+    fn test_gpu_params_debug_format() {
+        let params = GpuParams {
+            in_features: 4,
+            out_features: 8,
+            words_per_row: 1,
+            scale: 1.0,
+            batch_size: 2,
+            padding: [0; 3],
+        };
+        let s = format!("{params:?}");
+        assert!(s.contains("in_features"));
+        assert!(s.contains("out_features"));
+        assert!(s.contains("scale"));
+    }
+
+    #[test]
+    fn test_gpu_params_clone() {
+        let params = GpuParams {
+            in_features: 16,
+            out_features: 32,
+            words_per_row: 1,
+            scale: 2.5,
+            batch_size: 8,
+            padding: [0; 3],
+        };
+        let cloned = params;
+        assert_eq!(cloned.in_features, 16);
+        assert_eq!(cloned.out_features, 32);
+        assert_eq!(cloned.batch_size, 8);
+    }
+
+    #[test]
+    fn test_relu_params_debug_format() {
+        let params = ReluParams {
+            len: 512,
+            padding: [0; 3],
+        };
+        let s = format!("{params:?}");
+        assert!(s.contains("len"));
+        assert!(s.contains("512"));
+    }
+
+    #[test]
+    fn test_relu_params_clone() {
+        let params = ReluParams {
+            len: 1024,
+            padding: [0; 3],
+        };
+        let cloned = params;
+        assert_eq!(cloned.len, 1024);
+    }
+
+    #[test]
+    fn test_shader_contains_branchless_ternary() {
+        // The Trojan Horse trick: branchless expand of 2-bit weights
+        assert!(TERNARY_MATVEC_SHADER.contains("f32(is_plus) - f32(is_minus)"));
+        assert!(TERNARY_MATMUL_BATCH_SHADER.contains("f32(is_plus) - f32(is_minus)"));
+    }
+
+    #[test]
+    fn test_matvec_shader_has_five_bindings() {
+        // Bindings 0..4: input, plus_bits, minus_bits, output, params
+        for i in 0..5u32 {
+            assert!(
+                TERNARY_MATVEC_SHADER.contains(&format!("@binding({i})")),
+                "missing @binding({i}) in matvec shader"
+            );
+        }
+    }
+
+    #[test]
+    fn test_relu_shader_has_two_bindings() {
+        assert!(RELU_SHADER.contains("@binding(0)"));
+        assert!(RELU_SHADER.contains("@binding(1)"));
+        // No binding 2 in ReLU shader
+        assert!(!RELU_SHADER.contains("@binding(2)"));
     }
 }

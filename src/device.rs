@@ -73,14 +73,14 @@ impl GpuDevice {
     /// Get wgpu device reference
     #[inline]
     #[must_use]
-    pub fn device(&self) -> &wgpu::Device {
+    pub const fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
     /// Get wgpu queue reference
     #[inline]
     #[must_use]
-    pub fn queue(&self) -> &wgpu::Queue {
+    pub const fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
 

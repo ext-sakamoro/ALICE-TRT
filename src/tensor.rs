@@ -81,19 +81,19 @@ impl GpuTensor {
 
     /// Total number of elements
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Check if empty
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// VRAM usage in bytes
     #[inline]
-    pub fn memory_bytes(&self) -> usize {
+    pub const fn memory_bytes(&self) -> usize {
         self.len * std::mem::size_of::<f32>()
     }
 
@@ -104,7 +104,7 @@ impl GpuTensor {
     /// but will be used when the planned zero-copy device-buffer pool lands.
     #[allow(dead_code)]
     #[inline]
-    pub(crate) fn buffer_size(&self) -> u64 {
+    pub(crate) const fn buffer_size(&self) -> u64 {
         (self.len * std::mem::size_of::<f32>()) as u64
     }
 }
@@ -126,10 +126,7 @@ mod tests {
 
     #[test]
     fn test_tensor_shape_1d() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let t = GpuTensor::from_f32(&device, &[1.0, 2.0, 3.0], &[3]);
         assert_eq!(t.shape(), &[3]);
         assert_eq!(t.len(), 3);
@@ -139,10 +136,7 @@ mod tests {
 
     #[test]
     fn test_tensor_shape_2d() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let t = GpuTensor::from_f32(&device, &[1.0; 6], &[2, 3]);
         assert_eq!(t.shape(), &[2, 3]);
         assert_eq!(t.len(), 6);
@@ -151,10 +145,7 @@ mod tests {
 
     #[test]
     fn test_tensor_zeros_download() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let t = GpuTensor::zeros(&device, &[4]);
         let data = t.download(&device);
         assert_eq!(data, vec![0.0f32; 4]);
@@ -162,24 +153,18 @@ mod tests {
 
     #[test]
     fn test_tensor_roundtrip() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let input = vec![1.5, -2.3, 0.0, 42.0, -0.001];
         let t = GpuTensor::from_f32(&device, &input, &[5]);
         let output = t.download(&device);
         for (a, b) in input.iter().zip(output.iter()) {
-            assert!((a - b).abs() < 1e-6, "mismatch: {} vs {}", a, b);
+            assert!((a - b).abs() < 1e-6, "mismatch: {a} vs {b}");
         }
     }
 
     #[test]
     fn test_tensor_output_shape() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let t = GpuTensor::output(&device, &[8, 16]);
         assert_eq!(t.shape(), &[8, 16]);
         assert_eq!(t.len(), 128);
@@ -188,20 +173,14 @@ mod tests {
 
     #[test]
     fn test_tensor_buffer_size() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let t = GpuTensor::from_f32(&device, &[1.0; 100], &[100]);
         assert_eq!(t.buffer_size(), 400);
     }
 
     #[test]
     fn test_tensor_display() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let t = GpuTensor::from_f32(&device, &[1.0, 2.0], &[2]);
         let s = format!("{t}");
         assert!(s.contains("GpuTensor"));
@@ -212,13 +191,84 @@ mod tests {
     #[test]
     #[should_panic(expected = "Data length must match shape product")]
     fn test_tensor_shape_mismatch_panics() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => {
-                // Cannot test GPU panic without GPU; simulate
-                panic!("Data length must match shape product");
-            }
+        let Ok(device) = GpuDevice::new() else {
+            // Cannot test GPU panic without GPU; simulate
+            panic!("Data length must match shape product");
         };
         let _t = GpuTensor::from_f32(&device, &[1.0, 2.0], &[3]);
+    }
+
+    #[test]
+    fn test_tensor_zeros_2d() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let t = GpuTensor::zeros(&device, &[3, 4]);
+        assert_eq!(t.shape(), &[3, 4]);
+        assert_eq!(t.len(), 12);
+        assert!(!t.is_empty());
+        assert_eq!(t.memory_bytes(), 48);
+        let data = t.download(&device);
+        assert!(data.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_tensor_output_not_empty() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let t = GpuTensor::output(&device, &[1]);
+        assert_eq!(t.len(), 1);
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn test_tensor_memory_bytes_3d() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let t = GpuTensor::from_f32(&device, &[0.0; 24], &[2, 3, 4]);
+        assert_eq!(t.shape(), &[2, 3, 4]);
+        assert_eq!(t.len(), 24);
+        assert_eq!(t.memory_bytes(), 96); // 24 * 4
+    }
+
+    #[test]
+    fn test_tensor_display_2d() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let t = GpuTensor::from_f32(&device, &[0.0; 6], &[2, 3]);
+        let s = format!("{t}");
+        assert!(s.contains("GpuTensor"));
+        assert!(s.contains("[2, 3]"));
+        assert!(s.contains("24 bytes"));
+    }
+
+    #[test]
+    fn test_tensor_buffer_size_single_element() {
+        let Ok(device) = GpuDevice::new() else { return };
+        // shape [1] => 1 element => buffer_size = 4 bytes
+        let t = GpuTensor::from_f32(&device, &[0.0], &[1]);
+        assert_eq!(t.buffer_size(), 4);
+    }
+
+    #[test]
+    fn test_tensor_shape_3d_product() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let data: Vec<f32> = (0..60).map(|i| i as f32).collect();
+        let t = GpuTensor::from_f32(&device, &data, &[3, 4, 5]);
+        assert_eq!(t.len(), 60);
+        assert_eq!(t.shape(), &[3, 4, 5]);
+    }
+
+    #[test]
+    fn test_tensor_zeros_roundtrip_values() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let t = GpuTensor::zeros(&device, &[8]);
+        let result = t.download(&device);
+        assert_eq!(result.len(), 8);
+        for v in result {
+            assert!(v.abs() < 1e-6, "expected 0.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_tensor_len_matches_shape_product() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let t = GpuTensor::from_f32(&device, &[1.0; 30], &[5, 6]);
+        assert_eq!(t.len(), t.shape().iter().product::<usize>());
     }
 }

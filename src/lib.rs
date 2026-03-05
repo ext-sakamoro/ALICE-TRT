@@ -174,22 +174,16 @@ mod tests {
     #[test]
     fn test_gpu_init() {
         // GPU may not be available in all test environments
-        match GpuDevice::new() {
-            Ok(device) => {
-                assert!(!device.info().is_empty());
-            }
-            Err(_) => {
-                // No GPU available, skip
-            }
+        if let Ok(device) = GpuDevice::new() {
+            assert!(!device.info().is_empty());
+        } else {
+            // No GPU available, skip
         }
     }
 
     #[test]
     fn test_simple_matvec() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return, // No GPU
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let compute = TernaryCompute::new(&device);
 
@@ -210,10 +204,7 @@ mod tests {
 
     #[test]
     fn test_all_plus() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let compute = TernaryCompute::new(&device);
 
@@ -228,10 +219,7 @@ mod tests {
 
     #[test]
     fn test_all_minus() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let compute = TernaryCompute::new(&device);
 
@@ -246,10 +234,7 @@ mod tests {
 
     #[test]
     fn test_batch_matmul() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let compute = TernaryCompute::new(&device);
 
@@ -273,10 +258,7 @@ mod tests {
 
     #[test]
     fn test_relu() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let compute = TernaryCompute::new(&device);
 
@@ -293,10 +275,7 @@ mod tests {
 
     #[test]
     fn test_inference_engine() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let compute = TernaryCompute::new(&device);
 
@@ -323,10 +302,7 @@ mod tests {
 
     #[test]
     fn test_from_alice_ml_kernel() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let compute = TernaryCompute::new(&device);
 
@@ -344,10 +320,7 @@ mod tests {
 
     #[test]
     fn test_from_alice_ml_packed() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let compute = TernaryCompute::new(&device);
 
@@ -365,10 +338,7 @@ mod tests {
 
     #[test]
     fn test_compression_ratio() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
 
         let n = 1024;
         let values: Vec<i8> = (0..n * n).map(|i| (i % 3) as i8 - 1).collect();
@@ -383,10 +353,7 @@ mod tests {
 
     #[test]
     fn test_all_zeros_weights() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let compute = TernaryCompute::new(&device);
 
         // All-zero weight matrix: output should be all zeros
@@ -401,10 +368,7 @@ mod tests {
 
     #[test]
     fn test_identity_like_matvec() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let compute = TernaryCompute::new(&device);
 
         // "Identity-like" ternary: W = [[1,0,0],[0,1,0],[0,0,1]]
@@ -420,10 +384,7 @@ mod tests {
 
     #[test]
     fn test_scaled_weights() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let compute = TernaryCompute::new(&device);
 
         // W = [[1, 1]] with scale = 2.0
@@ -438,10 +399,7 @@ mod tests {
 
     #[test]
     fn test_weight_accessors() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 12], 3, 4);
         assert_eq!(w.out_features(), 3);
         assert_eq!(w.in_features(), 4);
@@ -451,10 +409,7 @@ mod tests {
 
     #[test]
     fn test_weight_display() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let w = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
         let s = format!("{w}");
         assert!(s.contains("GpuTernaryWeight"));
@@ -464,10 +419,7 @@ mod tests {
 
     #[test]
     fn test_single_element_matvec() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let compute = TernaryCompute::new(&device);
 
         // 1x1 matrix: W = [[1]], input = [42.0], output = [42.0]
@@ -481,10 +433,7 @@ mod tests {
 
     #[test]
     fn test_negative_input_values() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let compute = TernaryCompute::new(&device);
 
         // W = [[1, -1]], input = [-3.0, -5.0]
@@ -499,10 +448,7 @@ mod tests {
 
     #[test]
     fn test_relu_all_positive() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let compute = TernaryCompute::new(&device);
 
         let tensor = GpuTensor::from_f32(&device, &[1.0, 2.0, 3.0, 100.0], &[4]);
@@ -517,10 +463,7 @@ mod tests {
 
     #[test]
     fn test_relu_all_negative() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let compute = TernaryCompute::new(&device);
 
         let tensor = GpuTensor::from_f32(&device, &[-1.0, -2.0, -100.0], &[3]);
@@ -528,14 +471,14 @@ mod tests {
         let result = tensor.download(&device);
 
         for (i, &v) in result.iter().enumerate() {
-            assert!((v).abs() < 1e-6, "result[{}] = {} should be 0", i, v);
+            assert!((v).abs() < 1e-6, "result[{i}] = {v} should be 0");
         }
     }
 
     #[test]
     fn test_prelude_exports() {
         // Verify prelude contains expected types (compile-time check)
-        fn _check_prelude() {
+        fn check_prelude() {
             use crate::prelude::*;
             let _ = std::any::type_name::<GpuDevice>();
             let _ = std::any::type_name::<GpuTernaryWeight>();
@@ -544,28 +487,224 @@ mod tests {
             let _ = std::any::type_name::<GpuInferenceEngine>();
             let _ = std::any::type_name::<Activation>();
         }
-        _check_prelude();
+        check_prelude();
     }
 
     #[test]
     fn test_device_display() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let s = format!("{device}");
         assert!(s.contains("ALICE-TRT"));
     }
 
     #[test]
     fn test_compute_display() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let Ok(device) = GpuDevice::new() else { return };
         let compute = TernaryCompute::new(&device);
         let s = format!("{compute}");
         assert!(s.contains("TernaryCompute"));
         assert!(s.contains("4 pipelines"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tiled kernel path (in_features >= 1024 triggers matvec_tiled)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tiled_kernel_1024_cols() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // 1 output row, 1024 inputs: all +1 weights, all 1.0 inputs => sum = 1024
+        let values: Vec<i8> = vec![1; 1024];
+        let input_data: Vec<f32> = vec![1.0; 1024];
+        let weights = GpuTernaryWeight::from_ternary(&device, &values, 1, 1024);
+        let input = GpuTensor::from_f32(&device, &input_data, &[1024]);
+        let output = compute.matvec(&device, &input, &weights);
+        let result = output.download(&device);
+        assert_eq!(result.len(), 1);
+        assert!((result[0] - 1024.0).abs() < 1.0, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_tiled_kernel_minus_weights() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // 1 output row, 1024 inputs: all -1 weights, all 1.0 inputs => sum = -1024
+        let values: Vec<i8> = vec![-1; 1024];
+        let input_data: Vec<f32> = vec![1.0; 1024];
+        let weights = GpuTernaryWeight::from_ternary(&device, &values, 1, 1024);
+        let input = GpuTensor::from_f32(&device, &input_data, &[1024]);
+        let output = compute.matvec(&device, &input, &weights);
+        let result = output.download(&device);
+        assert!((result[0] - (-1024.0)).abs() < 1.0, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_matvec_4x4() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // W = identity-like 4x4
+        #[rustfmt::skip]
+        let w_vals: &[i8] = &[
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1,
+        ];
+        let weights = GpuTernaryWeight::from_ternary(&device, w_vals, 4, 4);
+        let input = GpuTensor::from_f32(&device, &[10.0, 20.0, 30.0, 40.0], &[4]);
+        let output = compute.matvec(&device, &input, &weights);
+        let result = output.download(&device);
+        assert!((result[0] - 10.0).abs() < 1e-4);
+        assert!((result[1] - 20.0).abs() < 1e-4);
+        assert!((result[2] - 30.0).abs() < 1e-4);
+        assert!((result[3] - 40.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_matvec_mixed_ternary_values() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // W = [[1, 0, -1]] (1 row, 3 cols)
+        // x = [5.0, 9.0, 3.0]
+        // y = 5 + 0 - 3 = 2
+        let weights = GpuTernaryWeight::from_ternary(&device, &[1, 0, -1], 1, 3);
+        let input = GpuTensor::from_f32(&device, &[5.0, 9.0, 3.0], &[3]);
+        let output = compute.matvec(&device, &input, &weights);
+        let result = output.download(&device);
+        assert!((result[0] - 2.0).abs() < 1e-4, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_batch_size_1_equals_matvec() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // batch_size=1 matmul must equal matvec result
+        let w_vals: &[i8] = &[1, -1, 0, 1];
+        let weights = GpuTernaryWeight::from_ternary(&device, w_vals, 2, 2);
+        let input_mv = GpuTensor::from_f32(&device, &[3.0, 7.0], &[2]);
+        let input_mm = GpuTensor::from_f32(&device, &[3.0, 7.0], &[1, 2]);
+        let out_mv = compute
+            .matvec(&device, &input_mv, &weights)
+            .download(&device);
+        let out_mm = compute
+            .matmul_batch(&device, &input_mm, &weights, 1)
+            .download(&device);
+        assert_eq!(out_mv.len(), out_mm.len());
+        for (a, b) in out_mv.iter().zip(out_mm.iter()) {
+            assert!((a - b).abs() < 1e-4, "matvec={a} matmul_batch={b}");
+        }
+    }
+
+    #[test]
+    fn test_scaled_weights_half() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // W = [[1, 1]] scale=0.5 => (3+5)*0.5 = 4.0
+        let weights = GpuTernaryWeight::from_ternary_scaled(&device, &[1, 1], 1, 2, 0.5);
+        let input = GpuTensor::from_f32(&device, &[3.0, 5.0], &[2]);
+        let output = compute.matvec(&device, &input, &weights);
+        let result = output.download(&device);
+        assert!((result[0] - 4.0).abs() < 1e-3, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_single_layer_none_activation_engine() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // Negative result must pass through unchanged with None activation
+        let w = GpuTernaryWeight::from_ternary(&device, &[-1], 1, 1);
+        let mut engine = GpuInferenceEngine::new();
+        engine.add_layer(w, Activation::None);
+        let input = GpuTensor::from_f32(&device, &[7.0], &[1]);
+        let output = engine.forward(&device, &compute, &input);
+        let result = output.download(&device);
+        assert!((result[0] - (-7.0)).abs() < 1e-4, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_engine_display_shows_layer_count() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let mut engine = GpuInferenceEngine::new();
+        for _ in 0..3 {
+            let w = GpuTernaryWeight::from_ternary(&device, &[1, 0, -1, 1], 2, 2);
+            engine.add_layer(w, Activation::None);
+        }
+        let s = format!("{engine}");
+        assert!(s.contains("3 layers"), "display = {s}");
+    }
+
+    #[test]
+    fn test_weight_memory_bytes_matches_formula() {
+        let Ok(device) = GpuDevice::new() else { return };
+        // 4 rows, 8 cols: words_per_row = ceil(8/32) = 1
+        // memory = 4 * 1 * 4 * 2 = 32 bytes
+        let w = GpuTernaryWeight::from_ternary(&device, &[1; 32], 4, 8);
+        assert_eq!(w.memory_bytes(), 32);
+        assert_eq!(w.words_per_row(), 1);
+    }
+
+    #[test]
+    fn test_relu_single_element_positive() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        let tensor = GpuTensor::from_f32(&device, &[5.5], &[1]);
+        compute.relu_inplace(&device, &tensor);
+        let result = tensor.download(&device);
+        assert!((result[0] - 5.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_relu_single_element_zero() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        let tensor = GpuTensor::from_f32(&device, &[0.0], &[1]);
+        compute.relu_inplace(&device, &tensor);
+        let result = tensor.download(&device);
+        assert!((result[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_words_per_row_64_cols() {
+        let Ok(device) = GpuDevice::new() else { return };
+        // 64 cols => ceil(64/32) = 2 words
+        let w = GpuTernaryWeight::from_ternary(&device, &[1; 64], 1, 64);
+        assert_eq!(w.words_per_row(), 2);
+    }
+
+    #[test]
+    fn test_compression_ratio_large_matrix() {
+        let Ok(device) = GpuDevice::new() else { return };
+        // 512 rows x 512 cols: words_per_row = 16
+        // fp32  = 512 * 512 * 4 = 1_048_576 bytes
+        // bits  = 512 * 16 * 4 * 2 = 65_536 bytes
+        // ratio = 1_048_576 / 65_536 = 16.0
+        let values: Vec<i8> = vec![1; 512 * 512];
+        let w = GpuTernaryWeight::from_ternary(&device, &values, 512, 512);
+        let ratio = w.compression_ratio();
+        assert!((ratio - 16.0).abs() < 0.1, "ratio = {ratio}");
+    }
+
+    #[test]
+    fn test_forward_batch_two_layer_engine() {
+        let Ok(device) = GpuDevice::new() else { return };
+        let compute = TernaryCompute::new(&device);
+        // 2-layer: 2->2->1, batch=2
+        // W1 = [[1,1],[-1,1]], ReLU
+        // W2 = [[1,1]],        None
+        let w1 = GpuTernaryWeight::from_ternary(&device, &[1, 1, -1, 1], 2, 2);
+        let w2 = GpuTernaryWeight::from_ternary(&device, &[1, 1], 1, 2);
+        let mut engine = GpuInferenceEngine::new();
+        engine.add_layer(w1, Activation::ReLU);
+        engine.add_layer(w2, Activation::None);
+        // batch[0] = [1,2], batch[1] = [3,4]
+        let input = GpuTensor::from_f32(&device, &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let output = engine.forward_batch(&device, &compute, &input, 2);
+        let result = output.download(&device);
+        assert_eq!(result.len(), 2);
+        // batch[0]: L1=[1+2,-1+2]=[3,1]->ReLU->[3,1]; L2=3+1=4
+        assert!((result[0] - 4.0).abs() < 1e-4, "batch0 = {}", result[0]);
+        // batch[1]: L1=[3+4,-3+4]=[7,1]->ReLU->[7,1]; L2=7+1=8
+        assert!((result[1] - 8.0).abs() < 1e-4, "batch1 = {}", result[1]);
     }
 }

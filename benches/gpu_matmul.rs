@@ -1,16 +1,14 @@
-//! GPU Ternary MatMul Benchmarks
+//! GPU Ternary `MatMul` Benchmarks
 //!
 //! Compares GPU (ALICE-TRT) vs CPU (ALICE-ML) inference throughput.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn bench_gpu_matvec(c: &mut Criterion) {
-    let device = match alice_trt::GpuDevice::new() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("No GPU available, skipping GPU benchmarks: {e}");
-            return;
-        }
+    let Ok(device) = alice_trt::GpuDevice::new() else {
+        eprintln!("No GPU available, skipping GPU benchmarks");
+        return;
     };
 
     let compute = alice_trt::TernaryCompute::new(&device);
@@ -36,10 +34,10 @@ fn bench_gpu_matvec(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn bench_cpu_vs_gpu(c: &mut Criterion) {
-    let device = match alice_trt::GpuDevice::new() {
-        Ok(d) => d,
-        Err(_) => return,
+    let Ok(device) = alice_trt::GpuDevice::new() else {
+        return;
     };
 
     let compute = alice_trt::TernaryCompute::new(&device);
@@ -77,10 +75,10 @@ fn bench_cpu_vs_gpu(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn bench_gpu_batch(c: &mut Criterion) {
-    let device = match alice_trt::GpuDevice::new() {
-        Ok(d) => d,
-        Err(_) => return,
+    let Ok(device) = alice_trt::GpuDevice::new() else {
+        return;
     };
 
     let compute = alice_trt::TernaryCompute::new(&device);
