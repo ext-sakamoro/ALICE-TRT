@@ -14,6 +14,11 @@ pub struct GpuTensor {
 
 impl GpuTensor {
     /// Upload f32 data to GPU
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len()` does not match the product of `shape`.
+    #[must_use]
     pub fn from_f32(device: &GpuDevice, data: &[f32], shape: &[usize]) -> Self {
         let total: usize = shape.iter().product();
         assert_eq!(data.len(), total, "Data length must match shape product");
@@ -28,6 +33,7 @@ impl GpuTensor {
     }
 
     /// Create zero-filled tensor on GPU
+    #[must_use]
     pub fn zeros(device: &GpuDevice, shape: &[usize]) -> Self {
         let total: usize = shape.iter().product();
         let size = (total * std::mem::size_of::<f32>()) as u64;
@@ -46,6 +52,7 @@ impl GpuTensor {
     }
 
     /// Create output tensor (pre-allocated, uninitialized)
+    #[must_use]
     pub fn output(device: &GpuDevice, shape: &[usize]) -> Self {
         let total: usize = shape.iter().product();
         let size = (total * std::mem::size_of::<f32>()) as u64;

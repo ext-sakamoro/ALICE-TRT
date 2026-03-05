@@ -15,19 +15,19 @@ pub struct GpuParams {
     pub words_per_row: u32,
     pub scale: f32,
     pub batch_size: u32,
-    pub _pad: [u32; 3],
+    pub padding: [u32; 3],
 }
 
-/// Ternary MatVec: One thread per output row (simple, low-latency)
+/// Ternary `MatVec`: One thread per output row (simple, low-latency)
 ///
-/// Best for: small-to-medium layers (out_features < 4096)
+/// Best for: small-to-medium layers (`out_features` < 4096)
 ///
 /// Strategy:
 /// - Each thread computes one output element
 /// - Loops over all input columns
 /// - Branchless: `acc += x * (f32(is_plus) - f32(is_minus))`
 /// - The GPU's FMA unit processes {-1, 0, +1} × input at full throughput
-pub const TERNARY_MATVEC_SHADER: &str = r#"
+pub const TERNARY_MATVEC_SHADER: &str = r"
 struct Params {
     in_features: u32,
     out_features: u32,
@@ -80,18 +80,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     output[row] = acc * params.scale;
 }
-"#;
+";
 
-/// Ternary MatVec Tiled: Workgroup-cooperative with parallel reduction
+/// Ternary `MatVec` Tiled: Workgroup-cooperative with parallel reduction
 ///
-/// Best for: large layers (out_features >= 4096, in_features >= 1024)
+/// Best for: large layers (`out_features` >= 4096, `in_features` >= 1024)
 ///
 /// Strategy:
 /// - Each workgroup handles one output row
 /// - 256 threads split the input columns (stride pattern)
 /// - Partial sums reduced via shared memory (log2 steps)
 /// - Thread 0 writes final result
-pub const TERNARY_MATVEC_TILED_SHADER: &str = r#"
+pub const TERNARY_MATVEC_TILED_SHADER: &str = r"
 struct Params {
     in_features: u32,
     out_features: u32,
@@ -168,14 +168,14 @@ fn main(
         output[row] = partial_sums[0] * params.scale;
     }
 }
-"#;
+";
 
-/// Batched Ternary MatMul: One thread per (batch, row) pair
+/// Batched Ternary `MatMul`: One thread per (batch, row) pair
 ///
 /// Computes: `output[b][row] = sum_col(input[b][col] * weight[row][col]) * scale`
 ///
-/// Dispatch: (ceil(out_features/256), batch_size, 1)
-pub const TERNARY_MATMUL_BATCH_SHADER: &str = r#"
+/// Dispatch: (`ceil(out_features/256)`, `batch_size`, 1)
+pub const TERNARY_MATMUL_BATCH_SHADER: &str = r"
 struct Params {
     in_features: u32,
     out_features: u32,
@@ -227,10 +227,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     output[batch * params.out_features + row] = acc * params.scale;
 }
-"#;
+";
 
-/// ReLU activation (in-place on storage buffer)
-pub const RELU_SHADER: &str = r#"
+/// `ReLU` activation (in-place on storage buffer)
+pub const RELU_SHADER: &str = r"
 struct Params {
     len: u32,
     _pad1: u32,
@@ -249,14 +249,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     data[idx] = max(data[idx], 0.0);
 }
-"#;
+";
 
-/// ReLU params (matches WGSL struct)
+/// `ReLU` params (matches WGSL struct)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ReluParams {
     pub len: u32,
-    pub _pad: [u32; 3],
+    pub padding: [u32; 3],
 }
 
 #[cfg(test)]
@@ -303,7 +303,7 @@ mod tests {
             words_per_row: 32,
             scale: 0.75,
             batch_size: 4,
-            _pad: [0; 3],
+            padding: [0; 3],
         };
         let bytes: &[u8] = bytemuck::bytes_of(&params);
         assert_eq!(bytes.len(), 32);
@@ -319,7 +319,7 @@ mod tests {
     fn test_relu_params_bytemuck_roundtrip() {
         let params = ReluParams {
             len: 65536,
-            _pad: [0; 3],
+            padding: [0; 3],
         };
         let bytes: &[u8] = bytemuck::bytes_of(&params);
         let restored: &ReluParams = bytemuck::from_bytes(bytes);
@@ -359,7 +359,7 @@ mod tests {
             words_per_row: u32::MAX,
             scale: f32::MAX,
             batch_size: u32::MAX,
-            _pad: [0; 3],
+            padding: [0; 3],
         };
         assert_eq!(params.in_features, u32::MAX);
         assert_eq!(params.scale, f32::MAX);

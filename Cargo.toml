@@ -16,6 +16,8 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
+ffi = []                         # C-ABI FFI (37 functions)
+python = ["dep:pyo3"]            # PyO3 Python bindings (5 classes)
 cuda = ["dep:cc"]
 physics = ["dep:alice-physics"]  # GPU ternary inference for physics control policies
 sdf = ["dep:alice-sdf"]  # GPU neural SDF approximation via ternary networks
@@ -31,6 +33,7 @@ alice-ml = { path = "../ALICE-ML" }
 alice-physics = { path = "../ALICE-Physics", optional = true, default-features = false, features = ["std"] }
 alice-sdf = { path = "../ALICE-SDF", optional = true, default-features = false }
 alice-db = { path = "../ALICE-DB", optional = true, default-features = false }
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 
 [build-dependencies]
 cc = { version = "1", optional = true }

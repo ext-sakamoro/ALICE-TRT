@@ -25,6 +25,7 @@ pub struct TernaryCompute {
 
 impl TernaryCompute {
     /// Compile all shaders and create pipelines
+    #[must_use]
     pub fn new(device: &GpuDevice) -> Self {
         let (matvec_pipeline, matvec_layout) =
             Self::create_ternary_pipeline(device, TERNARY_MATVEC_SHADER, "matvec");
@@ -49,6 +50,10 @@ impl TernaryCompute {
     /// Ternary matrix-vector multiplication (auto-selects kernel)
     ///
     /// Returns GPU tensor with shape `[out_features]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if input length does not match weight `in_features`.
     pub fn matvec(
         &self,
         device: &GpuDevice,
@@ -132,8 +137,12 @@ impl TernaryCompute {
 
     /// Batched ternary matrix multiplication
     ///
-    /// Input shape: [batch_size, in_features]
-    /// Output shape: [batch_size, out_features]
+    /// Input shape: [`batch_size`, `in_features`]
+    /// Output shape: [`batch_size`, `out_features`]
+    ///
+    /// # Panics
+    ///
+    /// Panics if input length does not match `batch_size * in_features`.
     pub fn matmul_batch(
         &self,
         device: &GpuDevice,
@@ -207,11 +216,11 @@ impl TernaryCompute {
         output
     }
 
-    /// ReLU activation (in-place)
+    /// `ReLU` activation (in-place)
     pub fn relu_inplace(&self, device: &GpuDevice, tensor: &GpuTensor) {
         let params = ReluParams {
             len: tensor.len() as u32,
-            _pad: [0; 3],
+            padding: [0; 3],
         };
         let params_buffer =
             device.create_uniform_buffer("relu_params", bytemuck::bytes_of(&params));
@@ -349,7 +358,7 @@ impl TernaryCompute {
                 layout: Some(&pipeline_layout),
                 module: &shader,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
 
@@ -410,7 +419,7 @@ impl TernaryCompute {
                 layout: Some(&pipeline_layout),
                 module: &shader,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
 

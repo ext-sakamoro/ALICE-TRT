@@ -25,6 +25,10 @@ impl GpuDevice {
     }
 
     /// Async initialization (for custom runtimes)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if GPU adapter or device request fails.
     pub async fn new_async() -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -68,23 +72,27 @@ impl GpuDevice {
 
     /// Get wgpu device reference
     #[inline]
+    #[must_use]
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
     /// Get wgpu queue reference
     #[inline]
+    #[must_use]
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
 
     /// GPU adapter info string
     #[inline]
+    #[must_use]
     pub fn info(&self) -> &str {
         &self.info
     }
 
     /// Create a storage buffer with initial data
+    #[must_use]
     pub fn create_buffer_init(&self, label: &str, data: &[u8]) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
         self.device
@@ -98,6 +106,7 @@ impl GpuDevice {
     }
 
     /// Create a uniform buffer with initial data
+    #[must_use]
     pub fn create_uniform_buffer(&self, label: &str, data: &[u8]) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
         self.device
@@ -109,6 +118,7 @@ impl GpuDevice {
     }
 
     /// Create an empty storage buffer
+    #[must_use]
     pub fn create_buffer_empty(&self, label: &str, size: u64) -> wgpu::Buffer {
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -126,11 +136,19 @@ impl GpuDevice {
     }
 
     /// Poll device until all operations complete
+    ///
+    /// # Panics
+    ///
+    /// Panics if the GPU readback channel is closed unexpectedly.
     pub fn poll_wait(&self) {
         self.device.poll(wgpu::Maintain::Wait);
     }
 
     /// Read buffer contents back to CPU
+    ///
+    /// # Panics
+    ///
+    /// Panics if the GPU readback channel is closed or the map operation fails.
     pub fn read_buffer(&self, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging_read"),

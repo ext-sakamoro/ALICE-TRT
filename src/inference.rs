@@ -1,7 +1,7 @@
 //! Inference Engine: Multi-Layer GPU Pipeline
 //!
 //! Stack layers, run forward pass. All computation stays on GPU
-//! until you call download() on the final output.
+//! until you call `download()` on the final output.
 
 use crate::device::GpuDevice;
 use crate::pipeline::TernaryCompute;
@@ -13,7 +13,7 @@ use crate::weights::GpuTernaryWeight;
 pub enum Activation {
     /// No activation (identity)
     None,
-    /// ReLU: max(0, x)
+    /// `ReLU`: max(0, x)
     ReLU,
 }
 
@@ -64,6 +64,7 @@ pub struct GpuInferenceEngine {
 
 impl GpuInferenceEngine {
     /// Create empty engine
+    #[must_use]
     pub fn new() -> Self {
         Self { layers: Vec::new() }
     }
@@ -75,6 +76,7 @@ impl GpuInferenceEngine {
 
     /// Number of layers
     #[inline(always)]
+    #[must_use]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
@@ -83,6 +85,10 @@ impl GpuInferenceEngine {
     ///
     /// Input shape: `[in_features]` (single vector)
     /// Output shape: `[last_layer_out_features]`
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine has no layers.
     pub fn forward(
         &self,
         device: &GpuDevice,
@@ -115,8 +121,12 @@ impl GpuInferenceEngine {
 
     /// Run batched forward pass
     ///
-    /// Input shape: [batch_size, in_features]
-    /// Output shape: [batch_size, last_layer_out_features]
+    /// Input shape: [`batch_size`, `in_features`]
+    /// Output shape: [`batch_size`, `last_layer_out_features`]
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine has no layers.
     pub fn forward_batch(
         &self,
         device: &GpuDevice,
@@ -148,11 +158,13 @@ impl GpuInferenceEngine {
     }
 
     /// Total VRAM usage for all layer weights
+    #[must_use]
     pub fn total_weight_bytes(&self) -> usize {
         self.layers.iter().map(|l| l.weights.memory_bytes()).sum()
     }
 
     /// Equivalent FP32 weight size (for comparison)
+    #[must_use]
     pub fn equivalent_fp32_bytes(&self) -> usize {
         self.layers
             .iter()
@@ -161,6 +173,7 @@ impl GpuInferenceEngine {
     }
 
     /// Overall compression ratio
+    #[must_use]
     pub fn compression_ratio(&self) -> f32 {
         let fp32 = self.equivalent_fp32_bytes();
         let actual = self.total_weight_bytes();

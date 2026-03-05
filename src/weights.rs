@@ -1,6 +1,6 @@
 //! GPU Ternary Weights: 2-bit Bitplane Storage in VRAM
 //!
-//! **The Memory Hack**: Weights are stored as two bitplanes (plus_bits, minus_bits)
+//! **The Memory Hack**: Weights are stored as two bitplanes (`plus_bits`, `minus_bits`)
 //! in GPU storage buffers. Each u32 word encodes 32 ternary weights.
 //!
 //! VRAM usage: 2 bits per weight (vs 16 bits FP16, 8 bits INT8)
@@ -26,9 +26,10 @@ pub struct GpuTernaryWeight {
 }
 
 impl GpuTernaryWeight {
-    /// Upload from ALICE-ML TernaryWeightKernel (bitplane format)
+    /// Upload from ALICE-ML `TernaryWeightKernel` (bitplane format)
     ///
-    /// Zero-copy compatible: TernaryWeightKernel already stores bitplanes.
+    /// Zero-copy compatible: `TernaryWeightKernel` already stores bitplanes.
+    #[must_use]
     pub fn from_kernel(device: &GpuDevice, kernel: &alice_ml::TernaryWeightKernel) -> Self {
         let out_features = kernel.out_features();
         let in_features = kernel.in_features();
@@ -46,7 +47,7 @@ impl GpuTernaryWeight {
             words_per_row: words_per_row as u32,
             scale,
             batch_size: 1,
-            _pad: [0; 3],
+            padding: [0; 3],
         };
         let params_buffer = device.create_uniform_buffer("trt_params", bytemuck::bytes_of(&params));
 
@@ -61,15 +62,17 @@ impl GpuTernaryWeight {
         }
     }
 
-    /// Upload from ALICE-ML TernaryWeight (packed 2-bit format)
+    /// Upload from ALICE-ML `TernaryWeight` (packed 2-bit format)
     ///
     /// Converts to bitplane format internally.
+    #[must_use]
     pub fn from_packed(device: &GpuDevice, weights: &alice_ml::TernaryWeight) -> Self {
         let kernel = alice_ml::TernaryWeightKernel::from_packed_weight(weights);
         Self::from_kernel(device, &kernel)
     }
 
     /// Create directly from ternary values (-1, 0, +1)
+    #[must_use]
     pub fn from_ternary(
         device: &GpuDevice,
         values: &[i8],
@@ -81,6 +84,7 @@ impl GpuTernaryWeight {
     }
 
     /// Create with custom scale
+    #[must_use]
     pub fn from_ternary_scaled(
         device: &GpuDevice,
         values: &[i8],
@@ -105,7 +109,7 @@ impl GpuTernaryWeight {
             words_per_row: self.words_per_row as u32,
             scale: self.scale,
             batch_size,
-            _pad: [0; 3],
+            padding: [0; 3],
         };
         device
             .queue()

@@ -94,12 +94,28 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::similar_names,
+    clippy::many_single_char_names,
+    clippy::module_name_repetitions,
+    clippy::inline_always
+)]
+
 pub mod device;
 pub mod inference;
 pub mod kernel;
 pub mod pipeline;
 pub mod tensor;
 pub mod weights;
+
+#[cfg(feature = "ffi")]
+pub mod ffi;
+#[cfg(feature = "python")]
+pub mod python;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;

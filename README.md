@@ -209,6 +209,34 @@ let cpu_packed = alice_ml::TernaryWeight::from_ternary(&weights, out, inp);
 let gpu_weights = GpuTernaryWeight::from_packed(&device, &cpu_packed);
 ```
 
+## C-ABI FFI (Unity / UE5)
+
+37 `extern "C"` functions for GPU ternary inference from game engines. Enable with `--features ffi`.
+
+| Module | Functions | Description |
+|--------|-----------|-------------|
+| Device | 3 | new, free, info |
+| Weight | 9 | from_ternary, from_ternary_scaled, free, out_features, in_features, scale, words_per_row, memory_bytes, compression_ratio |
+| Tensor | 10 | from_f32, zeros, output, free, download, ndim, shape, len, is_empty, memory_bytes |
+| Compute | 5 | new, free, matvec, matmul_batch, relu_inplace |
+| Engine | 9 | new, free, add_layer, num_layers, total_weight_bytes, equivalent_fp32_bytes, compression_ratio, forward, forward_batch |
+| Version | 1 | version |
+
+- **Unity C#**: `bindings/unity/AliceTrt.cs` — 37 `[DllImport]` + 5 RAII `IDisposable` handles
+- **UE5 C++**: `bindings/ue5/AliceTrt.h` — 37 `extern "C"` + 5 RAII `unique_ptr` handles
+
+## Test Suite
+
+```bash
+cargo test                    # Core tests (54)
+cargo test --features ffi     # + FFI (63)
+```
+
+| Config | Tests |
+|--------|-------|
+| default | 54 (52 unit + 2 doc) |
+| `--features ffi` | 63 (52 unit + 9 FFI + 2 doc) |
+
 ## Build
 
 ```bash
@@ -217,6 +245,9 @@ cargo build --release
 
 # With CUDA backend (requires NVIDIA CUDA Toolkit)
 cargo build --release --features cuda
+
+# With FFI bindings
+cargo build --release --features ffi
 
 # Run tests
 cargo test
@@ -254,6 +285,8 @@ ALICE-TRT/
 │   ├── tensor.rs                 # GpuTensor (f32 buffer on GPU)
 │   ├── pipeline.rs               # TernaryCompute (4 pre-compiled pipelines)
 │   ├── inference.rs              # GpuInferenceEngine (multi-layer forward)
+│   ├── ffi.rs                    # C-ABI FFI (37 functions, --features ffi)
+│   ├── python.rs                 # PyO3 Python bindings (5 classes, --features python)
 │   └── cuda/                     # CUDA backend (--features cuda)
 │       ├── mod.rs                # Module declarations
 │       ├── ffi.rs                # extern "C" FFI bindings
