@@ -157,6 +157,15 @@ impl GpuInferenceEngine {
         current
     }
 
+    /// レイヤーの重みと活性化関数の参照リストを返す (プロファイラ用)。
+    #[must_use]
+    pub fn layer_info(&self) -> Vec<(&GpuTernaryWeight, Activation)> {
+        self.layers
+            .iter()
+            .map(|l| (&l.weights, l.activation))
+            .collect()
+    }
+
     /// Total VRAM usage for all layer weights
     #[must_use]
     pub fn total_weight_bytes(&self) -> usize {

@@ -109,6 +109,7 @@ pub mod device;
 pub mod inference;
 pub mod kernel;
 pub mod pipeline;
+pub mod profiler;
 pub mod tensor;
 pub mod weights;
 
@@ -138,6 +139,7 @@ pub use device::GpuDevice;
 pub use inference::{Activation, GpuInferenceEngine, GpuLayer};
 pub use kernel::{GpuParams, ReluParams};
 pub use pipeline::TernaryCompute;
+pub use profiler::{InferenceProfile, InferenceProfiler, LayerProfile};
 pub use tensor::GpuTensor;
 pub use weights::GpuTernaryWeight;
 
