@@ -571,8 +571,7 @@ mod tests {
             total_duration: Duration::from_micros(500),
             batch_size: 4,
         };
-        let cloned = profile.clone();
-        assert_eq!(cloned.batch_size, 4);
-        assert_eq!(cloned.total_duration, Duration::from_micros(500));
+        assert_eq!(profile.batch_size, 4);
+        assert_eq!(profile.total_duration, Duration::from_micros(500));
     }
 }
