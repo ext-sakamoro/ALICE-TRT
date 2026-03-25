@@ -2,7 +2,7 @@
 name = "alice-trt"
 version = "0.1.0"
 edition = "2021"
-authors = ["Moroya Sakamoto"]
+authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 description = "GPU Ternary Inference Engine - Don't move data. Move the law."
 license = "AGPL-3.0"
 repository = "https://github.com/ext-sakamoro/ALICE-TRT"
