@@ -1,0 +1,21 @@
+# Dependabot 設定 (feedback_dependabot_major_bump_initial_wave 準拠)
+#
+# 注: root cargo entry は意図的に削除 (= [[feedback_dependabot_cargo_sibling_path_deps]])
+# 理由: root Cargo.toml に sibling path dep (= path = "../ALICE-Xxxx") が存在し、
+#       dependabot は sibling repo を checkout しないため
+#       path_dependencies_not_reachable で fail する
+#       root 直接の cargo dep update は手動 `cargo update -p <name>` で対応
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 3
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
