@@ -66,22 +66,43 @@ jobs:
             target
           key: ${{ matrix.os }}-cargo-fix128-${{ hashFiles('Cargo.toml') }}
 
-      - name: Clone sibling ALICE-* path deps (CI has no workspace checkouts)
+      - name: Clone ALICE-ML (unconditional path dep used by src/weights.rs)
         shell: bash
         run: |
           set -euo pipefail
-          # Cargo.toml declares four `path = "../ALICE-XX"` deps for
-          # local development. CI runners only clone this repo, so we
-          # shallow-clone the sibling crates (all public) into ../
-          # to satisfy the resolver + compilation. `alice_ml` types
-          # (`TernaryWeightKernel` / `TernaryWeight`) are used
-          # unconditionally by `src/weights.rs` so a real crate is
-          # required, not a stub.
           cd ..
-          for repo in ALICE-ML ALICE-Physics ALICE-SDF ALICE-DB; do
-            git clone --depth 1 "https://github.com/ext-sakamoro/${repo}.git"
-          done
-          ls -d ALICE-*
+          git clone --depth 1 https://github.com/ext-sakamoro/ALICE-ML.git
+
+      - name: Strip optional path deps from Cargo.toml (CI does not need them)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `alice-physics` / `alice-sdf` / `alice-db` are declared as
+          # `path = "../ALICE-XX", optional = true` for local
+          # development. Each pulls a transitive tree of path deps
+          # (alice-db → alice-zip → ...) that CI cannot reasonably
+          # clone. Since `--features fix128-arithmetic` alone does
+          # not activate any of these three, we strip their declarations
+          # from Cargo.toml before build. The GPU matrix job is
+          # scoped to fix128 tests, so this narrows the CI surface
+          # rather than the tested surface.
+          #
+          # Remove the three optional declaration lines.
+          if command -v gsed >/dev/null 2>&1; then
+            SED=gsed
+          else
+            SED=sed
+          fi
+          $SED -i.bak '/^alice-physics = {/d; /^alice-sdf = {/d; /^alice-db = {/d' Cargo.toml
+          # Feature entries that reference the stripped crates must
+          # also go, otherwise cargo will complain about unknown deps.
+          $SED -i.bak '/^physics = \["dep:alice-physics"/d' Cargo.toml
+          $SED -i.bak '/^sdf = \["dep:alice-sdf"/d' Cargo.toml
+          $SED -i.bak '/^db = \["dep:alice-db"/d' Cargo.toml
+          $SED -i.bak '/^physics-solver = /d' Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "--- stripped Cargo.toml [dependencies] ---"
+          grep -E "^(alice-|\[)" Cargo.toml || true
 
       - name: Build (fix128-arithmetic)
         run: cargo build --lib --features fix128-arithmetic
