@@ -487,19 +487,22 @@ fn fix128_mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// - `atomicAdd` on a shared accumulator — race-dependent order.
 /// - Any parallel tree-reduction that reorders the additions.
 ///
-/// The v0.7.0 implementation is a **64-thread blocked reduction**
-/// where the final accumulate remains serial in index order:
+/// The v0.7.1 implementation is a **multi-workgroup blocked reduction**
+/// for arbitrary N with a paired serial final-accumulate shader:
 ///
-/// - Phase 1 (parallel): thread `t ∈ [0, 64)` computes
-///   `partials[t] = Σ_{i=t·B}^{min((t+1)·B, N)} a[i] × b[i]`
-///   with `B = ⌈N / 64⌉`, iterating **in-block index order**.
-/// - `workgroupBarrier()` synchronises the 64 threads.
-/// - Phase 2 (serial): thread 0 computes
-///   `acc = Σ_{b=0}^{63} partials[b]` **in block-index order**.
+/// - Phase 1 (this shader, `fix128_dot_partial_main`): K workgroups
+///   of 64 threads each cover the input in `ELEMS_PER_WORKGROUP = 4096`
+///   chunks. Workgroup `w` owns `[w·4096, min((w+1)·4096, N))`,
+///   split among its 64 threads via the same in-block ordering as v0.7.0.
+///   Each workgroup writes one `Fix128Gpu` to `partials_out[w]`.
+/// - Phase 2 ([`FIX128_DOT_FINAL_WGSL`]): a single-thread pass folds
+///   `partials_out[0..K]` in **workgroup-index order** into `output[0]`.
 ///
-/// Total order = canonical index 0..N, so the result is byte-for-byte
-/// equal to the single-thread serial fold. Parallel speedup is up to
-/// 64x for N ≥ 64 (thread-utilization bounded).
+/// K = ⌈N / 4096⌉ workgroups. Since Phase 1 writes go to distinct
+/// `partials_out` slots and Phase 2 reads them in fixed index order,
+/// workgroup completion order is irrelevant to the result. Total
+/// arithmetic order = canonical index 0..N — byte-for-byte equal to
+/// the single-thread CPU reference regardless of workgroup scheduling.
 ///
 /// # Layout
 ///
@@ -657,24 +660,47 @@ fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
     return out;
 }
 
-// 64-thread blocked reduction with index-ordered serial final
-// accumulate. See the module doc for the determinism argument.
+// Multi-workgroup blocked reduction. See the module doc for the
+// full determinism argument.
 const WG_SIZE: u32 = 64u;
+const ELEMS_PER_WORKGROUP: u32 = 4096u;
 
 var<workgroup> partials: array<Fix128Gpu, 64>;
 
 @compute @workgroup_size(64)
-fn fix128_dot_main(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn fix128_dot_partial_main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>,
+) {
     let t = lid.x;
+    let wg = wgid.x;
     let n = arrayLength(&input_a);
 
-    // Phase 1: each thread computes its block's partial sum in
-    // block-internal index order. Block size = ceil(n / 64), so
-    // block boundaries are t*B .. min((t+1)*B, n).
-    let block_size = (n + WG_SIZE - 1u) / WG_SIZE;
-    let start = t * block_size;
-    let end_unclamped = start + block_size;
-    let end = select(end_unclamped, n, end_unclamped > n);
+    let wg_start = wg * ELEMS_PER_WORKGROUP;
+
+    // Workgroups past the input tail write ZERO and exit — Phase 2
+    // will happily fold zeros without altering the result.
+    if (wg_start >= n) {
+        if (t == 0u) {
+            var z: Fix128Gpu;
+            z.hi_lo = 0u;
+            z.hi_hi = 0u;
+            z.lo_lo = 0u;
+            z.lo_hi = 0u;
+            output[wg] = z;
+        }
+        return;
+    }
+
+    let wg_end_unclamped = wg_start + ELEMS_PER_WORKGROUP;
+    let wg_end = select(wg_end_unclamped, n, wg_end_unclamped > n);
+    let wg_len = wg_end - wg_start;
+
+    // Block boundaries within this workgroup's slice.
+    let block_size = (wg_len + WG_SIZE - 1u) / WG_SIZE;
+    let local_start = t * block_size;
+    let local_end_unclamped = local_start + block_size;
+    let local_end = select(local_end_unclamped, wg_len, local_end_unclamped > wg_len);
 
     var partial: Fix128Gpu;
     partial.hi_lo = 0u;
@@ -682,10 +708,9 @@ fn fix128_dot_main(@builtin(local_invocation_id) lid: vec3<u32>) {
     partial.lo_lo = 0u;
     partial.lo_hi = 0u;
 
-    // Threads whose block is entirely past n (small-N case) skip the
-    // loop cleanly. `start < end` handles both `start >= n` and the
-    // shrunk final block.
-    if (start < end) {
+    if (local_start < local_end) {
+        let start = wg_start + local_start;
+        let end = wg_start + local_end;
         for (var i: u32 = start; i < end; i = i + 1u) {
             let product = fix128_mul_kernel(input_a[i], input_b[i]);
             partial = fix128_add_kernel(partial, product);
@@ -695,9 +720,8 @@ fn fix128_dot_main(@builtin(local_invocation_id) lid: vec3<u32>) {
     partials[t] = partial;
     workgroupBarrier();
 
-    // Phase 2: thread 0 folds the 64 partials in block-index order.
-    // Iteration order = block index 0..63, and each block was itself
-    // computed in-order, so total order = canonical index 0..N.
+    // Thread 0 folds the 64 shared partials in block-index order,
+    // then writes this workgroup's contribution to partials_out[wg].
     if (t == 0u) {
         var acc: Fix128Gpu;
         acc.hi_lo = 0u;
@@ -707,8 +731,72 @@ fn fix128_dot_main(@builtin(local_invocation_id) lid: vec3<u32>) {
         for (var b: u32 = 0u; b < WG_SIZE; b = b + 1u) {
             acc = fix128_add_kernel(acc, partials[b]);
         }
-        output[0] = acc;
+        output[wg] = acc;
     }
+}
+"#;
+
+/// WGSL compute shader source for the Phase 2 serial fold of
+/// per-workgroup partials, paired with [`FIX128_DOT_WGSL`] for the
+/// multi-workgroup dot pipeline.
+///
+/// Bind group 0 exposes `(input_a, output)` — a two-buffer layout
+/// distinct from the Phase 1 three-buffer layout. `input_a` holds
+/// the K partials written by Phase 1; `output[0]` receives the
+/// final Fix128 dot product.
+///
+/// The kernel dispatches a single workgroup of one thread and folds
+/// `input_a[0..K]` in canonical index order. Since Phase 1 has
+/// already reduced each chunk to a single Fix128 without depending
+/// on cross-workgroup ordering, this pass restores the total order
+/// with an O(K) serial loop.
+pub const FIX128_DOT_FINAL_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+@group(0) @binding(0) var<storage, read>       input_a: array<Fix128Gpu>;
+@group(0) @binding(1) var<storage, read_write> output:  array<Fix128Gpu>;
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+@compute @workgroup_size(1)
+fn fix128_dot_final_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u) { return; }
+    let k = arrayLength(&input_a);
+    var acc: Fix128Gpu;
+    acc.hi_lo = 0u;
+    acc.hi_hi = 0u;
+    acc.lo_lo = 0u;
+    acc.lo_hi = 0u;
+    for (var w: u32 = 0u; w < k; w = w + 1u) {
+        acc = fix128_add_kernel(acc, input_a[w]);
+    }
+    output[0] = acc;
 }
 "#;
 
@@ -738,8 +826,10 @@ pub struct Fix128WgpuKernel<'a> {
     pipeline_add: wgpu::ComputePipeline,
     pipeline_sub: wgpu::ComputePipeline,
     pipeline_mul: wgpu::ComputePipeline,
-    pipeline_dot: wgpu::ComputePipeline,
+    pipeline_dot_partial: wgpu::ComputePipeline,
+    pipeline_dot_final: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    bind_group_layout_dot_final: wgpu::BindGroupLayout,
 }
 
 impl<'a> Fix128WgpuKernel<'a> {
@@ -774,6 +864,13 @@ impl<'a> Fix128WgpuKernel<'a> {
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fix128_dot_shader"),
                 source: wgpu::ShaderSource::Wgsl(FIX128_DOT_WGSL.into()),
+            });
+
+        let shader_dot_final = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_dot_final_shader"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_DOT_FINAL_WGSL.into()),
             });
 
         let bind_group_layout =
@@ -815,12 +912,51 @@ impl<'a> Fix128WgpuKernel<'a> {
                     ],
                 });
 
+        // 2-buffer bind group layout for the Phase 2 dot final pass.
+        let bind_group_layout_dot_final =
+            device
+                .device()
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("fix128_dot_final_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
         let pipeline_layout =
             device
                 .device()
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("fix128_add_pl"),
                     bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let pipeline_layout_dot_final =
+            device
+                .device()
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("fix128_dot_final_pl"),
+                    bind_group_layouts: &[&bind_group_layout_dot_final],
                     push_constant_ranges: &[],
                 });
 
@@ -857,14 +993,25 @@ impl<'a> Fix128WgpuKernel<'a> {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
-        let pipeline_dot =
+        let pipeline_dot_partial =
             device
                 .device()
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("fix128_dot_pipeline"),
+                    label: Some("fix128_dot_partial_pipeline"),
                     layout: Some(&pipeline_layout),
                     module: &shader_dot,
-                    entry_point: Some("fix128_dot_main"),
+                    entry_point: Some("fix128_dot_partial_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+        let pipeline_dot_final =
+            device
+                .device()
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("fix128_dot_final_pipeline"),
+                    layout: Some(&pipeline_layout_dot_final),
+                    module: &shader_dot_final,
+                    entry_point: Some("fix128_dot_final_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
@@ -874,8 +1021,10 @@ impl<'a> Fix128WgpuKernel<'a> {
             pipeline_add,
             pipeline_sub,
             pipeline_mul,
-            pipeline_dot,
+            pipeline_dot_partial,
+            pipeline_dot_final,
             bind_group_layout,
+            bind_group_layout_dot_final,
         }
     }
 
@@ -982,47 +1131,94 @@ impl<'a> Fix128WgpuKernel<'a> {
         self.dispatch_binary(&self.pipeline_mul, "fix128_mul", a, b, out);
     }
 
-    /// Dispatch the Fix128 `dot` kernel — computes
-    /// `Σ a[i] × b[i]` on the GPU using a single-thread serial
-    /// accumulate that preserves index-ordered addition (required by
-    /// the determinism contract §1 経路 3 since two's-complement
-    /// addition is not associative under wraparound).
+    /// Dispatch the Fix128 `dot` kernel — computes `Σ a[i] × b[i]`
+    /// via a two-phase multi-workgroup pipeline that preserves
+    /// canonical index order (determinism contract §1 経路 3).
+    ///
+    /// # Pipeline
+    ///
+    /// - **Phase 1** (`FIX128_DOT_WGSL::fix128_dot_partial_main`):
+    ///   dispatched with K = ⌈N / 4096⌉ workgroups of 64 threads.
+    ///   Each workgroup reduces its 4096-element chunk in-block-order
+    ///   and writes one partial to `partials_buf[wg]`.
+    /// - **Phase 2** (`FIX128_DOT_FINAL_WGSL::fix128_dot_final_main`):
+    ///   one workgroup of one thread folds `partials_buf[0..K]` in
+    ///   workgroup-index order into `output[0]`.
+    ///
+    /// Both passes are recorded in a single `CommandEncoder`, so
+    /// wgpu inserts the storage-buffer barrier between them. The
+    /// workgroup completion order in Phase 1 does not affect the
+    /// result because each workgroup writes a distinct
+    /// `partials_buf` slot; the total arithmetic order is fully
+    /// determined by the Phase 2 loop.
     ///
     /// `a` and `b` must have identical lengths. Returns `ZERO` when
     /// the inputs are empty. Bit-for-bit equivalent to the CPU
-    /// reference `acc.add(a[i].mul(b[i]))` loop.
+    /// reference `for i { acc = acc.add(a[i].mul(b[i])) }` loop.
     pub fn dot(&self, a: &[Fix128Gpu], b: &[Fix128Gpu]) -> Fix128Gpu {
         assert_eq!(a.len(), b.len(), "Fix128 dot: input slice length mismatch");
         if a.is_empty() {
             return Fix128Gpu::ZERO;
         }
 
-        let out_bytes = std::mem::size_of::<Fix128Gpu>() as u64;
+        // K workgroups cover N elements at 4096 per workgroup. This
+        // constant must match `ELEMS_PER_WORKGROUP` in FIX128_DOT_WGSL.
+        const ELEMS_PER_WORKGROUP: u32 = 4096;
+        let n = a.len() as u32;
+        let k = n.div_ceil(ELEMS_PER_WORKGROUP);
+
+        let fix128_bytes = std::mem::size_of::<Fix128Gpu>() as u64;
+        let partials_bytes = u64::from(k) * fix128_bytes;
+        let out_bytes = fix128_bytes;
+
         let buf_a = self
             .device
             .create_buffer_init("fix128_dot_a", bytemuck::cast_slice(a));
         let buf_b = self
             .device
             .create_buffer_init("fix128_dot_b", bytemuck::cast_slice(b));
+        let buf_partials = self
+            .device
+            .create_buffer_empty("fix128_dot_partials", partials_bytes);
         let buf_out = self.device.create_buffer_empty("fix128_dot_out", out_bytes);
 
-        let bind_group = self
+        // Phase 1 bind group: (input_a, input_b, partials_out) — 3-buffer layout.
+        let bind_group_partial =
+            self.device
+                .device()
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("fix128_dot_partial_bg"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buf_a.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: buf_b.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: buf_partials.as_entire_binding(),
+                        },
+                    ],
+                });
+
+        // Phase 2 bind group: (partials_in, output) — 2-buffer layout.
+        let bind_group_final = self
             .device
             .device()
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("fix128_dot_bg"),
-                layout: &self.bind_group_layout,
+                label: Some("fix128_dot_final_bg"),
+                layout: &self.bind_group_layout_dot_final,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: buf_a.as_entire_binding(),
+                        resource: buf_partials.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: buf_b.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
                         resource: buf_out.as_entire_binding(),
                     },
                 ],
@@ -1036,11 +1232,20 @@ impl<'a> Fix128WgpuKernel<'a> {
                 });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("fix128_dot_pass"),
+                label: Some("fix128_dot_partial_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline_dot);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_pipeline(&self.pipeline_dot_partial);
+            pass.set_bind_group(0, &bind_group_partial, &[]);
+            pass.dispatch_workgroups(k, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fix128_dot_final_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_dot_final);
+            pass.set_bind_group(0, &bind_group_final, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         self.device.submit(encoder);
@@ -1448,11 +1653,40 @@ mod tests {
         assert!(FIX128_DOT_WGSL.contains("u64_mul_wide"));
         assert!(FIX128_DOT_WGSL.contains("fix128_add_kernel"));
         assert!(FIX128_DOT_WGSL.contains("fix128_mul_kernel"));
-        assert!(FIX128_DOT_WGSL.contains("fix128_dot_main"));
+        assert!(FIX128_DOT_WGSL.contains("fix128_dot_partial_main"));
         assert!(FIX128_DOT_WGSL.contains("@compute"));
         assert!(FIX128_DOT_WGSL.contains("@workgroup_size(64)"));
         assert!(FIX128_DOT_WGSL.contains("var<workgroup> partials"));
         assert!(FIX128_DOT_WGSL.contains("workgroupBarrier"));
+        assert!(FIX128_DOT_WGSL.contains("ELEMS_PER_WORKGROUP"));
+        assert!(FIX128_DOT_WGSL.contains("workgroup_id"));
+    }
+
+    /// The Fix128 dot Phase 2 shader ships the fold helpers and the
+    /// single-thread final-accumulate entry point.
+    #[test]
+    fn wgsl_dot_final_shader_helpers_present() {
+        assert!(FIX128_DOT_FINAL_WGSL.contains("u64_add"));
+        assert!(FIX128_DOT_FINAL_WGSL.contains("fix128_add_kernel"));
+        assert!(FIX128_DOT_FINAL_WGSL.contains("fix128_dot_final_main"));
+        assert!(FIX128_DOT_FINAL_WGSL.contains("@compute"));
+        assert!(FIX128_DOT_FINAL_WGSL.contains("@workgroup_size(1)"));
+    }
+
+    /// The dot Phase 2 shader must compile as valid WGSL. Skips when
+    /// no GPU adapter is available (headless CI).
+    #[test]
+    fn wgsl_dot_final_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_dot_final_shader_compile_test"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_DOT_FINAL_WGSL.into()),
+            });
     }
 
     /// The dot shader must compile as valid WGSL. Skips when no GPU
@@ -1579,6 +1813,54 @@ mod tests {
         assert_eq!(
             gpu, cpu,
             "N=100 parallel dot mismatch: GPU {gpu:?} vs CPU {cpu:?}"
+        );
+    }
+
+    /// v0.7.1 multi-workgroup stress test — feeds 10 000 elements
+    /// through the Phase 1 + Phase 2 pipeline. K = ⌈10 000 / 4096⌉ = 3
+    /// workgroups, so this exercises:
+    ///
+    /// - Cross-workgroup partial writes to `partials_buf[0..3]`
+    /// - The Phase 2 workgroup-index-ordered serial fold
+    /// - Storage-buffer barrier between the two dispatches
+    ///
+    /// A successful byte-for-byte match with the single-thread CPU
+    /// reference proves that the total arithmetic order is
+    /// canonical index 0..N regardless of workgroup completion
+    /// scheduling.
+    #[test]
+    fn wgpu_dot_large_10000_matches_cpu_golden() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let kernel = Fix128WgpuKernel::new(&device);
+
+        // Vary sign and hi/lo bits across the range so re-ordered
+        // sums would produce different wraparound.
+        let a: Vec<Fix128Gpu> = (0..10_000i64)
+            .map(|i| {
+                let sign = if i % 7 == 0 { -1 } else { 1 };
+                Fix128Gpu::from_raw(sign * i, ((i as u64) & 0xFFFF) << 40)
+            })
+            .collect();
+        let b: Vec<Fix128Gpu> = (0..10_000i64)
+            .map(|i| {
+                let sign = if i % 11 == 0 { -1 } else { 1 };
+                Fix128Gpu::from_raw(sign * (i + 1), ((i as u64).wrapping_mul(37)) & 0xFFFF)
+            })
+            .collect();
+
+        let gpu = kernel.dot(&a, &b);
+
+        let mut cpu = Fix128Gpu::ZERO;
+        for i in 0..a.len() {
+            cpu = cpu.add(a[i].mul(b[i]));
+        }
+
+        assert_eq!(
+            gpu, cpu,
+            "N=10000 multi-workgroup dot mismatch: GPU {gpu:?} vs CPU {cpu:?}"
         );
     }
 

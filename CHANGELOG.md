@@ -2,6 +2,39 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.7.1] - 2026-07-04
+
+### Changed
+
+- **Fix128 dot product scales to arbitrary N via a 2-dispatch multi-workgroup pipeline.**
+  - **Phase 1** (`FIX128_DOT_WGSL::fix128_dot_partial_main`, `@workgroup_size(64)`): K = ⌈N / 4096⌉ workgroups each reduce a 4096-element chunk with the v0.7.0 in-block-ordered 64-thread blocked layout, writing one Fix128 to `partials_buf[wg]`.
+  - **Phase 2** (`FIX128_DOT_FINAL_WGSL::fix128_dot_final_main`, `@workgroup_size(1)`): one thread folds `partials_buf[0..K]` in workgroup-index order into `output[0]`.
+  - Both passes recorded in a single `CommandEncoder`; wgpu inserts the storage-buffer barrier between them. Workgroup completion order in Phase 1 does not affect the result because each workgroup writes a distinct slot — the total arithmetic order is fixed by the Phase 2 loop.
+- **Entry point rename**: `FIX128_DOT_WGSL::fix128_dot_main` → `fix128_dot_partial_main` (shader-source consumers must update; `Fix128WgpuKernel::dot` Rust API is unchanged).
+
+### Added
+
+- **`FIX128_DOT_FINAL_WGSL`** — new public constant for the Phase 2 shader (2-buffer bind group: partials read + output read_write).
+- **`wgpu_dot_large_10000_matches_cpu_golden`** — determinism proof on N = 10 000 (3 workgroups), mixed-sign fixture with interleaved hi/lo bits; GPU multi-workgroup matches CPU single-thread golden byte-for-byte.
+- **`wgsl_dot_final_shader_helpers_present`** + **`wgsl_dot_final_shader_compiles`** — coverage tests for the new Phase 2 shader.
+- Extra symbol assertions in `wgsl_dot_shader_helpers_present`: `ELEMS_PER_WORKGROUP` / `workgroup_id`.
+
+### Verified on
+
+- **macOS Apple Silicon (M3, Metal)** — 29/29 fix128 tests pass, 149/149 physics-solver tests pass (local)
+- **Platform matrix CI** — pending (Metal / Vulkan lavapipe / DX12 WARP)
+
+### Roadmap scope decisions
+
+- **Multi-workgroup dot** — **shipped** (this release)
+- **`criterion` benchmark for measured speedup** — **deferred to v0.7.2 candidate**. Software adapters in the CI matrix cannot produce meaningful throughput numbers; benchmark makes sense as a manually-run measurement on real hardware.
+- **Real hardware CI (self-hosted runner / GitHub GPU tier)** — **out of scope for automated releases**. Runner infrastructure and billing configuration are user-controlled operational decisions, not Rust code changes.
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.7.0 at the Rust API level (`Fix128WgpuKernel::dot` / `Fix128GpuKernel::dot` unchanged).
+- Shader-source consumers who load `FIX128_DOT_WGSL` and dispatch the `fix128_dot_main` entry point must update the entry name to `fix128_dot_partial_main` and pair it with `FIX128_DOT_FINAL_WGSL`. This is called out under **Changed** above.
+
 ## [0.7.0] - 2026-07-04
 
 ### Changed
