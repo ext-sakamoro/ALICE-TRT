@@ -668,12 +668,19 @@ const ELEMS_PER_WORKGROUP: u32 = 4096u;
 var<workgroup> partials: array<Fix128Gpu, 64>;
 
 @compute @workgroup_size(64)
-fn fix128_dot_partial_main(
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wgid: vec3<u32>,
-) {
-    let t = lid.x;
-    let wg = wgid.x;
+fn fix128_dot_partial_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // Derive local + workgroup indices from a single global_invocation_id
+    // builtin rather than declaring @builtin(local_invocation_id) and
+    // @builtin(workgroup_id) separately. WG_SIZE is 64 = 2^6, so:
+    //   t  = gid.x mod 64  = gid.x & 63u   (local index within workgroup)
+    //   wg = gid.x div 64  = gid.x >> 6u   (workgroup index)
+    // This avoids the multi-builtin declaration pattern that some
+    // WARP DXIL translation paths mishandled — WARP crashed
+    // STATUS_ACCESS_VIOLATION on the v0.7.1 variant with two
+    // @builtin parameters. Deriving both from a single builtin is
+    // semantically identical and passes on Metal / Vulkan.
+    let t = gid.x & 63u;
+    let wg = gid.x >> 6u;
     let n = arrayLength(&input_a);
 
     let wg_start = wg * ELEMS_PER_WORKGROUP;
@@ -1673,7 +1680,10 @@ mod tests {
         assert!(FIX128_DOT_WGSL.contains("var<workgroup> partials"));
         assert!(FIX128_DOT_WGSL.contains("workgroupBarrier"));
         assert!(FIX128_DOT_WGSL.contains("ELEMS_PER_WORKGROUP"));
-        assert!(FIX128_DOT_WGSL.contains("workgroup_id"));
+        // Note: v0.8.1 rewrite eliminated `@builtin(workgroup_id)` in
+        // favour of deriving the workgroup index from
+        // `global_invocation_id` (see the FIX128_DOT_WGSL source).
+        assert!(FIX128_DOT_WGSL.contains("global_invocation_id"));
     }
 
     /// The Fix128 dot Phase 2 shader ships the fold helpers and the

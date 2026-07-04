@@ -112,21 +112,14 @@ jobs:
         # 4 shader-source presence tests + naga compile checks (compile
         # tests skip themselves when no adapter is available).
 
-      - name: Test — Fix128 GPU dispatch (mac/linux — full 29 tests)
-        if: matrix.os != 'windows-latest'
+      - name: Test — Fix128 GPU dispatch (all platforms — full 29 tests)
         run: cargo test --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1
-
-      - name: Test — Fix128 GPU dispatch (windows — skip wgpu_dot_* WARP-hostile fixtures)
-        if: matrix.os == 'windows-latest'
-        run: cargo test --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1 --skip wgpu_dot_ --skip wgpu_trait_dot_
-        # DX12 WARP on windows-latest crashes STATUS_ACCESS_VIOLATION
-        # on every fixture of the v0.7.1 two-dispatch dot pipeline,
-        # regardless of N (reproduces from the smallest single-element
-        # fixture). v0.8.0 upgraded to wgpu 24, but the crash
-        # persists — this is a WARP driver-level issue that neither
-        # encoder splitting nor wgpu version bumps resolve. The
-        # determinism proofs are still verified on Metal (Apple M3)
-        # and Vulkan (lavapipe software), which together cover the
-        # WGSL → MSL / SPIR-V transpile matrix. Windows WARP remains
-        # verified for `add` / `sub` / `mul` (17 tests).
+        # v0.8.1 candidate 1: eliminated `@builtin(workgroup_id)` from
+        # FIX128_DOT_WGSL Phase 1 shader by deriving the workgroup
+        # index from `global_invocation_id`. This test step will
+        # verify whether the WARP STATUS_ACCESS_VIOLATION was caused
+        # by the multi-builtin declaration pattern that WARP DXIL
+        # transpile mishandled. If Windows still crashes, subsequent
+        # candidates will target the 2-buffer bind group layout
+        # (Phase 2) and the sequential dispatch pattern.
 
