@@ -1228,7 +1228,7 @@ impl<'a> Fix128WgpuKernel<'a> {
             self.device
                 .device()
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("fix128_dot_enc"),
+                    label: Some("fix128_dot_partial_enc"),
                 });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1239,8 +1239,22 @@ impl<'a> Fix128WgpuKernel<'a> {
             pass.set_bind_group(0, &bind_group_partial, &[]);
             pass.dispatch_workgroups(k, 1, 1);
         }
+        // Force a device-level sync between phases: two compute passes
+        // in the same encoder crashed the DX12 WARP driver on
+        // windows-latest CI runners (STATUS_ACCESS_VIOLATION), so we
+        // submit each phase in its own encoder. The overhead is one
+        // extra submit — negligible relative to the Phase 1 dispatch.
+        self.device.submit(encoder);
+        self.device.poll_wait();
+
+        let mut encoder_final =
+            self.device
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("fix128_dot_final_enc"),
+                });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut pass = encoder_final.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("fix128_dot_final_pass"),
                 timestamp_writes: None,
             });
@@ -1248,7 +1262,7 @@ impl<'a> Fix128WgpuKernel<'a> {
             pass.set_bind_group(0, &bind_group_final, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        self.device.submit(encoder);
+        self.device.submit(encoder_final);
         self.device.poll_wait();
 
         let raw = self.device.read_buffer(&buf_out, out_bytes);
