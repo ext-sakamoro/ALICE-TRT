@@ -2,6 +2,41 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.8.0] - 2026-07-04
+
+### Changed
+
+- **`wgpu` dependency: 23 → 24** (minor major bump reaches the wgpu 24 stability train)
+  - Only breaking change in our surface: `wgpu::Instance::new()` now takes `&InstanceDescriptor` instead of `InstanceDescriptor` by value — one-line fix in `src/device.rs`
+  - All existing pipelines / bind groups / compute shaders compile unchanged
+  - No API changes to `Fix128WgpuKernel` / `Fix128GpuKernel` / `GpuDevice` public surface
+
+### Verified on
+
+- **macOS Apple Silicon (M3, Metal)** — 29/29 fix128 tests pass, 149/149 physics-solver tests pass (local)
+- **Platform matrix CI** — Metal (mac) / Vulkan (Ubuntu lavapipe) / DX12 (Windows WARP) all green
+
+### WARP crash investigation outcome
+
+The `wgpu 23 → 24` upgrade was originally motivated by the DX12 WARP `STATUS_ACCESS_VIOLATION` on the v0.7.1 two-dispatch dot pipeline. **The crash persists on wgpu 24** with the exact same signature (crash on `wgpu_dot_large_10000_matches_cpu_golden`, reproduces from the smallest single-element fixture). Root cause is a WARP driver-level issue that neither encoder splitting, serial test execution, nor wgpu version bumps resolve. The Windows-only `--skip wgpu_dot_ --skip wgpu_trait_dot_` workflow flag from v0.7.1 is retained on windows-latest.
+
+The determinism proofs are still verified on:
+
+- **Metal (Apple M3)** — full 29-test suite including `wgpu_dot_large_10000_matches_cpu_golden` (K = 3 workgroups)
+- **Vulkan (lavapipe software)** — full 29-test suite
+
+Together these cover the WGSL → MSL / SPIR-V transpile matrix. DXIL is verified for `add` / `sub` / `mul` (17 tests).
+
+### Roadmap for v0.8.1+
+
+- criterion benchmark for measured speedup on Apple M3 Metal (deferred candidate)
+- ALICE-Physics `GpuSolverBridge` live wiring (PGS iteration path)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.7.1 at the public API level
+- Downstream crates importing `alice-trt` may need to bump their own `wgpu` dependency to 24 to avoid duplicate wgpu versions in the build graph (Cargo will resolve, but `wgpu::Device` / `wgpu::Buffer` types differ across major versions)
+
 ## [0.7.1] - 2026-07-04
 
 ### Changed
