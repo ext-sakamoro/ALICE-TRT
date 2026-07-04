@@ -7,7 +7,7 @@
 use crate::{
     Activation, GpuDevice, GpuInferenceEngine, GpuTensor, GpuTernaryWeight, TernaryCompute,
 };
-use alice_physics::{Fix128, RigidBody, Vec3Fix};
+use alice_physics::RigidBody;
 
 /// GPU-accelerated physics controller.
 ///
@@ -136,6 +136,7 @@ fn body_to_input(body: &RigidBody) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alice_physics::{Fix128, Vec3Fix};
 
     #[test]
     fn test_body_to_input() {

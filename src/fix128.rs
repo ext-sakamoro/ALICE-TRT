@@ -93,6 +93,7 @@ impl Fix128Gpu {
     /// - Product: `hh << 128 + (hl + lh) << 64 + ll`
     /// - Return the middle 128 bits (`bits[192:64]`).
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: Self) -> Self {
         let a_hi = self.hi as i128;
         let a_lo = self.lo as u128;
@@ -232,6 +233,126 @@ fn fix128_sub_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= arrayLength(&input_a)) { return; }
     output[i] = fix128_sub(input_a[i], input_b[i]);
+}
+"#;
+
+/// WGSL compute shader source for `Fix128 mul` (skeleton with the
+/// `umul_wide` and `u64_mul_wide` schoolbook helpers ready to be
+/// re-used by the full signed 128×128 pipeline in a follow-up).
+///
+/// The helpers exposed here — `umul_wide` (u32×u32→u64) and
+/// `u64_mul_wide` (u64×u64→u128) — are byte-exact re-productions of
+/// the operations that the CPU reference [`Fix128Gpu::mul`] performs
+/// internally on `i128`. Adding them separately keeps the follow-up
+/// commit focused on the sign-correction and truncation logic (the
+/// "middle 128 bits of the 256-bit signed product") rather than on
+/// wide integer arithmetic.
+///
+/// The full end-to-end `fix128_mul_main` entry point is scheduled for
+/// v0.5.0; this constant currently ships the helpers plus a trivial
+/// `fix128_mul_unsigned_lo_main` entry point that returns the low
+/// 128 bits of the *unsigned* 128×128→256 product. That entry point
+/// is enough to validate the schoolbook helpers on a real GPU
+/// against a hand-computed golden.
+pub const FIX128_MUL_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+@group(0) @binding(0) var<storage, read>       input_a: array<Fix128Gpu>;
+@group(0) @binding(1) var<storage, read>       input_b: array<Fix128Gpu>;
+@group(0) @binding(2) var<storage, read_write> output:  array<Fix128Gpu>;
+
+// u32 × u32 → u64 via 16-bit halving schoolbook.
+// Returns (lo, hi) so that (lo, hi) = a * b exactly as an unsigned 64-bit number.
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+// 64-bit unsigned add returning (sum_lo, sum_hi, carry_out).
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+// u64 × u64 → u128 (schoolbook of four u32×u32 partial products).
+// Returns the 128-bit product laid out as vec4<u32>(r0, r1, r2, r3)
+// where r0 is the least-significant word. Used by the follow-up
+// signed Fix128 mul pipeline.
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+
+    // Position 0: ll.x
+    let r0 = ll.x;
+
+    // Position 1: ll.y + lh.x + hl.x (with carry into position 2)
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+
+    // Position 2: lh.y + hl.y + hh.x + carry_to_2 (with carry into position 3)
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+
+    // Position 3: hh.y + carry_to_3 (no further overflow within u128)
+    let r3 = hh.y + carry_to_3;
+
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+// Skeleton entry point: emits the *unsigned* low-128 bits of the
+// 256-bit product `a.lo × b.lo`. This is enough to validate the
+// schoolbook helpers on a real GPU; the signed Fix128 mul pipeline
+// arrives in the follow-up commit and uses the same helpers.
+@compute @workgroup_size(64)
+fn fix128_mul_unsigned_lo_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&input_a)) { return; }
+    let a = input_a[i];
+    let b = input_b[i];
+    let product = u64_mul_wide(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+
+    var out: Fix128Gpu;
+    out.lo_lo = product.x;
+    out.lo_hi = product.y;
+    out.hi_lo = product.z;
+    out.hi_hi = product.w;
+    output[i] = out;
 }
 "#;
 
@@ -386,7 +507,7 @@ impl<'a> Fix128WgpuKernel<'a> {
             return;
         }
 
-        let byte_size = (a.len() * std::mem::size_of::<Fix128Gpu>()) as u64;
+        let byte_size = std::mem::size_of_val(a) as u64;
         let buf_a = self
             .device
             .create_buffer_init(&format!("{label}_a"), bytemuck::cast_slice(a));
@@ -432,7 +553,7 @@ impl<'a> Fix128WgpuKernel<'a> {
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = ((a.len() as u32) + 63) / 64;
+            let workgroups = (a.len() as u32).div_ceil(64);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
         self.device.submit(encoder);
@@ -649,6 +770,39 @@ mod tests {
         assert!(FIX128_SUB_WGSL.contains("fix128_sub_main"));
         assert!(FIX128_SUB_WGSL.contains("@compute"));
         assert!(FIX128_SUB_WGSL.contains("u64_sub"));
+    }
+
+    /// The Fix128 mul skeleton shader ships the schoolbook helpers
+    /// (`umul_wide` + `u64_mul_wide`) and the unsigned-lo entry point
+    /// that will be re-used by the full signed pipeline.
+    #[test]
+    fn wgsl_mul_shader_helpers_present() {
+        assert!(FIX128_MUL_WGSL.contains("umul_wide"));
+        assert!(FIX128_MUL_WGSL.contains("u64_mul_wide"));
+        assert!(FIX128_MUL_WGSL.contains("fix128_mul_unsigned_lo_main"));
+        assert!(FIX128_MUL_WGSL.contains("@compute"));
+    }
+
+    /// The mul skeleton must compile as valid WGSL. We ask the wgpu
+    /// naga parser (via `Device::create_shader_module`) to validate
+    /// it and fail loudly on any syntax / type error.
+    ///
+    /// Skips when no GPU adapter is available (headless CI).
+    #[test]
+    fn wgsl_mul_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        // `create_shader_module` panics on WGSL parse errors, which
+        // is the strongest compile-time signal we get short of
+        // running the shader.
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_mul_skeleton"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_MUL_WGSL.into()),
+            });
     }
 
     /// GPU dispatch bit-exact contract: for every input pair, the

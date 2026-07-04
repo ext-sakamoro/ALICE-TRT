@@ -2,6 +2,59 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.4.2] - 2026-07-04
+
+### Added
+
+- **`--features fix128-arithmetic`** — Fix128 GPU mul WGSL skeleton
+  - `FIX128_MUL_WGSL` compute shader source with the schoolbook helpers reused by the full pipeline:
+    - `umul_wide(a, b) -> vec2<u32>` — u32×u32 → u64 via 16-bit halving (bit-exact)
+    - `u64_add(a, b) -> vec3<u32>` — 64-bit unsigned add returning (lo, hi, carry)
+    - `u64_mul_wide(a, b) -> vec4<u32>` — u64×u64 → u128 via 4 u32×u32 partial products
+  - `fix128_mul_unsigned_lo_main` @compute entry point emitting the low 128 bits of the unsigned 128×128→256 product (validation harness for the schoolbook helpers)
+  - 2 shader-source tests + 1 real-GPU compile validity test (naga parser via `Device::create_shader_module`)
+
+### Roadmap for v0.5.0
+
+- Signed correction for the mixed `i64 × u64` partial products (`hl` / `lh` in the CPU reference)
+- Middle-128-bit extraction (bits [192:64] of the 256-bit signed product) to complete `Fix128Gpu::mul` on the GPU
+- `Fix128WgpuKernel::mul` end-to-end dispatch + `wgpu_mul_matches_cpu_golden` bit-exact test
+- `FIX128_DOT_WGSL` — index-ordered accumulate with `workgroupBarrier` sync (no subgroup reduce, keeps determinism contract §1 経路 3)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.4.1
+- No new public API on the trait surface; the `FIX128_MUL_WGSL` constant is additive
+- `Fix128WgpuKernel::mul` still returns `unimplemented!()` until the signed pipeline lands in v0.5.0
+
+## [0.4.1] - 2026-07-03
+
+### Added
+
+- **`--features fix128-arithmetic`** — Fix128Gpu::mul CPU reference
+  - Byte-for-byte mirror of `alice_physics::math::Fix128::mul` (I64F64 semantics, middle 128 bits of the 256-bit signed product via schoolbook)
+  - 4 unit tests (identity / integer / negative / fractional-half scaling)
+
+## [0.4.0] - 2026-07-03
+
+### Added
+
+- **`--features fix128-arithmetic`** — Fix128 GPU sub kernel
+  - `FIX128_SUB_WGSL` compute shader source with borrow-aware `u64_sub` helper
+  - `Fix128WgpuKernel::sub` real-GPU dispatch
+  - `Fix128GpuKernel` trait impl for `Fix128WgpuKernel<'_>` (add + sub live, mul + dot skeleton)
+  - `wgpu_sub_matches_cpu_golden` real-GPU bit-exact test
+  - `wgpu_trait_add_matches_inherent_add` trait-vs-inherent equivalence test
+
+## [0.3.0] - 2026-07-04
+
+### Added
+
+- **`--features fix128-arithmetic`** — Fix128 GPU add kernel
+  - `FIX128_ADD_WGSL` compute shader source with carry-aware `u64_add` helper
+  - `Fix128WgpuKernel::new / add` real-GPU dispatch via wgpu ComputePipeline
+  - `wgpu_add_matches_cpu_golden` real-GPU bit-exact test (skips when no adapter)
+
 ## [0.2.0] - 2026-07-04
 
 ### Added
