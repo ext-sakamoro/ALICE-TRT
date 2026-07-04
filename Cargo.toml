@@ -1,6 +1,6 @@
 [package]
 name = "alice-trt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 description = "GPU Ternary Inference Engine - Don't move data. Move the law."
@@ -24,6 +24,8 @@ sdf = ["dep:alice-sdf"]  # GPU neural SDF approximation via ternary networks
 db = ["dep:alice-db"]  # ALICE-DB inference metrics persistence
 view = []  # ALICE-View neural upscaling bridge
 voice = []  # GPU voice feature extraction bridge
+fix128-arithmetic = []  # Fix128 GPU primitive kernels (add/sub/mul/dot) for physics solver offload
+physics-solver = ["physics", "fix128-arithmetic", "alice-physics/gpu-solver-bridge"]  # Compute-shader-based Fix128 physics solver (ALICE-Physics GpuSolverBridge implementer)
 
 [dependencies]
 wgpu = "23"

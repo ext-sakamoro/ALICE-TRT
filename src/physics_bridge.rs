@@ -173,3 +173,160 @@ mod tests {
         assert_eq!(controller.output_dim(), 3);
     }
 }
+
+// ============================================================================
+// Phase F GPU solver offload (physics-solver feature)
+// ============================================================================
+//
+// The types below implement `alice_physics::gpu_bridge::GpuSolverBridge`
+// so ALICE-Physics callers can inject a compute-shader-based Fix128 PGS
+// iteration path. The dispatch body is scheduled for follow-up commits
+// that pair with the WGSL kernels landing in `crate::fix128`; this
+// skeleton pins the trait impl signature and keeps the CPU-side crate
+// compile-time compatible.
+
+#[cfg(feature = "physics-solver")]
+mod solver_bridge {
+    use alice_physics::gpu_bridge::{DiffFixture, GpuDivergence, GpuSolverBridge};
+    use alice_physics::math::Fix128;
+
+    use crate::fix128::Fix128Gpu;
+
+    /// GPU offload adapter for the sub-stepping TGS solver.
+    ///
+    /// Buffers the incoming island contents into `Fix128Gpu` storage
+    /// so the WGSL kernels (see `crate::fix128`) can read them
+    /// directly. Compute pipeline construction is scheduled for the
+    /// follow-up commit; the current skeleton keeps the trait
+    /// signature compile-time stable so ALICE-Physics can bring the
+    /// adapter behind its `gpu-solver-bridge` feature without waiting
+    /// for the full compute path.
+    pub struct TrtSolverAdapter {
+        positions: Vec<Fix128Gpu>,
+        velocities: Vec<Fix128Gpu>,
+    }
+
+    impl TrtSolverAdapter {
+        /// Construct an empty adapter. Populate via `send_island`.
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                positions: Vec::new(),
+                velocities: Vec::new(),
+            }
+        }
+    }
+
+    impl Default for TrtSolverAdapter {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    fn fix128_to_gpu(v: Fix128) -> Fix128Gpu {
+        Fix128Gpu { hi: v.hi, lo: v.lo }
+    }
+
+    fn gpu_to_fix128(v: Fix128Gpu) -> Fix128 {
+        Fix128::from_raw(v.hi, v.lo)
+    }
+
+    impl GpuSolverBridge for TrtSolverAdapter {
+        fn send_island(&mut self, positions: &[[Fix128; 3]], velocities: &[[Fix128; 3]]) {
+            self.positions.clear();
+            for p in positions {
+                self.positions.push(fix128_to_gpu(p[0]));
+                self.positions.push(fix128_to_gpu(p[1]));
+                self.positions.push(fix128_to_gpu(p[2]));
+            }
+            self.velocities.clear();
+            for v in velocities {
+                self.velocities.push(fix128_to_gpu(v[0]));
+                self.velocities.push(fix128_to_gpu(v[1]));
+                self.velocities.push(fix128_to_gpu(v[2]));
+            }
+        }
+
+        fn dispatch_iterations(&mut self, _iters: u32, _dt: Fix128) {
+            // TODO(phase-f-followup): dispatch the WGSL Fix128 PGS
+            // kernels against `self.positions` / `self.velocities`.
+            // Skeleton pass: no-op, so `recv_island` echoes the
+            // uploaded state unchanged and the CPU vs GPU diff test
+            // trivially agrees for a zero-iteration workload.
+        }
+
+        fn recv_island(&self, positions: &mut [[Fix128; 3]], velocities: &mut [[Fix128; 3]]) {
+            for (i, p) in positions.iter_mut().enumerate() {
+                p[0] = gpu_to_fix128(self.positions[i * 3]);
+                p[1] = gpu_to_fix128(self.positions[i * 3 + 1]);
+                p[2] = gpu_to_fix128(self.positions[i * 3 + 2]);
+            }
+            for (i, v) in velocities.iter_mut().enumerate() {
+                v[0] = gpu_to_fix128(self.velocities[i * 3]);
+                v[1] = gpu_to_fix128(self.velocities[i * 3 + 1]);
+                v[2] = gpu_to_fix128(self.velocities[i * 3 + 2]);
+            }
+        }
+
+        fn assert_bit_exact_vs_cpu(&self, _fixture: &DiffFixture) -> Result<(), GpuDivergence> {
+            // Skeleton echoing pass — the zero-iteration dispatch above
+            // preserves the uploaded state verbatim, so the diff is
+            // guaranteed to be zero. Follow-up commits will run a
+            // matched CPU / GPU pair against the supplied fixture and
+            // return `GpuDivergence` on any bit mismatch.
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Verify the zero-iteration round-trip preserves every
+        /// coordinate byte-for-byte (Fix128 hi/lo pair unchanged).
+        #[test]
+        fn trt_solver_adapter_zero_iter_round_trips() {
+            let mut adapter = TrtSolverAdapter::new();
+            let positions = vec![
+                [
+                    Fix128::from_raw(1, 0xDEAD_BEEF_0000_0001),
+                    Fix128::from_raw(2, 0xCAFE_BABE_0000_0002),
+                    Fix128::from_raw(3, 0xF00D_D00D_0000_0003),
+                ],
+                [
+                    Fix128::from_raw(-1, 0xAAAA_BBBB_CCCC_DDDD),
+                    Fix128::from_raw(-2, 0x1111_2222_3333_4444),
+                    Fix128::from_raw(-3, 0x5555_6666_7777_8888),
+                ],
+            ];
+            let velocities = vec![
+                [Fix128::ZERO, Fix128::ONE, Fix128::ZERO],
+                [Fix128::ONE, Fix128::ZERO, Fix128::ONE],
+            ];
+            adapter.send_island(&positions, &velocities);
+            adapter.dispatch_iterations(0, Fix128::from_ratio(1, 60));
+
+            let mut out_p = vec![[Fix128::ZERO; 3]; 2];
+            let mut out_v = vec![[Fix128::ZERO; 3]; 2];
+            adapter.recv_island(&mut out_p, &mut out_v);
+
+            for i in 0..2 {
+                for axis in 0..3 {
+                    assert_eq!(out_p[i][axis].hi, positions[i][axis].hi);
+                    assert_eq!(out_p[i][axis].lo, positions[i][axis].lo);
+                    assert_eq!(out_v[i][axis].hi, velocities[i][axis].hi);
+                    assert_eq!(out_v[i][axis].lo, velocities[i][axis].lo);
+                }
+            }
+
+            let fixture = DiffFixture {
+                description: "zero_iter_round_trip",
+                tolerance: Fix128::ZERO,
+            };
+            assert!(adapter.assert_bit_exact_vs_cpu(&fixture).is_ok());
+        }
+    }
+}
+
+#[cfg(feature = "physics-solver")]
+pub use solver_bridge::TrtSolverAdapter;

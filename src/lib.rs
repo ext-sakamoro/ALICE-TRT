@@ -106,6 +106,8 @@
 )]
 
 pub mod device;
+#[cfg(feature = "fix128-arithmetic")]
+pub mod fix128;
 pub mod inference;
 pub mod kernel;
 pub mod pipeline;
