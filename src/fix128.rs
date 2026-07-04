@@ -685,26 +685,27 @@ fn fix128_dot_partial_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let wg_start = wg * ELEMS_PER_WORKGROUP;
 
-    // Workgroups past the input tail write ZERO and exit — Phase 2
-    // will happily fold zeros without altering the result.
-    if (wg_start >= n) {
-        if (t == 0u) {
-            var z: Fix128Gpu;
-            z.hi_lo = 0u;
-            z.hi_hi = 0u;
-            z.lo_lo = 0u;
-            z.lo_hi = 0u;
-            output[wg] = z;
-        }
-        return;
-    }
-
-    let wg_end_unclamped = wg_start + ELEMS_PER_WORKGROUP;
+    // DirectX FXC's uniformity analysis on WARP requires that
+    // `workgroupBarrier()` be reached by every thread through
+    // identical flow control. An early `return` for out-of-tail
+    // workgroups upstream of the barrier triggers FXC error
+    // X4026 ("thread sync operation must be in non-varying flow
+    // control") and — with `@builtin(workgroup_id)` — used to
+    // manifest as a runtime `STATUS_ACCESS_VIOLATION` instead of
+    // a compile error. We therefore keep the flow uniform: every
+    // workgroup executes the same code path, and out-of-tail
+    // workgroups simply write ZERO by leaving `partial` at its
+    // default value and clamping their `wg_end` to `wg_start`.
+    let wg_start_clamped = select(wg_start, n, wg_start > n);
+    let wg_end_unclamped = wg_start_clamped + ELEMS_PER_WORKGROUP;
     let wg_end = select(wg_end_unclamped, n, wg_end_unclamped > n);
-    let wg_len = wg_end - wg_start;
+    let wg_len = wg_end - wg_start_clamped;
 
     // Block boundaries within this workgroup's slice.
-    let block_size = (wg_len + WG_SIZE - 1u) / WG_SIZE;
+    // `wg_len` is 0 for out-of-tail workgroups, so `block_size`
+    // collapses to 0 and every thread's `local_start = local_end`,
+    // which cleanly skips the accumulate loop below.
+    let block_size = select((wg_len + WG_SIZE - 1u) / WG_SIZE, 0u, wg_len == 0u);
     let local_start = t * block_size;
     let local_end_unclamped = local_start + block_size;
     let local_end = select(local_end_unclamped, wg_len, local_end_unclamped > wg_len);
@@ -716,8 +717,8 @@ fn fix128_dot_partial_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     partial.lo_hi = 0u;
 
     if (local_start < local_end) {
-        let start = wg_start + local_start;
-        let end = wg_start + local_end;
+        let start = wg_start_clamped + local_start;
+        let end = wg_start_clamped + local_end;
         for (var i: u32 = start; i < end; i = i + 1u) {
             let product = fix128_mul_kernel(input_a[i], input_b[i]);
             partial = fix128_add_kernel(partial, product);
