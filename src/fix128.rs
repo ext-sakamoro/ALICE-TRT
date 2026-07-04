@@ -146,6 +146,186 @@ fn fix128_add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// wgpu dispatch backend (Fix128 add) — pairs with the WGSL shader above.
+// ---------------------------------------------------------------------------
+
+/// wgpu-based dispatch backend for the Fix128 GPU kernels.
+///
+/// Owns the `ComputePipeline` + `BindGroupLayout` compiled from
+/// [`FIX128_ADD_WGSL`]. Constructed once per `GpuDevice`; each
+/// `add` call uploads the two input slices, dispatches the compute
+/// pipeline, and reads the results back into the caller-owned
+/// output slice.
+///
+/// # Determinism
+/// - Workgroup size is fixed at 64, dispatched in ascending
+///   `global_invocation_id` order (skill §1 経路 5).
+/// - No `atomicAdd` / subgroup reductions are used inside the shader
+///   (skill §1 経路 3); each output index is computed by a single
+///   thread from a single pair of inputs.
+/// - Rust-side `bytemuck::cast_slice` preserves the little-endian
+///   `#[repr(C)] { hi: i64, lo: u64 }` layout, so the shader sees the
+///   same bit pattern as the CPU reference.
+pub struct Fix128WgpuKernel<'a> {
+    device: &'a crate::device::GpuDevice,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl<'a> Fix128WgpuKernel<'a> {
+    /// Compile the WGSL shader and build the compute pipeline against
+    /// the supplied `GpuDevice`. This is cheap enough to be done at
+    /// scene load; the resulting kernel can be reused for every
+    /// `add` dispatch.
+    #[must_use]
+    pub fn new(device: &'a crate::device::GpuDevice) -> Self {
+        let shader = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_add_shader"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_ADD_WGSL.into()),
+            });
+
+        let bind_group_layout =
+            device
+                .device()
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("fix128_add_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let pipeline_layout =
+            device
+                .device()
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("fix128_add_pl"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let pipeline = device
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("fix128_add_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("fix128_add_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        Self {
+            device,
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    /// Dispatch the Fix128 `add` kernel. `a`, `b`, and `out` must
+    /// have identical lengths; the caller owns the output slice.
+    pub fn add(&self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "Fix128 add: input slices must match length"
+        );
+        assert_eq!(
+            a.len(),
+            out.len(),
+            "Fix128 add: output slice length mismatch"
+        );
+        if a.is_empty() {
+            return;
+        }
+
+        let byte_size = (a.len() * std::mem::size_of::<Fix128Gpu>()) as u64;
+        let buf_a = self
+            .device
+            .create_buffer_init("fix128_add_a", bytemuck::cast_slice(a));
+        let buf_b = self
+            .device
+            .create_buffer_init("fix128_add_b", bytemuck::cast_slice(b));
+        let buf_out = self.device.create_buffer_empty("fix128_add_out", byte_size);
+
+        let bind_group = self
+            .device
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("fix128_add_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf_a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buf_out.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut encoder =
+            self.device
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("fix128_add_enc"),
+                });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fix128_add_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = ((a.len() as u32) + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.device.submit(encoder);
+        self.device.poll_wait();
+
+        let raw = self.device.read_buffer(&buf_out, byte_size);
+        let result: &[Fix128Gpu] = bytemuck::cast_slice(&raw);
+        out.copy_from_slice(result);
+    }
+}
+
 /// GPU kernel dispatch trait for Fix128 element-wise arithmetic.
 ///
 /// Backends implementing this trait own a compute pipeline that
@@ -263,5 +443,51 @@ mod tests {
         assert!(FIX128_ADD_WGSL.contains("fix128_add_main"));
         assert!(FIX128_ADD_WGSL.contains("@compute"));
         assert!(FIX128_ADD_WGSL.contains("workgroup_size(64)"));
+    }
+
+    /// GPU dispatch bit-exact contract: for every input pair, the
+    /// wgpu backend must produce the exact same `hi` / `lo` pair as
+    /// the CPU reference [`Fix128Gpu::add`]. Fixtures cover the three
+    /// carry-propagation regimes exercised by the CPU tests above:
+    /// no carry, carry into hi, and two's complement negative.
+    ///
+    /// Skips when no GPU adapter is available (headless CI).
+    #[test]
+    fn wgpu_add_matches_cpu_golden() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return, // No GPU adapter — headless CI, skip.
+        };
+        let kernel = Fix128WgpuKernel::new(&device);
+
+        let a = vec![
+            Fix128Gpu::from_raw(1, 0x0000_0000_0000_0001),
+            Fix128Gpu::from_raw(1, u64::MAX),
+            Fix128Gpu::from_raw(-1, u64::MAX),
+            Fix128Gpu::from_raw(0, 0xDEAD_BEEF_CAFE_BABE),
+        ];
+        let b = vec![
+            Fix128Gpu::from_raw(2, 0x0000_0000_0000_0002),
+            Fix128Gpu::from_raw(0, 1),
+            Fix128Gpu::from_raw(0, 1),
+            Fix128Gpu::from_raw(0, 0x1111_2222_3333_4444),
+        ];
+        let mut out = vec![Fix128Gpu::ZERO; 4];
+
+        kernel.add(&a, &b, &mut out);
+
+        for i in 0..a.len() {
+            let cpu_ref = a[i].add(b[i]);
+            assert_eq!(
+                out[i].hi, cpu_ref.hi,
+                "hi mismatch at i={i}: GPU {} vs CPU {}",
+                out[i].hi, cpu_ref.hi
+            );
+            assert_eq!(
+                out[i].lo, cpu_ref.lo,
+                "lo mismatch at i={i}: GPU {:#x} vs CPU {:#x}",
+                out[i].lo, cpu_ref.lo
+            );
+        }
     }
 }
