@@ -146,8 +146,65 @@ fn fix128_add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader source for `Fix128 sub` — mirrors
+/// [`FIX128_ADD_WGSL`] with borrow propagation replacing carry
+/// propagation. Same bind group layout (3 storage buffers,
+/// `Fix128Gpu` arrays); entry point is
+/// `@compute @workgroup_size(64) fn fix128_sub_main`.
+///
+/// The CPU reference is [`Fix128Gpu::sub`]; the two implementations
+/// must produce byte-identical results on every platform.
+pub const FIX128_SUB_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+@group(0) @binding(0) var<storage, read>       input_a: array<Fix128Gpu>;
+@group(0) @binding(1) var<storage, read>       input_b: array<Fix128Gpu>;
+@group(0) @binding(2) var<storage, read_write> output:  array<Fix128Gpu>;
+
+// 64-bit unsigned sub, returning (diff_lo, diff_hi, borrow_out).
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let diff_lo = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid     = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let diff_hi = mid - borrow1;
+    let borrow3 = select(0u, 1u, mid < borrow1);
+    return vec3<u32>(diff_lo, diff_hi, borrow2 + borrow3);
+}
+
+fn fix128_sub(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    // Lo half (unsigned 64-bit sub).
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+
+    // Hi half (unsigned 64-bit sub, interpreted as two's complement signed).
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    // Fold the borrow from the lo half into the hi total.
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+@compute @workgroup_size(64)
+fn fix128_sub_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&input_a)) { return; }
+    output[i] = fix128_sub(input_a[i], input_b[i]);
+}
+"#;
+
 // ---------------------------------------------------------------------------
-// wgpu dispatch backend (Fix128 add) — pairs with the WGSL shader above.
+// wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
 
 /// wgpu-based dispatch backend for the Fix128 GPU kernels.
@@ -169,7 +226,8 @@ fn fix128_add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 ///   same bit pattern as the CPU reference.
 pub struct Fix128WgpuKernel<'a> {
     device: &'a crate::device::GpuDevice,
-    pipeline: wgpu::ComputePipeline,
+    pipeline_add: wgpu::ComputePipeline,
+    pipeline_sub: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -180,11 +238,17 @@ impl<'a> Fix128WgpuKernel<'a> {
     /// `add` dispatch.
     #[must_use]
     pub fn new(device: &'a crate::device::GpuDevice) -> Self {
-        let shader = device
+        let shader_add = device
             .device()
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fix128_add_shader"),
                 source: wgpu::ShaderSource::Wgsl(FIX128_ADD_WGSL.into()),
+            });
+        let shader_sub = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_sub_shader"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_SUB_WGSL.into()),
             });
 
         let bind_group_layout =
@@ -235,36 +299,56 @@ impl<'a> Fix128WgpuKernel<'a> {
                     push_constant_ranges: &[],
                 });
 
-        let pipeline = device
-            .device()
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("fix128_add_pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("fix128_add_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
+        let pipeline_add =
+            device
+                .device()
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("fix128_add_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader_add,
+                    entry_point: Some("fix128_add_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+        let pipeline_sub =
+            device
+                .device()
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("fix128_sub_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader_sub,
+                    entry_point: Some("fix128_sub_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
         Self {
             device,
-            pipeline,
+            pipeline_add,
+            pipeline_sub,
             bind_group_layout,
         }
     }
 
-    /// Dispatch the Fix128 `add` kernel. `a`, `b`, and `out` must
-    /// have identical lengths; the caller owns the output slice.
-    pub fn add(&self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+    /// Internal helper — dispatches the given pipeline against the
+    /// two input slices and reads the result back into `out`.
+    fn dispatch_binary(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        label: &str,
+        a: &[Fix128Gpu],
+        b: &[Fix128Gpu],
+        out: &mut [Fix128Gpu],
+    ) {
         assert_eq!(
             a.len(),
             b.len(),
-            "Fix128 add: input slices must match length"
+            "Fix128 dispatch: input slices must match length"
         );
         assert_eq!(
             a.len(),
             out.len(),
-            "Fix128 add: output slice length mismatch"
+            "Fix128 dispatch: output slice length mismatch"
         );
         if a.is_empty() {
             return;
@@ -273,17 +357,19 @@ impl<'a> Fix128WgpuKernel<'a> {
         let byte_size = (a.len() * std::mem::size_of::<Fix128Gpu>()) as u64;
         let buf_a = self
             .device
-            .create_buffer_init("fix128_add_a", bytemuck::cast_slice(a));
+            .create_buffer_init(&format!("{label}_a"), bytemuck::cast_slice(a));
         let buf_b = self
             .device
-            .create_buffer_init("fix128_add_b", bytemuck::cast_slice(b));
-        let buf_out = self.device.create_buffer_empty("fix128_add_out", byte_size);
+            .create_buffer_init(&format!("{label}_b"), bytemuck::cast_slice(b));
+        let buf_out = self
+            .device
+            .create_buffer_empty(&format!("{label}_out"), byte_size);
 
         let bind_group = self
             .device
             .device()
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("fix128_add_bg"),
+                label: Some(&format!("{label}_bg")),
                 layout: &self.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -305,14 +391,14 @@ impl<'a> Fix128WgpuKernel<'a> {
             self.device
                 .device()
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("fix128_add_enc"),
+                    label: Some(&format!("{label}_enc")),
                 });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("fix128_add_pass"),
+                label: Some(&format!("{label}_pass")),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let workgroups = ((a.len() as u32) + 63) / 64;
             pass.dispatch_workgroups(workgroups, 1, 1);
@@ -323,6 +409,44 @@ impl<'a> Fix128WgpuKernel<'a> {
         let raw = self.device.read_buffer(&buf_out, byte_size);
         let result: &[Fix128Gpu] = bytemuck::cast_slice(&raw);
         out.copy_from_slice(result);
+    }
+
+    /// Dispatch the Fix128 `add` kernel. `a`, `b`, and `out` must
+    /// have identical lengths; the caller owns the output slice.
+    pub fn add(&self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        self.dispatch_binary(&self.pipeline_add, "fix128_add", a, b, out);
+    }
+
+    /// Dispatch the Fix128 `sub` kernel. `a`, `b`, and `out` must
+    /// have identical lengths.
+    pub fn sub(&self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        self.dispatch_binary(&self.pipeline_sub, "fix128_sub", a, b, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fix128GpuKernel trait bridge (add/sub live via wgpu; mul/dot pending)
+// ---------------------------------------------------------------------------
+
+impl Fix128GpuKernel for Fix128WgpuKernel<'_> {
+    fn add(&mut self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        Fix128WgpuKernel::add(self, a, b, out);
+    }
+
+    fn sub(&mut self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        Fix128WgpuKernel::sub(self, a, b, out);
+    }
+
+    fn mul(&mut self, _a: &[Fix128Gpu], _b: &[Fix128Gpu], _out: &mut [Fix128Gpu]) {
+        unimplemented!(
+            "Fix128 mul: WGSL kernel + Fix128WgpuKernel::mul scheduled for the next release"
+        );
+    }
+
+    fn dot(&mut self, _a: &[Fix128Gpu], _b: &[Fix128Gpu], _out: &mut Fix128Gpu) {
+        unimplemented!(
+            "Fix128 dot: WGSL kernel + Fix128WgpuKernel::dot scheduled for the next release"
+        );
     }
 }
 
@@ -445,6 +569,15 @@ mod tests {
         assert!(FIX128_ADD_WGSL.contains("workgroup_size(64)"));
     }
 
+    /// The Fix128 sub shader source is a non-empty compile-time
+    /// constant with the required entry point.
+    #[test]
+    fn wgsl_sub_shader_is_present() {
+        assert!(FIX128_SUB_WGSL.contains("fix128_sub_main"));
+        assert!(FIX128_SUB_WGSL.contains("@compute"));
+        assert!(FIX128_SUB_WGSL.contains("u64_sub"));
+    }
+
     /// GPU dispatch bit-exact contract: for every input pair, the
     /// wgpu backend must produce the exact same `hi` / `lo` pair as
     /// the CPU reference [`Fix128Gpu::add`]. Fixtures cover the three
@@ -489,5 +622,75 @@ mod tests {
                 out[i].lo, cpu_ref.lo
             );
         }
+    }
+
+    /// GPU dispatch bit-exact contract for `sub` — mirrors the add
+    /// golden test but exercises borrow propagation instead of
+    /// carry propagation.
+    #[test]
+    fn wgpu_sub_matches_cpu_golden() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let kernel = Fix128WgpuKernel::new(&device);
+
+        let a = vec![
+            Fix128Gpu::from_raw(5, 10),
+            Fix128Gpu::from_raw(3, 0),
+            Fix128Gpu::from_raw(0, 0),
+            Fix128Gpu::from_raw(-1, u64::MAX),
+        ];
+        let b = vec![
+            Fix128Gpu::from_raw(2, 3),
+            Fix128Gpu::from_raw(0, 1),
+            Fix128Gpu::from_raw(0, 1),
+            Fix128Gpu::from_raw(-2, 0),
+        ];
+        let mut out = vec![Fix128Gpu::ZERO; 4];
+
+        kernel.sub(&a, &b, &mut out);
+
+        for i in 0..a.len() {
+            let cpu_ref = a[i].sub(b[i]);
+            assert_eq!(
+                out[i].hi, cpu_ref.hi,
+                "sub hi mismatch at i={i}: GPU {} vs CPU {}",
+                out[i].hi, cpu_ref.hi
+            );
+            assert_eq!(
+                out[i].lo, cpu_ref.lo,
+                "sub lo mismatch at i={i}: GPU {:#x} vs CPU {:#x}",
+                out[i].lo, cpu_ref.lo
+            );
+        }
+    }
+
+    /// The `Fix128GpuKernel` trait bridge routes `add` / `sub` to the
+    /// live wgpu pipelines while `mul` / `dot` remain
+    /// `unimplemented!`. Verifies the trait method matches
+    /// [`Fix128WgpuKernel::add`] byte-for-byte.
+    #[test]
+    fn wgpu_trait_add_matches_inherent_add() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut kernel = Fix128WgpuKernel::new(&device);
+
+        let a = vec![
+            Fix128Gpu::from_raw(1, u64::MAX),
+            Fix128Gpu::from_raw(-3, 42),
+        ];
+        let b = vec![Fix128Gpu::from_raw(0, 1), Fix128Gpu::from_raw(5, 100)];
+        let mut via_inherent = vec![Fix128Gpu::ZERO; 2];
+        let mut via_trait = vec![Fix128Gpu::ZERO; 2];
+
+        // Inherent method
+        Fix128WgpuKernel::add(&kernel, &a, &b, &mut via_inherent);
+        // Trait method
+        <Fix128WgpuKernel<'_> as Fix128GpuKernel>::add(&mut kernel, &a, &b, &mut via_trait);
+
+        assert_eq!(via_inherent, via_trait);
     }
 }
