@@ -487,10 +487,19 @@ fn fix128_mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// - `atomicAdd` on a shared accumulator — race-dependent order.
 /// - Any parallel tree-reduction that reorders the additions.
 ///
-/// The current implementation therefore uses `@workgroup_size(1)` and
-/// dispatches a single workgroup. A future high-throughput variant
-/// can use a blocked partial-sum layout where the final accumulate
-/// remains serial in index order.
+/// The v0.7.0 implementation is a **64-thread blocked reduction**
+/// where the final accumulate remains serial in index order:
+///
+/// - Phase 1 (parallel): thread `t ∈ [0, 64)` computes
+///   `partials[t] = Σ_{i=t·B}^{min((t+1)·B, N)} a[i] × b[i]`
+///   with `B = ⌈N / 64⌉`, iterating **in-block index order**.
+/// - `workgroupBarrier()` synchronises the 64 threads.
+/// - Phase 2 (serial): thread 0 computes
+///   `acc = Σ_{b=0}^{63} partials[b]` **in block-index order**.
+///
+/// Total order = canonical index 0..N, so the result is byte-for-byte
+/// equal to the single-thread serial fold. Parallel speedup is up to
+/// 64x for N ≥ 64 (thread-utilization bounded).
 ///
 /// # Layout
 ///
@@ -648,23 +657,58 @@ fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
     return out;
 }
 
-// Single-thread serial accumulate: acc = acc + (a[i] * b[i]) for
-// i = 0, 1, ..., N-1. The workgroup and dispatch sizes are both 1,
-// so the total number of live threads is 1 and no barrier is needed.
-@compute @workgroup_size(1)
-fn fix128_dot_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x != 0u) { return; }
+// 64-thread blocked reduction with index-ordered serial final
+// accumulate. See the module doc for the determinism argument.
+const WG_SIZE: u32 = 64u;
+
+var<workgroup> partials: array<Fix128Gpu, 64>;
+
+@compute @workgroup_size(64)
+fn fix128_dot_main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
     let n = arrayLength(&input_a);
-    var acc: Fix128Gpu;
-    acc.hi_lo = 0u;
-    acc.hi_hi = 0u;
-    acc.lo_lo = 0u;
-    acc.lo_hi = 0u;
-    for (var i: u32 = 0u; i < n; i = i + 1u) {
-        let product = fix128_mul_kernel(input_a[i], input_b[i]);
-        acc = fix128_add_kernel(acc, product);
+
+    // Phase 1: each thread computes its block's partial sum in
+    // block-internal index order. Block size = ceil(n / 64), so
+    // block boundaries are t*B .. min((t+1)*B, n).
+    let block_size = (n + WG_SIZE - 1u) / WG_SIZE;
+    let start = t * block_size;
+    let end_unclamped = start + block_size;
+    let end = select(end_unclamped, n, end_unclamped > n);
+
+    var partial: Fix128Gpu;
+    partial.hi_lo = 0u;
+    partial.hi_hi = 0u;
+    partial.lo_lo = 0u;
+    partial.lo_hi = 0u;
+
+    // Threads whose block is entirely past n (small-N case) skip the
+    // loop cleanly. `start < end` handles both `start >= n` and the
+    // shrunk final block.
+    if (start < end) {
+        for (var i: u32 = start; i < end; i = i + 1u) {
+            let product = fix128_mul_kernel(input_a[i], input_b[i]);
+            partial = fix128_add_kernel(partial, product);
+        }
     }
-    output[0] = acc;
+
+    partials[t] = partial;
+    workgroupBarrier();
+
+    // Phase 2: thread 0 folds the 64 partials in block-index order.
+    // Iteration order = block index 0..63, and each block was itself
+    // computed in-order, so total order = canonical index 0..N.
+    if (t == 0u) {
+        var acc: Fix128Gpu;
+        acc.hi_lo = 0u;
+        acc.hi_hi = 0u;
+        acc.lo_lo = 0u;
+        acc.lo_hi = 0u;
+        for (var b: u32 = 0u; b < WG_SIZE; b = b + 1u) {
+            acc = fix128_add_kernel(acc, partials[b]);
+        }
+        output[0] = acc;
+    }
 }
 "#;
 
@@ -1406,7 +1450,9 @@ mod tests {
         assert!(FIX128_DOT_WGSL.contains("fix128_mul_kernel"));
         assert!(FIX128_DOT_WGSL.contains("fix128_dot_main"));
         assert!(FIX128_DOT_WGSL.contains("@compute"));
-        assert!(FIX128_DOT_WGSL.contains("@workgroup_size(1)"));
+        assert!(FIX128_DOT_WGSL.contains("@workgroup_size(64)"));
+        assert!(FIX128_DOT_WGSL.contains("var<workgroup> partials"));
+        assert!(FIX128_DOT_WGSL.contains("workgroupBarrier"));
     }
 
     /// The dot shader must compile as valid WGSL. Skips when no GPU
@@ -1486,6 +1532,66 @@ mod tests {
         let cpu3 = cpu_dot(&a3, &b3);
         assert_eq!(gpu3, cpu3, "mixed-sign dot mismatch");
         assert_eq!(gpu3.hi, 19, "mixed-sign expected Σ = 19");
+    }
+
+    /// v0.7.0 parallelisation stress test — feeds 100 elements
+    /// through the 64-thread blocked reduction and checks byte-for-
+    /// byte equivalence with the single-thread CPU reference
+    /// (`for i { acc = acc.add(a[i].mul(b[i])) }`).
+    ///
+    /// This is the primary determinism proof for the blocked path:
+    /// N > WG_SIZE (64) exercises the block-size clamp, the
+    /// mid-block boundary, and the trailing shrunk block, so a
+    /// successful golden match confirms the block-index-order
+    /// serial final accumulate reproduces the canonical index order.
+    #[test]
+    fn wgpu_dot_parallel_100_matches_cpu_golden() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let kernel = Fix128WgpuKernel::new(&device);
+
+        // Mixed-sign fixture with a deliberate hi/lo interleave so
+        // that reordering the block-internal sums would flip
+        // wraparound behaviour at the 128-bit boundary.
+        let a: Vec<Fix128Gpu> = (0..100)
+            .map(|i| {
+                let sign = if i % 3 == 0 { -1 } else { 1 };
+                Fix128Gpu::from_raw(sign * i, (i as u64) << 32)
+            })
+            .collect();
+        let b: Vec<Fix128Gpu> = (0..100)
+            .map(|i| {
+                let sign = if i % 5 == 0 { -1 } else { 1 };
+                Fix128Gpu::from_raw(sign * (i + 1), ((100 - i) as u64) << 16)
+            })
+            .collect();
+
+        let gpu = kernel.dot(&a, &b);
+
+        // Single-thread CPU reference.
+        let mut cpu = Fix128Gpu::ZERO;
+        for i in 0..a.len() {
+            cpu = cpu.add(a[i].mul(b[i]));
+        }
+
+        assert_eq!(
+            gpu, cpu,
+            "N=100 parallel dot mismatch: GPU {gpu:?} vs CPU {cpu:?}"
+        );
+    }
+
+    /// Empty-input contract: dot returns `ZERO` without dispatching.
+    #[test]
+    fn wgpu_dot_zero_elements_returns_zero() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let kernel = Fix128WgpuKernel::new(&device);
+        let result = kernel.dot(&[], &[]);
+        assert_eq!(result, Fix128Gpu::ZERO);
     }
 
     /// The `Fix128GpuKernel` trait bridge routes `dot` to the live

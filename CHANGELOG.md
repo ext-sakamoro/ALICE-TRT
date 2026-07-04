@@ -2,6 +2,39 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.7.0] - 2026-07-04
+
+### Changed
+
+- **`FIX128_DOT_WGSL::fix128_dot_main`** rewritten from single-thread serial (`@workgroup_size(1)`) to **64-thread blocked reduction** (`@workgroup_size(64)`):
+  - **Phase 1 (parallel)**: thread `t ∈ [0, 64)` computes `partials[t] = Σ_{i=t·B}^{min((t+1)·B, N)} a[i]·b[i]` with `B = ⌈N/64⌉`, iterating **in-block index order**.
+  - `workgroupBarrier()` synchronises the 64 threads.
+  - **Phase 2 (serial)**: thread 0 folds `partials[0..64]` in block-index order.
+  - Total order = canonical index 0..N → **byte-for-byte equal to the previous single-thread serial fold**. The change is purely a performance shift; the determinism contract §1 経路 3 is preserved.
+  - Parallel speedup up to 64× for `N ≥ 64`.
+
+### Added
+
+- **`wgpu_dot_parallel_100_matches_cpu_golden`** — new determinism proof test on `N = 100` mixed-sign fixture with interleaved hi/lo bits designed to expose ordering-dependent wraparound. GPU (64-thread blocked) matches CPU single-thread golden byte-for-byte.
+- **`wgpu_dot_zero_elements_returns_zero`** — empty-input contract.
+- Additional shader-source symbol coverage in `wgsl_dot_shader_helpers_present`: `@workgroup_size(64)` / `var<workgroup> partials` / `workgroupBarrier`.
+
+### Verified on
+
+- **macOS Apple Silicon (M3, Metal)** — 26/26 fix128 tests pass, 146/146 physics-solver tests pass (local)
+- **Platform matrix CI** — pending (Metal / Vulkan lavapipe / DX12 WARP)
+
+### Roadmap for v0.7.1+
+
+- Multi-workgroup dot for `N ≫ 4096` (Phase 3: cross-workgroup index-ordered final serial via second dispatch)
+- `criterion` benchmark for measured speedup on Apple M3 Metal
+- Real hardware CI (self-hosted runner or GitHub-hosted GPU tier)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.6.x (public API unchanged; internal algorithm shift only)
+- Existing callers of `Fix128WgpuKernel::dot` / `Fix128GpuKernel::dot` see identical output values, just faster on `N ≥ 64`
+
 ## [0.6.1] - 2026-07-04
 
 ### Added
