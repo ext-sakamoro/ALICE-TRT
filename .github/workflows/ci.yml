@@ -113,11 +113,19 @@ jobs:
         # tests skip themselves when no adapter is available).
 
       - name: Test — Fix128 GPU dispatch (all fix128 tests, GPU tests self-skip on no-adapter)
-        run: cargo test --lib --features fix128-arithmetic fix128 -- --nocapture
+        run: cargo test --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1
         # The wgpu_* tests early-return on `GpuDevice::new()` failure,
         # so this step passes even on runners where no adapter is
         # exposed. When an adapter is available (Metal on macos-latest,
         # lavapipe on ubuntu-latest, WARP on windows-latest) the same
         # tests exercise the full GPU dispatch path and check
         # bit-exact equivalence with the CPU reference.
+        #
+        # `--test-threads=1` forces serial execution: DX12 WARP on
+        # windows-latest crashed (STATUS_ACCESS_VIOLATION) when
+        # multiple wgpu tests ran in parallel and allocated storage
+        # buffers concurrently. Serial execution keeps each test's
+        # device state isolated. The performance cost is minor since
+        # each test's GPU dispatch is sub-millisecond on real
+        # hardware and only marginally longer on software adapters.
 
