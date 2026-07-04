@@ -32,3 +32,58 @@ jobs:
           fail_level: error
           reporter: github-check
 
+  fix128-gpu-matrix:
+    name: Fix128 GPU (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned to rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: clippy
+
+      - name: Install Vulkan / Mesa (Linux only — enables lavapipe software adapter)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mesa-vulkan-drivers \
+            vulkan-tools \
+            libvulkan1 \
+            libvulkan-dev
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-fix128-${{ hashFiles('Cargo.toml') }}
+
+      - name: Build (fix128-arithmetic)
+        run: cargo build --lib --features fix128-arithmetic
+
+      - name: Test — Fix128 CPU reference (always runs, no GPU dep)
+        run: cargo test --lib --features fix128-arithmetic fix128::tests::fix128_gpu_
+        # 11 CPU-only fixture tests (const / from_raw / add / sub / mul).
+
+      - name: Test — WGSL shader source symbol coverage (always runs, no GPU dep)
+        run: cargo test --lib --features fix128-arithmetic fix128::tests::wgsl_
+        # 4 shader-source presence tests + naga compile checks (compile
+        # tests skip themselves when no adapter is available).
+
+      - name: Test — Fix128 GPU dispatch (all fix128 tests, GPU tests self-skip on no-adapter)
+        run: cargo test --lib --features fix128-arithmetic fix128 -- --nocapture
+        # The wgpu_* tests early-return on `GpuDevice::new()` failure,
+        # so this step passes even on runners where no adapter is
+        # exposed. When an adapter is available (Metal on macos-latest,
+        # lavapipe on ubuntu-latest, WARP on windows-latest) the same
+        # tests exercise the full GPU dispatch path and check
+        # bit-exact equivalence with the CPU reference.
+

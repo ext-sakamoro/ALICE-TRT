@@ -2,6 +2,25 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.6.1] - 2026-07-04
+
+### Added
+
+- **Platform matrix CI** — new `fix128-gpu-matrix` job in `.github/workflows/ci.yml`
+  - Runs on `macos-latest` (Metal) / `ubuntu-latest` (Vulkan via lavapipe / Mesa) / `windows-latest` (DX12 WARP)
+  - Three test tiers per platform:
+    1. CPU reference (11 `fix128_gpu_*` fixture tests — always run, no GPU dependency)
+    2. Shader source coverage (`wgsl_*` presence + naga compile checks)
+    3. Full GPU dispatch (`wgpu_*` bit-exact golden — self-skip on no-adapter, exercise the full pipeline when an adapter is exposed)
+  - Ubuntu step installs `mesa-vulkan-drivers` / `vulkan-tools` / `libvulkan1` so lavapipe can serve a software Vulkan adapter
+  - Toolchain pinned to `1.92.0` (matches `rust-toolchain.toml`)
+  - Cargo registry + `target/` cache keyed on `hashFiles('Cargo.toml')`
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.6.0
+- No public API changes; CI-only patch release
+
 ## [0.6.0] - 2026-07-04
 
 ### Added
