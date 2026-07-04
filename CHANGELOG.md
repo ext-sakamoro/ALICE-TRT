@@ -2,6 +2,45 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.8.1] - 2026-07-04
+
+### Fixed — WARP crash root cause resolved
+
+**The Windows DX12 WARP `STATUS_ACCESS_VIOLATION` on the two-dispatch dot pipeline (tracked since v0.7.1) is now fully fixed on all three platforms.**
+
+Root cause: FXC (DirectX shader compiler) rejects `workgroupBarrier()` reached through flow control that FXC's uniformity analysis cannot statically prove is uniform (error X4026: *"thread sync operation must be in non-varying flow control"*). The v0.7.1 shader placed an early `return` before the barrier for out-of-tail workgroups. With `@builtin(workgroup_id)` (v0.7.1 form), FXC still compiled it but the WARP DXIL runtime mishandled the divergent early-return + barrier path and crashed with a runtime access violation. With `@builtin(global_invocation_id)`-derived workgroup index (v0.8.1 candidate 1), FXC could no longer prove uniformity and surfaced a **compile-time** X4026 error — which turned the mysterious runtime crash into an actionable diagnostic.
+
+Fix: **restructure the Phase 1 shader so every thread reaches `workgroupBarrier()` through identical flow control.** The early `return` for `wg_start >= n` is replaced with a clamp of `wg_start` to `n` and a `wg_len = 0` fallback, so out-of-tail workgroups execute the same code path but their accumulate loop bounds are empty (partial remains ZERO). All threads unconditionally reach the barrier; FXC's uniformity check passes; both the compile-time X4026 and the v0.7.1 runtime crash disappear.
+
+### Changed
+
+- **`FIX128_DOT_WGSL::fix128_dot_partial_main`** — Phase 1 shader restructured:
+  - `@builtin(local_invocation_id)` + `@builtin(workgroup_id)` two-builtin signature replaced with single `@builtin(global_invocation_id)`, derives `t = gid.x & 63u` / `wg = gid.x >> 6u`
+  - Early `return` on out-of-tail workgroups eliminated; replaced with `wg_start_clamped` + `wg_len = 0` uniform-flow fallback
+  - `workgroupBarrier()` now reached by every thread through identical flow (FXC X4026 compliant)
+  - Semantics preserved: out-of-tail workgroups still write ZERO to `partials_out[wg]`, byte-for-byte equal to previous behaviour
+- **CI `fix128-gpu-matrix` job** — the Windows-only `--skip wgpu_dot_ --skip wgpu_trait_dot_` flag is **removed**. All three platforms now run the full 29-test suite.
+
+### Verified on platform matrix CI
+
+| Platform | Backend | Tests run | Wall time |
+|----------|---------|----------:|----------:|
+| macos-latest | Metal (Apple) | **29/29 (full)** | 0.66s |
+| ubuntu-latest | Vulkan (lavapipe SW) | **29/29 (full)** | 1.20s |
+| windows-latest | DX12 (WARP SW) | **29/29 (full)** | 6.17s |
+
+Windows WARP is now fully verified for `add` / `sub` / `mul` / `dot` on all fixture sizes including `wgpu_dot_large_10000_matches_cpu_golden` (N = 10 000, K = 3 workgroups).
+
+### Roadmap for v0.8.2+
+
+- criterion benchmark for measured speedup on Apple M3 Metal (deferred candidate)
+- ALICE-Physics `GpuSolverBridge` live wiring (PGS iteration path)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.8.0 at the public API level
+- Downstream shader-source consumers who inspect `FIX128_DOT_WGSL` see a slightly restructured Phase 1 but the entry point name (`fix128_dot_partial_main`) and bind group layout (3 storage buffers) are unchanged
+
 ## [0.8.0] - 2026-07-04
 
 ### Changed
