@@ -87,19 +87,15 @@ jobs:
           # scoped to fix128 tests, so this narrows the CI surface
           # rather than the tested surface.
           #
+          # `sed -i.bak` is portable across BSD (macOS) and GNU (Linux).
           # Remove the three optional declaration lines.
-          if command -v gsed >/dev/null 2>&1; then
-            SED=gsed
-          else
-            SED=sed
-          fi
-          $SED -i.bak '/^alice-physics = {/d; /^alice-sdf = {/d; /^alice-db = {/d' Cargo.toml
+          sed -i.bak '/^alice-physics = {/d; /^alice-sdf = {/d; /^alice-db = {/d' Cargo.toml
           # Feature entries that reference the stripped crates must
           # also go, otherwise cargo will complain about unknown deps.
-          $SED -i.bak '/^physics = \["dep:alice-physics"/d' Cargo.toml
-          $SED -i.bak '/^sdf = \["dep:alice-sdf"/d' Cargo.toml
-          $SED -i.bak '/^db = \["dep:alice-db"/d' Cargo.toml
-          $SED -i.bak '/^physics-solver = /d' Cargo.toml
+          sed -i.bak '/^physics = \["dep:alice-physics"/d' Cargo.toml
+          sed -i.bak '/^sdf = \["dep:alice-sdf"/d' Cargo.toml
+          sed -i.bak '/^db = \["dep:alice-db"/d' Cargo.toml
+          sed -i.bak '/^physics-solver = /d' Cargo.toml
           rm -f Cargo.toml.bak
           echo "--- stripped Cargo.toml [dependencies] ---"
           grep -E "^(alice-|\[)" Cargo.toml || true
