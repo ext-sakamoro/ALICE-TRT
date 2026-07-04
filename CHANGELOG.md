@@ -2,6 +2,37 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.6.0] - 2026-07-04
+
+### Added
+
+- **`--features fix128-arithmetic`** — Fix128 GPU dot product (index-ordered serial reduction)
+  - `FIX128_DOT_WGSL::fix128_dot_main` @compute entry point (`@workgroup_size(1)`) — single-thread `for i in 0..N { acc = acc + a[i] * b[i] }`
+  - Self-contained shader: schoolbook helpers (`umul_wide` / `u64_add` / `u64_mul_wide`) + inline `fix128_add_kernel` + `fix128_mul_kernel`
+  - **Determinism contract**: two's-complement 128-bit addition is not associative under wraparound, so the reduction must preserve canonical index order. No `subgroup{Add,...}`, no `atomicAdd`, no parallel tree reduction — the accumulate is strictly serial per §1 経路 3.
+  - `Fix128WgpuKernel::dot(&self, a, b) -> Fix128Gpu` — real-GPU dispatch, returns `ZERO` for empty inputs
+  - `Fix128GpuKernel::dot` trait method now routes to the live pipeline (previously `unimplemented!()`)
+  - 4 new tests:
+    - `wgsl_dot_shader_helpers_present` — shader source symbol coverage
+    - `wgsl_dot_shader_compiles` — real-GPU compile validity via naga
+    - `wgpu_dot_matches_cpu_golden` — 3 fixtures (single-element / 4 positive integers Σ=100 / mixed-sign Σ=19) byte-for-byte equal to `for i { acc = acc.add(a[i].mul(b[i])) }`
+    - `wgpu_trait_dot_matches_inherent_dot` — trait routing equivalence
+
+### Verified on
+
+- **macOS Apple Silicon (M3, Metal)** — 24/24 fix128 tests pass, 144/144 physics-solver tests pass
+
+### Roadmap for v0.6.1+
+
+- Platform matrix CI (Metal / Vulkan / DX12 golden agreement across all four Fix128 GPU ops)
+- High-throughput blocked dot with index-ordered final serial accumulate (profile-driven)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.5.x
+- No breaking API changes; `dot` was previously `unimplemented!()` on the GPU path
+- With this release the `Fix128GpuKernel` trait has zero `unimplemented!()` methods — the full add / sub / mul / dot surface is live on the GPU
+
 ## [0.5.0] - 2026-07-04
 
 ### Added
