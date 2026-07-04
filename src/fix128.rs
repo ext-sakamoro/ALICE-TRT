@@ -80,6 +80,38 @@ impl Fix128Gpu {
         let hi = self.hi.wrapping_sub(other.hi).wrapping_sub(borrow as i64);
         Self { hi, lo }
     }
+
+    /// Reference `mul` — Fix128 (`I64F64`) multiplication that takes
+    /// the middle 128 bits of the 256-bit signed product. Mirrors
+    /// [`alice_physics::math::Fix128::mul`] so the WGSL kernel
+    /// (scheduled for the follow-up commit) can be certified
+    /// byte-for-byte against this reference.
+    ///
+    /// # Semantics
+    /// - `self = self.hi + self.lo / 2^64`
+    /// - `rhs  = rhs.hi + rhs.lo / 2^64`
+    /// - Product: `hh << 128 + (hl + lh) << 64 + ll`
+    /// - Return the middle 128 bits (`bits[192:64]`).
+    #[must_use]
+    pub fn mul(self, other: Self) -> Self {
+        let a_hi = self.hi as i128;
+        let a_lo = self.lo as u128;
+        let b_hi = other.hi as i128;
+        let b_lo = other.lo as u128;
+
+        let ll = a_lo.wrapping_mul(b_lo);
+        let hl = a_hi.wrapping_mul(b_lo as i128);
+        let lh = (a_lo as i128).wrapping_mul(b_hi);
+        let hh = a_hi.wrapping_mul(b_hi);
+
+        let ll_hi = (ll >> 64) as i128;
+        let mid = hl.wrapping_add(lh).wrapping_add(ll_hi);
+        let mid_lo = mid as u64;
+        let mid_hi = (mid >> 64) as i64;
+
+        let hi = (hh as i64).wrapping_add(mid_hi);
+        Self { hi, lo: mid_lo }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +599,47 @@ mod tests {
         assert!(FIX128_ADD_WGSL.contains("fix128_add_main"));
         assert!(FIX128_ADD_WGSL.contains("@compute"));
         assert!(FIX128_ADD_WGSL.contains("workgroup_size(64)"));
+    }
+
+    /// `mul` where either operand equals `Fix128Gpu::ONE` must return
+    /// the other operand unchanged.
+    #[test]
+    fn fix128_gpu_mul_one_is_identity() {
+        let x = Fix128Gpu::from_raw(42, 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(x.mul(Fix128Gpu::ONE), x);
+        assert_eq!(Fix128Gpu::ONE.mul(x), x);
+    }
+
+    /// `mul` on pure integer operands must match ordinary signed
+    /// integer multiplication (no fractional carry produced).
+    #[test]
+    fn fix128_gpu_mul_integer_operands() {
+        let three = Fix128Gpu::from_raw(3, 0);
+        let five = Fix128Gpu::from_raw(5, 0);
+        let out = three.mul(five);
+        assert_eq!(out.hi, 15);
+        assert_eq!(out.lo, 0);
+    }
+
+    /// `mul` respects two's complement sign: `(-2) * 3 == -6`.
+    #[test]
+    fn fix128_gpu_mul_negative_operand() {
+        let neg_two = Fix128Gpu::from_raw(-2, 0);
+        let three = Fix128Gpu::from_raw(3, 0);
+        let out = neg_two.mul(three);
+        assert_eq!(out.hi, -6);
+        assert_eq!(out.lo, 0);
+    }
+
+    /// `mul` with a fractional operand: `2 * 0.5 == 1`. In Fix128
+    /// terms `0.5` is `hi=0, lo=1 << 63`.
+    #[test]
+    fn fix128_gpu_mul_half_scales_correctly() {
+        let two = Fix128Gpu::from_raw(2, 0);
+        let half = Fix128Gpu::from_raw(0, 1u64 << 63);
+        let out = two.mul(half);
+        assert_eq!(out.hi, 1);
+        assert_eq!(out.lo, 0);
     }
 
     /// The Fix128 sub shader source is a non-empty compile-time
