@@ -30,7 +30,7 @@ impl GpuDevice {
     ///
     /// Returns an error string if GPU adapter or device request fails.
     pub async fn new_async() -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });

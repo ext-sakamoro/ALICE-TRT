@@ -28,7 +28,7 @@ fix128-arithmetic = []  # Fix128 GPU primitive kernels (add/sub/mul/dot) for phy
 physics-solver = ["physics", "fix128-arithmetic", "alice-physics/gpu-solver-bridge"]  # Compute-shader-based Fix128 physics solver (ALICE-Physics GpuSolverBridge implementer)
 
 [dependencies]
-wgpu = "23"
+wgpu = "24"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 alice-ml = { path = "../ALICE-ML" }
