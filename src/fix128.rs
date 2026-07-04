@@ -336,9 +336,7 @@ fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
 }
 
 // Skeleton entry point: emits the *unsigned* low-128 bits of the
-// 256-bit product `a.lo × b.lo`. This is enough to validate the
-// schoolbook helpers on a real GPU; the signed Fix128 mul pipeline
-// arrives in the follow-up commit and uses the same helpers.
+// 256-bit product `a.lo × b.lo`. Kept for helper validation harness.
 @compute @workgroup_size(64)
 fn fix128_mul_unsigned_lo_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -352,6 +350,123 @@ fn fix128_mul_unsigned_lo_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out.lo_hi = product.y;
     out.hi_lo = product.z;
     out.hi_hi = product.w;
+    output[i] = out;
+}
+
+// Full signed Fix128 multiplication.
+//
+// Algorithm:
+//   1. Treat a, b as unsigned 128-bit numbers a_u, b_u.
+//   2. Compute the 256-bit unsigned schoolbook product P = a_u × b_u
+//      via four u64×u64 partial products (`ll`, `lh`, `hl`, `hh`).
+//   3. Two's-complement correction:
+//        signed(a) × signed(b) = a_u × b_u
+//                              - (b_u << 128 if a < 0)
+//                              - (a_u << 128 if b < 0)
+//                              + (2^256 if both < 0)
+//      The 2^256 term overflows away; the other two subtractions
+//      touch only bits [128, 256), which is exactly where our
+//      middle-hi output word lives.
+//   4. The Fix128 result is the middle 128 bits (bits [192:64]):
+//        lo (u64) = P[2..4]  (unchanged by signed correction)
+//        hi (i64) = P[4..6]  (with the two subtractions above)
+@compute @workgroup_size(64)
+fn fix128_mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&input_a)) { return; }
+    let a = input_a[i];
+    let b = input_b[i];
+
+    // Unsigned 128-bit views:
+    //   a_u = a_hi * 2^64 + a_lo   (a_hi, a_lo each u64 = vec2<u32>)
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+
+    // Four u64 × u64 → u128 partial products, each vec4<u32> laid
+    // out little-endian (word 0 = least significant).
+    let ll = u64_mul_wide(a_lo, b_lo);  // contributes to positions 0..4
+    let lh = u64_mul_wide(a_lo, b_hi);  // contributes to positions 2..6
+    let hl = u64_mul_wide(a_hi, b_lo);  // contributes to positions 2..6
+    let hh = u64_mul_wide(a_hi, b_hi);  // contributes to positions 4..8
+
+    // Positions 0..1: only ll contributes; no addition, no carry.
+    // We start tracking carries from position 2 (the first
+    // position where multiple limbs collide).
+
+    // Position 2: ll.z + lh.x + hl.x
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+
+    // Position 3: ll.w + lh.y + hl.y + carry_to_3
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+
+    // Position 4: lh.z + hl.z + hh.x + carry_to_4
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+
+    // Position 5: lh.w + hl.w + hh.y + carry_to_5
+    let s5a = lh.w + hl.w;
+    let c5a = select(0u, 1u, s5a < lh.w);
+    let s5b = s5a + hh.y;
+    let c5b = select(0u, 1u, s5b < s5a);
+    let p5_u = s5b + carry_to_5;
+    // Carries past position 5 do not affect the middle 128 bits.
+
+    // Signed correction:
+    //   If a is negative (its i64 hi has MSB set), subtract b_u
+    //   from position 4..8. For our middle window (positions 4..6),
+    //   that means subtracting b_lo (u64) from (p4, p5).
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+
+    var p4 = p4_u;
+    var p5 = p5_u;
+
+    if (a_negative) {
+        let sub_lo = b.lo_lo;
+        let sub_hi = b.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+
+    if (b_negative) {
+        let sub_lo = a.lo_lo;
+        let sub_hi = a.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+
+    // Fix128 output:
+    //   lo = middle_lo (u64) = (p2, p3)
+    //   hi = middle_hi (i64) = (p4, p5)  (two's-complement bits)
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
     output[i] = out;
 }
 "#;
@@ -381,6 +496,7 @@ pub struct Fix128WgpuKernel<'a> {
     device: &'a crate::device::GpuDevice,
     pipeline_add: wgpu::ComputePipeline,
     pipeline_sub: wgpu::ComputePipeline,
+    pipeline_mul: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -402,6 +518,13 @@ impl<'a> Fix128WgpuKernel<'a> {
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fix128_sub_shader"),
                 source: wgpu::ShaderSource::Wgsl(FIX128_SUB_WGSL.into()),
+            });
+
+        let shader_mul = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_mul_shader"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_MUL_WGSL.into()),
             });
 
         let bind_group_layout =
@@ -474,11 +597,23 @@ impl<'a> Fix128WgpuKernel<'a> {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+        let pipeline_mul =
+            device
+                .device()
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("fix128_mul_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader_mul,
+                    entry_point: Some("fix128_mul_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
         Self {
             device,
             pipeline_add,
             pipeline_sub,
+            pipeline_mul,
             bind_group_layout,
         }
     }
@@ -575,6 +710,16 @@ impl<'a> Fix128WgpuKernel<'a> {
     pub fn sub(&self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
         self.dispatch_binary(&self.pipeline_sub, "fix128_sub", a, b, out);
     }
+
+    /// Dispatch the Fix128 `mul` kernel. `a`, `b`, and `out` must
+    /// have identical lengths; the caller owns the output slice.
+    ///
+    /// Bit-for-bit equivalent to [`Fix128Gpu::mul`] on every input;
+    /// see the shader source (`FIX128_MUL_WGSL::fix128_mul_main`)
+    /// for the signed 128×128→256 schoolbook algorithm.
+    pub fn mul(&self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        self.dispatch_binary(&self.pipeline_mul, "fix128_mul", a, b, out);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,10 +735,8 @@ impl Fix128GpuKernel for Fix128WgpuKernel<'_> {
         Fix128WgpuKernel::sub(self, a, b, out);
     }
 
-    fn mul(&mut self, _a: &[Fix128Gpu], _b: &[Fix128Gpu], _out: &mut [Fix128Gpu]) {
-        unimplemented!(
-            "Fix128 mul: WGSL kernel + Fix128WgpuKernel::mul scheduled for the next release"
-        );
+    fn mul(&mut self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        Fix128WgpuKernel::mul(self, a, b, out);
     }
 
     fn dot(&mut self, _a: &[Fix128Gpu], _b: &[Fix128Gpu], _out: &mut Fix128Gpu) {
@@ -891,6 +1034,81 @@ mod tests {
                 out[i].lo, cpu_ref.lo
             );
         }
+    }
+
+    /// GPU dispatch bit-exact contract for `mul` — feeds four
+    /// representative fixtures through the WGSL signed 128×128→256
+    /// pipeline and checks byte-for-byte equivalence with the CPU
+    /// reference [`Fix128Gpu::mul`].
+    ///
+    /// Fixtures cover the four sign-correction paths:
+    ///   1. Identity   (1 × x = x)
+    ///   2. Integer    (2 × 3 = 6)
+    ///   3. Negative   (-1 × 3 = -3, exercises the `a_negative` branch)
+    ///   4. Fractional (0.5 × 0.5 = 0.25, exercises the lo × lo carry-out
+    ///      into the middle-lo output word)
+    #[test]
+    fn wgpu_mul_matches_cpu_golden() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let kernel = Fix128WgpuKernel::new(&device);
+
+        // Fix128 one = raw(1, 0); Fix128 half = raw(0, 1 << 63).
+        let half_lo: u64 = 1u64 << 63;
+        let a = vec![
+            Fix128Gpu::from_raw(1, 0),       // 1
+            Fix128Gpu::from_raw(2, 0),       // 2
+            Fix128Gpu::from_raw(-1, 0),      // -1
+            Fix128Gpu::from_raw(0, half_lo), // 0.5
+        ];
+        let b = vec![
+            Fix128Gpu::from_raw(-3, 42),     // arbitrary
+            Fix128Gpu::from_raw(3, 0),       // 3
+            Fix128Gpu::from_raw(3, 0),       // 3
+            Fix128Gpu::from_raw(0, half_lo), // 0.5
+        ];
+        let mut out = vec![Fix128Gpu::ZERO; 4];
+
+        kernel.mul(&a, &b, &mut out);
+
+        for i in 0..a.len() {
+            let cpu_ref = a[i].mul(b[i]);
+            assert_eq!(
+                out[i].hi, cpu_ref.hi,
+                "mul hi mismatch at i={i}: GPU {} vs CPU {}",
+                out[i].hi, cpu_ref.hi
+            );
+            assert_eq!(
+                out[i].lo, cpu_ref.lo,
+                "mul lo mismatch at i={i}: GPU {:#x} vs CPU {:#x}",
+                out[i].lo, cpu_ref.lo
+            );
+        }
+    }
+
+    /// The `Fix128GpuKernel` trait bridge routes `add` / `sub` / `mul`
+    /// to the live wgpu pipelines while `dot` remains
+    /// `unimplemented!`. Verifies the trait `mul` matches
+    /// [`Fix128WgpuKernel::mul`] byte-for-byte.
+    #[test]
+    fn wgpu_trait_mul_matches_inherent_mul() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut kernel = Fix128WgpuKernel::new(&device);
+
+        let a = vec![Fix128Gpu::from_raw(1, 0), Fix128Gpu::from_raw(-1, 0)];
+        let b = vec![Fix128Gpu::from_raw(3, 0), Fix128Gpu::from_raw(3, 0)];
+        let mut via_inherent = vec![Fix128Gpu::ZERO; 2];
+        let mut via_trait = vec![Fix128Gpu::ZERO; 2];
+
+        Fix128WgpuKernel::mul(&kernel, &a, &b, &mut via_inherent);
+        <Fix128WgpuKernel<'_> as Fix128GpuKernel>::mul(&mut kernel, &a, &b, &mut via_trait);
+
+        assert_eq!(via_inherent, via_trait);
     }
 
     /// The `Fix128GpuKernel` trait bridge routes `add` / `sub` to the

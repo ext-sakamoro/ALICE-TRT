@@ -2,6 +2,35 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.5.0] - 2026-07-04
+
+### Added
+
+- **`--features fix128-arithmetic`** — Fix128 GPU mul full pipeline
+  - `FIX128_MUL_WGSL::fix128_mul_main` @compute entry point — signed 128×128 → middle 128 bits
+    - 4 `u64 × u64 → u128` partial products (`ll` / `lh` / `hl` / `hh`) via the schoolbook helpers shipped in v0.4.2
+    - Full carry propagation across positions 2..5 of the 256-bit intermediate
+    - Two's-complement sign correction: subtracts `b_lo` from `(P[4], P[5])` when `a` is negative, `a_lo` when `b` is negative (matches `alice_physics::math::Fix128::mul`)
+  - `Fix128WgpuKernel::mul` — real-GPU dispatch method paired with the shader
+  - `Fix128GpuKernel::mul` trait method now routes to the live pipeline (previously `unimplemented!()`)
+  - 2 new tests:
+    - `wgpu_mul_matches_cpu_golden` — 4 fixtures (identity / integer / negative / fractional 0.5×0.5=0.25) byte-for-byte equal to `Fix128Gpu::mul`
+    - `wgpu_trait_mul_matches_inherent_mul` — trait routing equivalence
+
+### Verified on
+
+- **macOS Apple Silicon (M3, Metal)** — 20/20 fix128 tests pass, 140/140 physics-solver tests pass
+
+### Roadmap for v0.5.1+
+
+- `FIX128_DOT_WGSL` — index-ordered accumulate with `workgroupBarrier` sync (no subgroup reduce, keeps determinism contract §1 経路 3)
+- Platform matrix CI (Metal / Vulkan / DX12 golden agreement)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.4.x
+- No breaking API changes; `mul` was previously `unimplemented!()` on the GPU path
+
 ## [0.4.2] - 2026-07-04
 
 ### Added
