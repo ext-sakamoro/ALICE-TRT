@@ -349,8 +349,65 @@ ALICE-TRT connects to other ALICE ecosystem crates via feature-gated bridge modu
 
 | Bridge | Feature | Target Crate | Description |
 |--------|---------|--------------|-------------|
-| `physics_bridge` | `physics` | [ALICE-Physics](../ALICE-Physics) | GPU ternary inference for physics control policies, batched force computation |
+| `physics_bridge::GpuPhysicsController` | `physics` | [ALICE-Physics](../ALICE-Physics) | GPU ternary inference for physics **control policies**, batched force computation |
+| `physics_bridge::TrtSolverAdapter` | `physics-solver` | [ALICE-Physics v0.8.0+](../ALICE-Physics) | Compute-shader-based Fix128 **PGS solver offload** (implements `alice_physics::gpu_bridge::GpuSolverBridge`) |
+| `fix128::Fix128GpuKernel` | `fix128-arithmetic` | [ALICE-Physics v0.8.0+](../ALICE-Physics) | Fix128 GPU primitive skeleton (`add` / `sub` / `mul` / `dot`) with WGSL kernels landing in follow-up |
 | `sdf_bridge` | `sdf` | [ALICE-SDF](../ALICE-SDF) | GPU neural SDF approximation via ternary networks for real-time distance field queries |
+
+### Physics Solver Bridge (feature: `physics-solver`, since v0.2.0)
+
+Compute-shader-based Fix128 PGS solver offload for [ALICE-Physics v0.8.0+](../ALICE-Physics). `TrtSolverAdapter` implements the `alice_physics::gpu_bridge::GpuSolverBridge` trait so ALICE-Physics callers can inject the GPU path via dependency injection. The default CPU-native TGS pipeline remains untouched unless the adapter is explicitly wired in.
+
+**Pair with `alice-physics/gpu-solver-bridge`.** The `physics-solver` feature automatically enables it on the ALICE-Physics side.
+
+```toml
+[dependencies]
+alice-trt     = { path = "../ALICE-TRT",     features = ["physics-solver"] }
+alice-physics = { path = "../ALICE-Physics", features = ["gpu-solver-bridge"] }
+```
+
+```rust
+use alice_physics::gpu_bridge::{DiffFixture, GpuSolverBridge};
+use alice_physics::math::Fix128;
+use alice_trt::TrtSolverAdapter;
+
+// 1. Construct an adapter (no GPU device required for the skeleton API).
+let mut adapter = TrtSolverAdapter::new();
+
+// 2. Upload the current island state.
+let positions:  Vec<[Fix128; 3]> = /* ... */;
+let velocities: Vec<[Fix128; 3]> = /* ... */;
+adapter.send_island(&positions, &velocities);
+
+// 3. Dispatch PGS iterations on the GPU (zero-iteration is a no-op echo
+//    today — WGSL kernels land in the follow-up).
+adapter.dispatch_iterations(0, Fix128::from_ratio(1, 60));
+
+// 4. Read back into caller-owned slices.
+let mut out_positions  = vec![[Fix128::ZERO; 3]; positions.len()];
+let mut out_velocities = vec![[Fix128::ZERO; 3]; velocities.len()];
+adapter.recv_island(&mut out_positions, &mut out_velocities);
+
+// 5. Certify byte-for-byte equivalence with the CPU-side solver before
+//    production runtime accepts the backend.
+adapter.assert_bit_exact_vs_cpu(&DiffFixture {
+    description: "gravity_fall_60_steps",
+    tolerance: Fix128::ZERO, // strict byte-for-byte equality
+})?;
+```
+
+Companion release: [ALICE-Physics v0.8.0](https://github.com/ext-sakamoro/ALICE-Physics/releases/tag/v0.8.0).
+
+### Fix128 GPU Primitive (feature: `fix128-arithmetic`, since v0.2.0)
+
+Standalone `Fix128Gpu` (`#[repr(C)]` + `bytemuck::Pod`, layout-compatible with `alice_physics::Fix128`) plus the `Fix128GpuKernel` trait providing the add / sub / mul / dot signatures. Enable this feature without `physics-solver` to build the Fix128 GPU primitive without pulling in ALICE-Physics.
+
+```toml
+[dependencies]
+alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
+```
+
+Follow-up commits will land the WGSL shader bodies and Metal / Vulkan / DX12 platform-diff test matrix.
 
 ### SDF Bridge (feature: `sdf`)
 
