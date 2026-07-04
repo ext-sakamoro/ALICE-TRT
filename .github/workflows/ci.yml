@@ -66,41 +66,22 @@ jobs:
             target
           key: ${{ matrix.os }}-cargo-fix128-${{ hashFiles('Cargo.toml') }}
 
-      - name: Stub sibling ALICE-* path deps (CI lacks sibling checkouts)
+      - name: Clone sibling ALICE-* path deps (CI has no workspace checkouts)
         shell: bash
         run: |
           set -euo pipefail
           # Cargo.toml declares four `path = "../ALICE-XX"` deps for
-          # local development. CI runners only clone this repo, so
-          # `cargo metadata` needs bare-minimum sibling crates on
-          # disk. The stubs export no items — `--features
-          # fix128-arithmetic` does not touch any of them at compile
-          # time; they exist purely to satisfy the workspace resolver.
-          declare -A crates=(
-            ["ALICE-ML"]="alice-ml"
-            ["ALICE-Physics"]="alice-physics"
-            ["ALICE-SDF"]="alice-sdf"
-            ["ALICE-DB"]="alice-db"
-          )
-          for dir in "${!crates[@]}"; do
-            name="${crates[$dir]}"
-            mkdir -p "../${dir}/src"
-            cat > "../${dir}/Cargo.toml" <<EOF
-          [package]
-          name = "${name}"
-          version = "0.0.0"
-          edition = "2021"
-
-          [lib]
-          path = "src/lib.rs"
-
-          [features]
-          default = []
-          std = []
-          gpu-solver-bridge = []
-          EOF
-            printf '' > "../${dir}/src/lib.rs"
+          # local development. CI runners only clone this repo, so we
+          # shallow-clone the sibling crates (all public) into ../
+          # to satisfy the resolver + compilation. `alice_ml` types
+          # (`TernaryWeightKernel` / `TernaryWeight`) are used
+          # unconditionally by `src/weights.rs` so a real crate is
+          # required, not a stub.
+          cd ..
+          for repo in ALICE-ML ALICE-Physics ALICE-SDF ALICE-DB; do
+            git clone --depth 1 "https://github.com/ext-sakamoro/${repo}.git"
           done
+          ls -d ALICE-*
 
       - name: Build (fix128-arithmetic)
         run: cargo build --lib --features fix128-arithmetic
