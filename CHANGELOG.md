@@ -2,6 +2,44 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.1.0] - 2026-07-06
+
+### Added — `FIX128_PGS_PROJECT_DISTANCE_WGSL` distance constraint kernel
+
+The first non-trivial constraint kernel that operates on a pair of bodies at a time. Together with the v1.0.1 `Fix128Gpu::sqrt` and v1.0.6 `Fix128Gpu::div` CPU references, this closes the scalar arithmetic surface the constraint solver needs. The v1.2.0 companion release will wire this shader into `TrtSolverAdapter::set_distance_constraint(...)` with per-iteration CPU scalar precompute.
+
+- **`FIX128_PGS_PROJECT_DISTANCE_WGSL`** — new public compute shader source constant
+  - Body: `for axis in 0..3 { diff = pa - pb; delta = s * diff; pa += delta; pb -= delta; }` per dispatch
+  - Uniform: `DistanceParams { body_a: u32, body_b: u32, _pad: vec2<u32>, scalar: Fix128Gpu }` — 32 bytes
+  - `@compute @workgroup_size(1)`, no `workgroupBarrier()` — trivially satisfies the FXC uniformity contract that landed in v0.8.1
+  - Inline helpers: `u64_add` / `u64_sub` / `umul_wide` / `u64_mul_wide` / `fix128_add_kernel` / `fix128_sub_kernel` / `fix128_mul_kernel` (all already certified bit-exact against the CPU reference in the `wgpu_*_matches_cpu_golden` tests)
+- Callers precompute `scalar = (L - d) / (2 * d)` on the CPU using `Fix128Gpu::sqrt` + `Fix128Gpu::div`, then upload it via the uniform. This design keeps the GPU kernel branch-free and division-free — every kernel operation is one of the mul / add / sub primitives already proven bit-exact.
+
+### Tests
+
+- **2 new tests**:
+  - `wgsl_pgs_project_distance_shader_helpers_present` — every helper + entry point symbol coverage
+  - `wgsl_pgs_project_distance_shader_compiles` — naga parser validity on the local GPU (skips when no adapter)
+- Total: 37 fix128 tests
+
+### Design rationale — why the CPU precomputes the scalar
+
+Fix128 sqrt and division are expensive on the GPU (both need many Newton iterations for full 128-bit precision, and Fix128 division specifically needs bit-scan / initial-guess logic that WGSL cannot cleanly express). Since the constraint solver already reads positions back to the CPU each iteration for the outer step function, computing the scalar CPU-side costs one `sqrt` + one `div` per constraint per iteration — negligible next to the workgroup dispatch cost. The GPU kernel then does only mul + add + sub, all bit-exact. Bit-exact CPU vs GPU agreement is thereby a direct corollary of the primitive-level guarantees already on the platform matrix CI.
+
+### Roadmap for v1.2.0
+
+Wire the shader into `TrtSolverAdapter`:
+
+- `set_distance_constraint(body_a, body_b, rest_length)` API
+- Per-iteration CPU-side scalar computation using `Fix128Gpu::sqrt` + `Fix128Gpu::div`
+- Uniform buffer upload + `pipeline_project_distance` dispatch after each integrate + floor
+- End-to-end bit-exact test at the adapter layer (in addition to today's kernel-source coverage)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.0.x at the Rust API level (no API changes, only a new public shader constant)
+- All new items are additive; v1.0.0 semver stability commitment preserved
+
 ## [1.0.6] - 2026-07-05
 
 ### Added — `Fix128Gpu::div` (foundation for v1.1.0 distance constraint)
