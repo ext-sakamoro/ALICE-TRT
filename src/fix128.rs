@@ -1026,6 +1026,73 @@ fn fix128_pgs_integrate_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader source for the **Fix128 PGS floor projection**
+/// kernel — v0.9.2's minimum-viable constraint solver.
+///
+/// # Semantics
+///
+/// For every Y-axis position slot (`idx % 3 == 1`), if the Fix128
+/// value is negative (i.e. the body has passed through the ground
+/// plane `y = 0`), the slot and its paired velocity slot are both
+/// snapped to zero. All other slots are left untouched.
+///
+/// This is the classical "floor constraint" from position-based
+/// dynamics: the world has an infinite ground plane at `y = 0` and
+/// bodies cannot penetrate it. Zeroing the velocity prevents the
+/// well-known "sinking into the floor" oscillation that would
+/// otherwise occur if gravity kept pulling the body down while the
+/// position stayed clamped.
+///
+/// # Determinism
+///
+/// Each thread reads and writes a single, distinct slot. There is
+/// no `workgroupBarrier()`, no cross-thread dependency, and no
+/// reduction — so uniformity concerns (which caused the WARP crash
+/// fixed in v0.8.1) do not apply. The signed-negative check is a
+/// single MSB test of `hi_hi` and cannot diverge across backends.
+///
+/// # Layout
+///
+/// - `@group(0) @binding(0) var<storage, read_write> positions: array<Fix128Gpu>`
+/// - `@group(0) @binding(1) var<storage, read_write> velocities: array<Fix128Gpu>`
+///
+/// No uniform block is needed — the floor value is hard-coded at
+/// `y = 0` for the MVV. A follow-up release can add a
+/// `floor_y: Fix128Gpu` uniform for configurable floor heights.
+pub const FIX128_PGS_PROJECT_FLOOR_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> positions:  array<Fix128Gpu>;
+@group(0) @binding(1) var<storage, read_write> velocities: array<Fix128Gpu>;
+
+@compute @workgroup_size(64)
+fn fix128_pgs_project_floor_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&positions)) { return; }
+
+    // The MSB of `hi_hi` is the sign bit of the Fix128 two's-complement
+    // 128-bit integer. A set bit here means the value is < 0.
+    let is_y_axis    = (idx % 3u) == 1u;
+    let is_negative  = (positions[idx].hi_hi & 0x80000000u) != 0u;
+
+    if (is_y_axis && is_negative) {
+        positions[idx].hi_lo  = 0u;
+        positions[idx].hi_hi  = 0u;
+        positions[idx].lo_lo  = 0u;
+        positions[idx].lo_hi  = 0u;
+        velocities[idx].hi_lo = 0u;
+        velocities[idx].hi_hi = 0u;
+        velocities[idx].lo_lo = 0u;
+        velocities[idx].lo_hi = 0u;
+    }
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------

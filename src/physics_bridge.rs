@@ -194,7 +194,7 @@ mod solver_bridge {
     use alice_physics::gpu_bridge::{DiffFixture, GpuDivergence, GpuSolverBridge};
     use alice_physics::math::Fix128;
 
-    use crate::fix128::{Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL};
+    use crate::fix128::{Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_FLOOR_WGSL};
 
     /// Uniform block laid out to match the `PgsParams` struct in
     /// `FIX128_PGS_INTEGRATE_WGSL`. 64 bytes total: 16 for `dt`
@@ -222,13 +222,21 @@ mod solver_bridge {
     pub struct TrtSolverAdapter<'a> {
         device: &'a crate::device::GpuDevice,
         pipeline_integrate: wgpu::ComputePipeline,
+        pipeline_project_floor: wgpu::ComputePipeline,
         bind_group_layout: wgpu::BindGroupLayout,
+        bind_group_layout_project: wgpu::BindGroupLayout,
         positions: Vec<Fix128Gpu>,
         velocities: Vec<Fix128Gpu>,
         /// Per-axis gravity applied every dispatch iteration. Defaults
         /// to zero (no gravity), so v0.9.0 callers see identical
         /// behaviour until they opt in via [`Self::set_gravity`].
         gravity: [Fix128; 3],
+        /// Toggle for the v0.9.2 floor constraint. When `true`, every
+        /// dispatched iteration follows the integrate kernel with a
+        /// second kernel that snaps any `y < 0` position back to
+        /// `y = 0` and zeroes its paired velocity. Defaults to
+        /// `false` for full backwards compatibility with v0.9.1.
+        floor_enabled: bool,
     }
 
     impl<'a> TrtSolverAdapter<'a> {
@@ -308,13 +316,76 @@ mod solver_bridge {
                         cache: None,
                     });
 
+            // v0.9.2: floor projection shader + pipeline. This uses a
+            // 2-buffer bind group (positions + velocities, no uniform)
+            // so the layout is distinct from the integrate one.
+            let shader_floor = device
+                .device()
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("fix128_pgs_project_floor_shader"),
+                    source: wgpu::ShaderSource::Wgsl(FIX128_PGS_PROJECT_FLOOR_WGSL.into()),
+                });
+
+            let bind_group_layout_project =
+                device
+                    .device()
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("fix128_pgs_project_bgl"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                        ],
+                    });
+
+            let pipeline_layout_project =
+                device
+                    .device()
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("fix128_pgs_project_pl"),
+                        bind_group_layouts: &[&bind_group_layout_project],
+                        push_constant_ranges: &[],
+                    });
+
+            let pipeline_project_floor =
+                device
+                    .device()
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("fix128_pgs_project_floor_pipeline"),
+                        layout: Some(&pipeline_layout_project),
+                        module: &shader_floor,
+                        entry_point: Some("fix128_pgs_project_floor_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        cache: None,
+                    });
+
             Self {
                 device,
                 pipeline_integrate,
+                pipeline_project_floor,
                 bind_group_layout,
+                bind_group_layout_project,
                 positions: Vec::new(),
                 velocities: Vec::new(),
                 gravity: [Fix128::ZERO; 3],
+                floor_enabled: false,
             }
         }
 
@@ -329,6 +400,19 @@ mod solver_bridge {
         /// their world axes.
         pub fn set_gravity(&mut self, gravity: [Fix128; 3]) {
             self.gravity = gravity;
+        }
+
+        /// Toggle the v0.9.2 floor constraint (ground plane at `y = 0`).
+        /// When enabled, every dispatched iteration follows the
+        /// integrate kernel with a second kernel that snaps any
+        /// position slot with `y < 0` back to `y = 0` and zeroes its
+        /// paired velocity slot.
+        ///
+        /// Defaults to `false` for full v0.9.1 compatibility. Enable
+        /// by calling `set_floor_enabled(true)` before the first
+        /// `dispatch_iterations` call in a stepping session.
+        pub fn set_floor_enabled(&mut self, enabled: bool) {
+            self.floor_enabled = enabled;
         }
     }
 
@@ -345,6 +429,7 @@ mod solver_bridge {
     /// ```text
     /// v' = v + gravity[axis] * dt
     /// p' = p + v' * dt
+    /// if floor_enabled and axis == Y and p' < 0: p' = 0; v' = 0
     /// ```
     ///
     /// Any deviation of the GPU dispatch from this loop is a
@@ -357,6 +442,7 @@ mod solver_bridge {
         positions: &mut [Fix128Gpu],
         velocities: &mut [Fix128Gpu],
         gravity: [Fix128; 3],
+        floor_enabled: bool,
         iters: u32,
         dt: Fix128,
     ) {
@@ -370,6 +456,17 @@ mod solver_bridge {
                 let p_fix = gpu_to_fix128(*p);
                 let p_new = p_fix + v_new * dt;
                 *p = fix128_to_gpu(p_new);
+            }
+            if floor_enabled {
+                for (i, (p, v)) in positions.iter_mut().zip(velocities.iter_mut()).enumerate() {
+                    if i % 3 == 1 && p.hi < 0 {
+                        // Y-axis slot with a negative Fix128: snap to
+                        // zero (matches the WGSL floor kernel, which
+                        // tests the same sign bit).
+                        *p = Fix128Gpu { hi: 0, lo: 0 };
+                        *v = Fix128Gpu { hi: 0, lo: 0 };
+                    }
+                }
             }
         }
     }
@@ -436,6 +533,33 @@ mod solver_bridge {
                     ],
                 });
 
+            // v0.9.2: if the floor constraint is enabled, we need a
+            // second bind group that binds positions + velocities to
+            // the 2-buffer project layout. Build it once outside the
+            // loop (the buffers themselves are stable).
+            let bind_group_project = if self.floor_enabled {
+                Some(
+                    self.device
+                        .device()
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("pgs_project_floor_bg"),
+                            layout: &self.bind_group_layout_project,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: buf_pos.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: buf_vel.as_entire_binding(),
+                                },
+                            ],
+                        }),
+                )
+            } else {
+                None
+            };
+
             // Independent-encoder-per-iteration pattern (mirrors the
             // v0.7.1 Fix128 dot workaround for DX12 WARP determinism).
             // Each iteration reads the previous write of `buf_pos`
@@ -459,6 +583,27 @@ mod solver_bridge {
                 }
                 self.device.submit(encoder);
                 self.device.poll_wait();
+
+                // v0.9.2: floor projection pass (only if enabled).
+                if let Some(bg_project) = &bind_group_project {
+                    let mut encoder = self.device.device().create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("pgs_project_floor_enc"),
+                        },
+                    );
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("pgs_project_floor_pass"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.pipeline_project_floor);
+                        pass.set_bind_group(0, bg_project, &[]);
+                        let workgroups = (n as u32).div_ceil(64);
+                        pass.dispatch_workgroups(workgroups, 1, 1);
+                    }
+                    self.device.submit(encoder);
+                    self.device.poll_wait();
+                }
             }
 
             let raw_pos = self.device.read_buffer(&buf_pos, bytes);
@@ -620,6 +765,7 @@ mod solver_bridge {
                 &mut cpu_positions,
                 &mut cpu_velocities,
                 [Fix128::ZERO; 3],
+                false,
                 iters,
                 dt,
             );
@@ -710,6 +856,7 @@ mod solver_bridge {
                 &mut cpu_positions,
                 &mut cpu_velocities,
                 gravity,
+                false,
                 iters,
                 dt,
             );
@@ -734,6 +881,106 @@ mod solver_bridge {
                     gpu_v.lo, cpu_velocities[i].lo,
                     "velocity lo mismatch at slot {i}: GPU {:#x} vs CPU {:#x}",
                     gpu_v.lo, cpu_velocities[i].lo
+                );
+            }
+        }
+
+        /// v0.9.2 floor constraint determinism proof: a body starting
+        /// at `y = 1` with `gravity = [0, -1, 0]` and `dt = 1/60` for
+        /// 100 iterations must eventually clamp to `y = 0` and stay
+        /// there (velocity zeroed on contact so it does not oscillate
+        /// through the floor). GPU output must match the CPU reference
+        /// byte-for-byte on every slot.
+        #[test]
+        fn trt_solver_adapter_floor_constraint_matches_cpu_reference() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+
+            let gravity = [Fix128::ZERO, Fix128::NEG_ONE, Fix128::ZERO];
+            adapter.set_gravity(gravity);
+            adapter.set_floor_enabled(true);
+
+            let positions = vec![
+                // Body A: starts above the floor
+                [Fix128::ZERO, Fix128::from_int(1), Fix128::ZERO],
+                // Body B: also above but with lateral velocity
+                [
+                    Fix128::from_int(-2),
+                    Fix128::from_int(5),
+                    Fix128::from_int(3),
+                ],
+            ];
+            let velocities = vec![
+                [Fix128::ZERO; 3],
+                [Fix128::from_int(1), Fix128::ZERO, Fix128::NEG_ONE],
+            ];
+
+            adapter.send_island(&positions, &velocities);
+
+            let dt = Fix128::from_ratio(1, 60);
+            let iters = 100u32;
+            adapter.dispatch_iterations(iters, dt);
+
+            let mut cpu_positions: Vec<Fix128Gpu> = positions
+                .iter()
+                .flat_map(|p| p.iter().map(|f| fix128_to_gpu(*f)))
+                .collect();
+            let mut cpu_velocities: Vec<Fix128Gpu> = velocities
+                .iter()
+                .flat_map(|v| v.iter().map(|f| fix128_to_gpu(*f)))
+                .collect();
+            cpu_semi_implicit_integrate(
+                &mut cpu_positions,
+                &mut cpu_velocities,
+                gravity,
+                true,
+                iters,
+                dt,
+            );
+
+            for (i, gpu_p) in adapter.positions.iter().enumerate() {
+                assert_eq!(
+                    gpu_p.hi, cpu_positions[i].hi,
+                    "position hi mismatch at slot {i}"
+                );
+                assert_eq!(
+                    gpu_p.lo, cpu_positions[i].lo,
+                    "position lo mismatch at slot {i}: GPU {:#x} vs CPU {:#x}",
+                    gpu_p.lo, cpu_positions[i].lo
+                );
+            }
+            for (i, gpu_v) in adapter.velocities.iter().enumerate() {
+                assert_eq!(
+                    gpu_v.hi, cpu_velocities[i].hi,
+                    "velocity hi mismatch at slot {i}"
+                );
+                assert_eq!(
+                    gpu_v.lo, cpu_velocities[i].lo,
+                    "velocity lo mismatch at slot {i}: GPU {:#x} vs CPU {:#x}",
+                    gpu_v.lo, cpu_velocities[i].lo
+                );
+            }
+
+            // Behavioural sanity: the floor kernel must never leave
+            // any Y-axis position slot with a negative Fix128 (that
+            // is, `hi < 0` since the CPU reference and WGSL kernel
+            // both test the same MSB). The kernel runs after every
+            // integrate so, regardless of how far the body has fallen
+            // in the current iteration, the projection step re-clamps
+            // it to zero. Velocities are also zeroed on contact so
+            // this behavioural check does not extend to them (a body
+            // starting well above the floor may keep an in-flight
+            // negative velocity for many iterations before hitting).
+            for body in 0..2 {
+                let y_slot = body * 3 + 1;
+                let y_pos = adapter.positions[y_slot];
+                assert!(
+                    y_pos.hi >= 0,
+                    "body {body} Y position went below floor: {:?}",
+                    y_pos
                 );
             }
         }

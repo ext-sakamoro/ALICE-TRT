@@ -2,6 +2,44 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.9.2] - 2026-07-05
+
+### Added — first constraint: infinite floor plane at `y = 0`
+
+The PGS live dispatch now supports its first real constraint projection: an infinite ground plane. Every enabled iteration runs a second WGSL kernel after the integrate step that snaps any position slot with `y < 0` back to `y = 0` and zeroes its paired velocity slot.
+
+- **`FIX128_PGS_PROJECT_FLOOR_WGSL`** — new public compute shader constant
+  - `@compute @workgroup_size(64)`, one thread per Fix128 slot
+  - MSB test on `hi_hi` (the Fix128 two's-complement sign bit) — no arithmetic, no barrier
+  - Independent per-body: no cross-thread coordination, no `workgroupBarrier`
+- **2-buffer bind group layout** for the projection pass (`positions` + `velocities`, no uniform)
+- **`TrtSolverAdapter::set_floor_enabled(&mut self, bool)`** — opt-in API
+  - Defaults to `false` so v0.9.1 callers see identical behaviour
+  - Enabling routes each `dispatch_iterations` iteration through the integrate + project kernel pair
+- **`trt_solver_adapter_floor_constraint_matches_cpu_reference`** — new determinism test
+  - N = 2 bodies × 3 axes, gravity `[0, -1, 0]`, 100 iterations with floor enabled
+  - Byte-for-byte CPU vs GPU agreement on positions AND velocities
+  - Behavioural sanity: every Y-axis slot's `hi >= 0` after 100 iterations
+
+### Design rationale — why "floor" for the first constraint?
+
+The MVV constraint for v0.9.2 needed to be:
+1. **Independent per body** — no cross-thread coord, keeps the dispatch simple
+2. **No `workgroupBarrier`** — avoids the v0.7.1 WARP class of bugs entirely
+3. **Trivially bit-exact verifiable** — no square roots, no divisions, no floating-point-ish edge cases
+4. **A real constraint people actually use** — not just an assignment
+
+Floor `y = 0` hits all four. Distance constraints (spring / rigid rod) need cross-thread coordination and Fix128 square roots and are deferred to a later release. Position pin constraints are trivially assignments and lack demonstrative value.
+
+### Verified on
+
+- **macOS Apple Silicon (M3, Metal)** — 4/4 solver_bridge tests, 152/152 physics-solver tests pass locally
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.9.1 at the Rust API level
+- Default `floor_enabled = false`, so existing behaviour is unchanged unless the caller explicitly opts in
+
 ## [0.9.1] - 2026-07-05
 
 ### Added — gravity acceleration on the GPU
