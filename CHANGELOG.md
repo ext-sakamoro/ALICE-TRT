@@ -2,6 +2,31 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.0.1] - 2026-07-05
+
+### Added — `Fix128Gpu::sqrt` (foundation for v1.1.0 distance constraint)
+
+The first entry in the "Fix128Gpu ↔ ALICE-Physics scalar operations bridge" pattern. `Fix128Gpu::sqrt` delegates to `alice_physics::math::Fix128::sqrt` (Newton-Raphson, 64 iterations, deterministic) so the CPU reference stays bit-for-bit identical to the rest of the ecosystem.
+
+- **`Fix128Gpu::sqrt(self) -> Self`** — new method on `crate::fix128::Fix128Gpu`
+  - Gated behind `--features physics-solver` (the delegation pulls `alice_physics` into the compile graph; pure `--features fix128-arithmetic` stays wgpu-only)
+  - Returns `Self::ZERO` for negative or zero inputs (matches the ALICE-Physics contract)
+  - Positive inputs: bit-width-estimated initial guess + 64 Newton-Raphson iterations
+- **4 new tests**:
+  - `sqrt_matches_alice_physics_reference` — 8-fixture bit-exact agreement with `Fix128::sqrt`
+  - `sqrt_of_four_is_two` — behavioural sanity for integers
+  - `sqrt_of_quarter_is_half` — behavioural sanity for fractions
+  - `sqrt_of_negative_is_zero` — contract check for negative inputs
+
+### Roadmap for v1.1.0
+
+The GPU port (`FIX128_SQRT_WGSL`) lands in v1.1.0 alongside the distance-constraint projection kernel. Callers that need agreement between CPU pre-flight and GPU dispatch will get bit-exact results because the two paths share this reference.
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.0.0 at the Rust API level (`sqrt` is additive)
+- Semver stability commitment from v1.0.0 is preserved — no public surface removed or renamed
+
 ## [1.0.0] - 2026-07-05
 
 **Semver stability commitment**: from this release forward, ALICE-TRT commits to no breaking changes on its public Rust API until v2.0.0. The 0.x era's month-scale API churn (four `TrtSolverAdapter` refactors in one week) is behind us; downstream crates can pin to `alice-trt = "1"` and expect Cargo's semver-compatible dependency resolution to deliver bug fixes and additive features without integration work.

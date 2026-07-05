@@ -989,3 +989,135 @@ mod solver_bridge {
 
 #[cfg(feature = "physics-solver")]
 pub use solver_bridge::TrtSolverAdapter;
+
+// ============================================================================
+// Fix128Gpu ↔ ALICE-Physics scalar operations bridge (v1.0.1)
+// ============================================================================
+//
+// v1.0.1 opens a thin bridge between the GPU-friendly Fix128Gpu layout
+// and the operations that already ship in ALICE-Physics but are not
+// yet transliterated to WGSL. `sqrt` is the first entry — it is the
+// building block that will unlock distance / spring / rigid-rod
+// constraints in the v1.1.0 GPU projection kernel. Delegating to
+// `alice_physics::math::Fix128::sqrt` (Newton-Raphson, 64 iterations,
+// deterministic) rather than re-implementing here keeps the CPU
+// reference bit-for-bit identical to the rest of the ecosystem.
+//
+// The bridge is gated behind the `physics-solver` feature because it
+// pulls `alice_physics` into the compile graph; the pure
+// `fix128-arithmetic` feature stays wgpu-only.
+
+#[cfg(feature = "physics-solver")]
+impl crate::fix128::Fix128Gpu {
+    /// Deterministic Fix128 square root, mirroring
+    /// `alice_physics::math::Fix128::sqrt` byte-for-byte.
+    ///
+    /// # Semantics
+    ///
+    /// - Returns `Self::ZERO` for negative or zero inputs.
+    /// - Positive inputs are refined via Newton-Raphson with a
+    ///   bit-width-estimated initial guess (no `f64`); the iteration
+    ///   count is fixed at 64 to guarantee determinism regardless of
+    ///   the input's magnitude.
+    ///
+    /// # Why delegate?
+    ///
+    /// The CPU implementation already lives in ALICE-Physics and has
+    /// been exercised on 50 000+ integration tests since v0.6.0.
+    /// Re-implementing here would risk drift in the rounding /
+    /// truncation behaviour that the deterministic lockstep contract
+    /// depends on. The delegation is one convert-in + one
+    /// convert-out per call — negligible cost compared with the 64
+    /// Newton iterations.
+    ///
+    /// # Roadmap
+    ///
+    /// A GPU port (`FIX128_SQRT_WGSL`) lands in v1.1.0 alongside the
+    /// distance-constraint projection kernel. Callers that need the
+    /// same result on both sides of the bridge — e.g. CPU pre-flight
+    /// vs GPU dispatch — will get bit-exact agreement because the
+    /// two paths share this reference.
+    #[must_use]
+    pub fn sqrt(self) -> Self {
+        let fix = alice_physics::math::Fix128::from_raw(self.hi, self.lo);
+        let root = fix.sqrt();
+        Self {
+            hi: root.hi,
+            lo: root.lo,
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "physics-solver")]
+mod fix128_gpu_sqrt_tests {
+    use crate::fix128::Fix128Gpu;
+    use alice_physics::math::Fix128;
+
+    fn fix128_to_gpu(v: Fix128) -> Fix128Gpu {
+        Fix128Gpu { hi: v.hi, lo: v.lo }
+    }
+
+    /// The Fix128Gpu bridge must return exactly the same bits as the
+    /// canonical `alice_physics::Fix128::sqrt` for every fixture.
+    #[test]
+    fn sqrt_matches_alice_physics_reference() {
+        let fixtures = [
+            Fix128::ZERO,
+            Fix128::ONE,
+            Fix128::from_int(4),
+            Fix128::from_int(9),
+            Fix128::from_int(100),
+            Fix128::from_ratio(1, 4),  // = 0.25
+            Fix128::from_ratio(1, 16), // = 0.0625
+            Fix128::NEG_ONE,           // negative -> ZERO by contract
+        ];
+        for (i, &fix) in fixtures.iter().enumerate() {
+            let cpu_root = fix.sqrt();
+            let gpu = fix128_to_gpu(fix);
+            let bridged_root = gpu.sqrt();
+            assert_eq!(
+                bridged_root.hi, cpu_root.hi,
+                "fixture[{i}] hi mismatch: bridged {} vs canonical {}",
+                bridged_root.hi, cpu_root.hi
+            );
+            assert_eq!(
+                bridged_root.lo, cpu_root.lo,
+                "fixture[{i}] lo mismatch: bridged {:#x} vs canonical {:#x}",
+                bridged_root.lo, cpu_root.lo
+            );
+        }
+    }
+
+    /// Behavioural spot check: `sqrt(4) == 2` (the classic sanity
+    /// test), verifying the bridge does not accidentally swap
+    /// `Fix128` and `Fix128Gpu` field layouts.
+    #[test]
+    fn sqrt_of_four_is_two() {
+        let four_gpu = fix128_to_gpu(Fix128::from_int(4));
+        let root = four_gpu.sqrt();
+        let expected = fix128_to_gpu(Fix128::from_int(2));
+        assert_eq!(root.hi, expected.hi);
+        assert_eq!(root.lo, expected.lo);
+    }
+
+    /// Behavioural spot check: `sqrt(0.25) == 0.5`.
+    #[test]
+    fn sqrt_of_quarter_is_half() {
+        let quarter_gpu = fix128_to_gpu(Fix128::from_ratio(1, 4));
+        let root = quarter_gpu.sqrt();
+        let expected = fix128_to_gpu(Fix128::from_ratio(1, 2));
+        assert_eq!(root.hi, expected.hi);
+        assert_eq!(root.lo, expected.lo);
+    }
+
+    /// Contract check: negative inputs return `Fix128Gpu::ZERO`
+    /// verbatim.
+    #[test]
+    fn sqrt_of_negative_is_zero() {
+        let neg_gpu = fix128_to_gpu(Fix128::NEG_ONE);
+        let root = neg_gpu.sqrt();
+        assert_eq!(root.hi, 0);
+        assert_eq!(root.lo, 0);
+    }
+}
