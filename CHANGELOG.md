@@ -2,6 +2,36 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.0.2] - 2026-07-05
+
+### Added — `Fix128Gpu` constructor helpers
+
+Four additive `Fix128Gpu` methods to eliminate the `Self { hi: v.hi, lo: v.lo }` and `Fix128::from_raw(gpu.hi, gpu.lo)` boilerplate that had accumulated across the bridge layer.
+
+- **`Fix128Gpu::from_int(n: i64) -> Self`** — `const fn` matching `alice_physics::math::Fix128::from_int` byte-for-byte in the shared I64F64 layout
+- **`Fix128Gpu::to_f64(self) -> f64`** — logging / debugging conversion (not deterministic; documented as such)
+- **`Fix128Gpu::from_physics(v: Fix128) -> Self`** (physics-solver feature) — canonical CPU → GPU conversion; `const fn`
+- **`Fix128Gpu::to_physics(self) -> Fix128`** (physics-solver feature) — round-trips exactly with `from_physics`
+
+### Internal cleanup
+
+- `Fix128Gpu::sqrt` refactored to use the new helpers: `Self::from_physics(self.to_physics().sqrt())`
+- Test helper `fix128_to_gpu(v)` in the sqrt tests now delegates to `Fix128Gpu::from_physics(v)`
+
+### Tests
+
+- **3 new tests** covering the four helpers:
+  - `fix128_gpu_from_int_matches_from_raw` — 8 integer fixtures including `i64::MAX`/`i64::MIN`
+  - `fix128_gpu_to_f64_matches_expected` — zero / one / integers / 0.5
+  - `from_physics_to_physics_round_trips` — 7 fixtures with mixed sign / bit patterns
+- Total: 31 fix128 tests (+2 fix128_gpu constructors) + 159 physics-solver tests (+3 sqrt module)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.0.1 at the Rust API level
+- All new methods are additive; v1.0.0 semver stability commitment preserved
+- Downstream code that used the manual `Fix128Gpu { hi, lo }` pattern continues to compile unchanged; the helpers are strictly opt-in convenience
+
 ## [1.0.1] - 2026-07-05
 
 ### Added — `Fix128Gpu::sqrt` (foundation for v1.1.0 distance constraint)

@@ -1009,6 +1009,29 @@ pub use solver_bridge::TrtSolverAdapter;
 
 #[cfg(feature = "physics-solver")]
 impl crate::fix128::Fix128Gpu {
+    /// Construct a `Fix128Gpu` from an ALICE-Physics `Fix128` value.
+    ///
+    /// This is the canonical CPU → GPU conversion, kept as a
+    /// one-liner to eliminate the repeated `Self { hi: v.hi, lo: v.lo }`
+    /// pattern that has grown across the bridge. Since both types
+    /// share the same `#[repr(C)] { hi: i64, lo: u64 }` layout, the
+    /// conversion is exact and const-foldable.
+    #[must_use]
+    pub const fn from_physics(v: alice_physics::math::Fix128) -> Self {
+        Self { hi: v.hi, lo: v.lo }
+    }
+
+    /// Convert a `Fix128Gpu` back into an ALICE-Physics `Fix128` for
+    /// CPU-side use.
+    ///
+    /// Round-trips exactly with [`Self::from_physics`] because the
+    /// two types share layout; the compiler collapses the pair down
+    /// to a no-op in release builds.
+    #[must_use]
+    pub fn to_physics(self) -> alice_physics::math::Fix128 {
+        alice_physics::math::Fix128::from_raw(self.hi, self.lo)
+    }
+
     /// Deterministic Fix128 square root, mirroring
     /// `alice_physics::math::Fix128::sqrt` byte-for-byte.
     ///
@@ -1039,12 +1062,7 @@ impl crate::fix128::Fix128Gpu {
     /// two paths share this reference.
     #[must_use]
     pub fn sqrt(self) -> Self {
-        let fix = alice_physics::math::Fix128::from_raw(self.hi, self.lo);
-        let root = fix.sqrt();
-        Self {
-            hi: root.hi,
-            lo: root.lo,
-        }
+        Self::from_physics(self.to_physics().sqrt())
     }
 }
 
@@ -1055,7 +1073,27 @@ mod fix128_gpu_sqrt_tests {
     use alice_physics::math::Fix128;
 
     fn fix128_to_gpu(v: Fix128) -> Fix128Gpu {
-        Fix128Gpu { hi: v.hi, lo: v.lo }
+        Fix128Gpu::from_physics(v)
+    }
+
+    /// Round-trip: `from_physics` then `to_physics` returns the same
+    /// `Fix128` bit-for-bit for every representative fixture.
+    #[test]
+    fn from_physics_to_physics_round_trips() {
+        let fixtures = [
+            Fix128::ZERO,
+            Fix128::ONE,
+            Fix128::NEG_ONE,
+            Fix128::from_int(42),
+            Fix128::from_int(-100),
+            Fix128::from_raw(1, 0xDEAD_BEEF_CAFE_BABE),
+            Fix128::from_raw(-1, 0x1234_5678_9ABC_DEF0),
+        ];
+        for &fix in &fixtures {
+            let round_tripped = Fix128Gpu::from_physics(fix).to_physics();
+            assert_eq!(round_tripped.hi, fix.hi);
+            assert_eq!(round_tripped.lo, fix.lo);
+        }
     }
 
     /// The Fix128Gpu bridge must return exactly the same bits as the

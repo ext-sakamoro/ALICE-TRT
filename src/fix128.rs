@@ -59,6 +59,32 @@ impl Fix128Gpu {
         Self { hi, lo }
     }
 
+    /// Construct a `Fix128Gpu` from a signed integer.
+    ///
+    /// The result has `hi = n` and `lo = 0`, matching
+    /// `alice_physics::math::Fix128::from_int` byte-for-byte in the
+    /// I64F64 layout that both types share.
+    #[must_use]
+    pub const fn from_int(n: i64) -> Self {
+        Self { hi: n, lo: 0 }
+    }
+
+    /// Approximate `f64` conversion for logging / debugging only.
+    ///
+    /// **Not deterministic** — floating-point rounding depends on the
+    /// host CPU's rounding mode. Use this to eyeball values in tests
+    /// and print statements, never inside determinism-sensitive code
+    /// paths. For the deterministic conversion the ecosystem relies
+    /// on, go through
+    /// `alice_physics::math::Fix128::from_raw(gpu.hi, gpu.lo)`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn to_f64(self) -> f64 {
+        // Value = hi + lo / 2^64; construct as f64 in one expression
+        // so the compiler can fold the divisor into the constant pool.
+        (self.hi as f64) + (self.lo as f64) / ((1u128 << 64) as f64)
+    }
+
     /// Reference `add` — Fix128 128-bit two's-complement addition with
     /// carry propagation from `lo` into `hi`. This is the golden
     /// implementation the WGSL kernel must reproduce byte-for-byte
@@ -1624,6 +1650,27 @@ pub trait Fix128GpuKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fix128_gpu_from_int_matches_from_raw() {
+        for &n in &[-3_i64, -1, 0, 1, 2, 42, i64::MAX, i64::MIN] {
+            let via_from_int = Fix128Gpu::from_int(n);
+            let via_from_raw = Fix128Gpu::from_raw(n, 0);
+            assert_eq!(via_from_int.hi, via_from_raw.hi);
+            assert_eq!(via_from_int.lo, via_from_raw.lo);
+        }
+    }
+
+    #[test]
+    fn fix128_gpu_to_f64_matches_expected() {
+        assert!((Fix128Gpu::ZERO.to_f64() - 0.0).abs() < 1e-12);
+        assert!((Fix128Gpu::ONE.to_f64() - 1.0).abs() < 1e-12);
+        assert!((Fix128Gpu::from_int(42).to_f64() - 42.0).abs() < 1e-12);
+        assert!((Fix128Gpu::from_int(-5).to_f64() - -5.0).abs() < 1e-12);
+        // 0.5 = raw(0, 1 << 63)
+        let half = Fix128Gpu::from_raw(0, 1u64 << 63);
+        assert!((half.to_f64() - 0.5).abs() < 1e-12);
+    }
 
     #[test]
     fn fix128_gpu_constants_are_wellformed() {
