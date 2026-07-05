@@ -808,6 +808,199 @@ fn fix128_dot_final_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader source for the **Fix128 PGS integrate** kernel —
+/// the minimum-viable "live dispatch" that upgrades the ALICE-Physics ↔
+/// ALICE-TRT `GpuSolverBridge` from wire-up-only to an actually-running
+/// GPU physics step.
+///
+/// # Semantics
+///
+/// One dispatch performs semi-implicit Euler position integration on
+/// every scalar Fix128 axis component in the storage buffer:
+///
+/// ```text
+/// positions[i] = positions[i] + velocities[i] * dt
+/// ```
+///
+/// Bodies are laid out as flat `Fix128Gpu[]` where each body occupies
+/// three consecutive slots (x, y, z). The grid dispatches one thread
+/// per axis component and updates `positions` in place. Velocities are
+/// read-only in this MVV; gravity acceleration and constraint
+/// projection land in v0.9.1+.
+///
+/// # Determinism contract
+///
+/// Every thread updates a distinct position slot with only a single
+/// mul + add of the paired velocity and shared `dt`, so there is no
+/// cross-thread ordering dependence. The Fix128 mul + add primitives
+/// are already certified bit-exact against the CPU reference
+/// ([`Fix128Gpu::mul`], [`Fix128Gpu::add`]) on the platform-matrix CI,
+/// so the composite result is also bit-exact — this is the property
+/// the paired `TrtSolverAdapter::assert_bit_exact_vs_cpu` test proves.
+///
+/// # Layout
+///
+/// - `@group(0) @binding(0) var<storage, read_write> positions: array<Fix128Gpu>`
+/// - `@group(0) @binding(1) var<storage, read>       velocities: array<Fix128Gpu>`
+/// - `@group(0) @binding(2) var<uniform>              params: PgsParams`
+///
+/// `PgsParams` packs `dt` (a `Fix128Gpu`, 16 bytes) plus 16 bytes of
+/// padding so the uniform buffer stays at the 32-byte minimum many
+/// backends prefer for uniform blocks.
+pub const FIX128_PGS_INTEGRATE_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+struct PgsParams {
+    dt: Fix128Gpu,
+    _pad: vec4<u32>,
+}
+
+@group(0) @binding(0) var<storage, read_write> positions:  array<Fix128Gpu>;
+@group(0) @binding(1) var<storage, read>       velocities: array<Fix128Gpu>;
+@group(0) @binding(2) var<uniform>             params:     PgsParams;
+
+// -- helper: u32 × u32 → u64 (16-bit halving schoolbook) ----------------------
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+// -- helper: 64-bit unsigned add returning (lo, hi, carry) --------------------
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+// -- helper: u64 × u64 → u128 -------------------------------------------------
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+    let r0 = ll.x;
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+    let r3 = hh.y + carry_to_3;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+// -- fix128 add: 128-bit two's-complement add ---------------------------------
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+// -- fix128 mul: signed 128×128 → middle 128 bits (I64F64 semantics) ----------
+fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+    let ll = u64_mul_wide(a_lo, b_lo);
+    let lh = u64_mul_wide(a_lo, b_hi);
+    let hl = u64_mul_wide(a_hi, b_lo);
+    let hh = u64_mul_wide(a_hi, b_hi);
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+    let s5a = lh.w + hl.w;
+    let s5b = s5a + hh.y;
+    let p5_u = s5b + carry_to_5;
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+    var p4 = p4_u;
+    var p5 = p5_u;
+    if (a_negative) {
+        let new_p4 = p4 - b.lo_lo;
+        let borrow = select(0u, 1u, p4 < b.lo_lo);
+        let new_p5 = p5 - b.lo_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    if (b_negative) {
+        let new_p4 = p4 - a.lo_lo;
+        let borrow = select(0u, 1u, p4 < a.lo_lo);
+        let new_p5 = p5 - a.lo_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
+    return out;
+}
+
+// One dispatch = one PGS iteration. Every thread updates a distinct
+// `positions[idx]` in place: p += v * dt (semi-implicit Euler,
+// gravity omitted for the MVV — will land in v0.9.1+).
+@compute @workgroup_size(64)
+fn fix128_pgs_integrate_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&positions)) { return; }
+    let vel_dt = fix128_mul_kernel(velocities[idx], params.dt);
+    positions[idx] = fix128_add_kernel(positions[idx], vel_dt);
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------

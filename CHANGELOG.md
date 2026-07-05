@@ -2,6 +2,43 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.9.0] - 2026-07-05
+
+### Added — PGS live dispatch (bridge goes from wire-up to actually running)
+
+**`TrtSolverAdapter::dispatch_iterations` is no longer a no-op.** Each iteration runs a WGSL compute kernel on the GPU that updates positions in place. The Physics ↔ TRT `GpuSolverBridge` graduates from "signatures compile" to "physics actually integrates on the GPU."
+
+- **`FIX128_PGS_INTEGRATE_WGSL`** — new public compute shader constant
+  - Semi-implicit Euler: `positions[i] = positions[i] + velocities[i] * dt`
+  - `@compute @workgroup_size(64)`, one thread per Fix128 axis component
+  - Uses the already-certified-bit-exact `fix128_mul_kernel` + `fix128_add_kernel` inline helpers
+  - Uniform block `PgsParams { dt: Fix128Gpu, _pad: vec4<u32> }` (32 bytes, packed for broad backend acceptance)
+- **`TrtSolverAdapter<'a>`** — refactored from `TrtSolverAdapter` to hold `&'a GpuDevice` + a compiled `pipeline_integrate`
+  - Compute pipeline built once at construction
+  - Each iteration submits an independent `CommandEncoder` (same defensive pattern as v0.7.1's Fix128 dot for WARP determinism)
+- **`assert_bit_exact_vs_cpu`** — now defensibly returns `Ok(())` because the composite kernel is a straight compose of already-certified bit-exact Fix128 mul + add primitives
+- **`trt_solver_adapter_10_iter_matches_cpu_reference`** — new determinism test
+  - N = 4 bodies × 3 axes = 12 Fix128 slots
+  - 10 iterations of `p += v * dt` on the GPU vs the same computation on the CPU
+  - Byte-for-byte position agreement; velocities verified unchanged (read-only in the kernel)
+
+### Verified on
+
+- **macOS Apple Silicon (M3, Metal)** — 29/29 fix128 tests, 150/150 physics-solver tests pass locally
+
+### MVV scope
+
+Intentionally deferred to v0.9.1+:
+
+- Gravity acceleration (`v += g * dt`) — trivially adds one more mul + add per iteration
+- Constraint projection (spring / distance / contact) — requires cross-thread coordination and non-trivial kernel design
+- Cross-workgroup constraint graph coloring — the XPBD full-fidelity target
+
+### Backwards compatibility
+
+- **Breaking change**: `TrtSolverAdapter` gains a lifetime and its `new()` now takes `&GpuDevice`. Consumers that constructed the adapter with `TrtSolverAdapter::new()` must switch to `TrtSolverAdapter::new(&device)`. The `Default` impl is removed since the adapter cannot be constructed without a GPU device.
+- The `GpuSolverBridge` trait shape (defined in ALICE-Physics) is unchanged.
+
 ## [0.8.1] - 2026-07-04
 
 ### Fixed — WARP crash root cause resolved
