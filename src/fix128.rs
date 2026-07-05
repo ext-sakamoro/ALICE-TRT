@@ -69,6 +69,45 @@ impl Fix128Gpu {
         Self { hi: n, lo: 0 }
     }
 
+    /// True when the Fix128 value is strictly less than zero.
+    ///
+    /// Uses the sign bit of the high half (`hi < 0` in two's-
+    /// complement) — the same test the WGSL floor projection kernel
+    /// performs via `hi_hi & 0x8000_0000u`. Keeping the CPU and GPU
+    /// paths in lockstep lets tests assert identical behaviour on
+    /// either side of the bridge.
+    #[must_use]
+    #[inline]
+    pub const fn is_negative(self) -> bool {
+        self.hi < 0
+    }
+
+    /// True when the Fix128 value is exactly zero (both `hi` and
+    /// `lo` halves are zero).
+    #[must_use]
+    #[inline]
+    pub const fn is_zero(self) -> bool {
+        self.hi == 0 && self.lo == 0
+    }
+
+    /// True when the Fix128 value is strictly greater than zero.
+    ///
+    /// The unusual `else if` structure (rather than
+    /// `!self.is_negative() && !self.is_zero()`) keeps the method
+    /// `const fn`-compatible on the current MSRV; `const fn` bodies
+    /// cannot call other trait methods yet.
+    #[must_use]
+    #[inline]
+    pub const fn is_positive(self) -> bool {
+        if self.hi > 0 {
+            true
+        } else if self.hi < 0 {
+            false
+        } else {
+            self.lo > 0
+        }
+    }
+
     /// Approximate `f64` conversion for logging / debugging only.
     ///
     /// **Not deterministic** — floating-point rounding depends on the
@@ -1650,6 +1689,49 @@ pub trait Fix128GpuKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fix128_gpu_sign_predicates_cover_every_case() {
+        // is_negative
+        assert!(Fix128Gpu::from_int(-1).is_negative());
+        assert!(Fix128Gpu::from_raw(-1, u64::MAX).is_negative());
+        assert!(!Fix128Gpu::ZERO.is_negative());
+        assert!(!Fix128Gpu::ONE.is_negative());
+        assert!(!Fix128Gpu::from_raw(0, 1u64 << 63).is_negative());
+
+        // is_zero
+        assert!(Fix128Gpu::ZERO.is_zero());
+        assert!(!Fix128Gpu::ONE.is_zero());
+        assert!(!Fix128Gpu::from_raw(0, 1).is_zero());
+        assert!(!Fix128Gpu::from_int(-1).is_zero());
+
+        // is_positive
+        assert!(Fix128Gpu::ONE.is_positive());
+        assert!(Fix128Gpu::from_raw(0, 1u64 << 63).is_positive());
+        assert!(Fix128Gpu::from_raw(0, 1).is_positive()); // tiny positive fraction
+        assert!(!Fix128Gpu::ZERO.is_positive());
+        assert!(!Fix128Gpu::from_int(-1).is_positive());
+    }
+
+    #[test]
+    fn fix128_gpu_sign_predicates_are_mutually_exclusive() {
+        // For every representative value, exactly one of the three
+        // predicates must return true.
+        let fixtures = [
+            Fix128Gpu::ZERO,
+            Fix128Gpu::ONE,
+            Fix128Gpu::from_int(-1),
+            Fix128Gpu::from_int(i64::MAX),
+            Fix128Gpu::from_int(i64::MIN),
+            Fix128Gpu::from_raw(0, 1),
+            Fix128Gpu::from_raw(-1, u64::MAX),
+        ];
+        for &f in &fixtures {
+            let flags = [f.is_negative(), f.is_zero(), f.is_positive()];
+            let count = flags.iter().filter(|&&b| b).count();
+            assert_eq!(count, 1, "exactly one sign predicate must hold for {f:?}");
+        }
+    }
 
     #[test]
     fn fix128_gpu_from_int_matches_from_raw() {

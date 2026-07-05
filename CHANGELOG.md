@@ -2,6 +2,28 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.0.4] - 2026-07-05
+
+### Added — `Fix128Gpu` sign predicates (CPU / WGSL parity helpers)
+
+Three `const fn` sign predicates on `Fix128Gpu` matching the WGSL floor projection kernel's MSB test byte-for-byte. Callers writing CPU / GPU parity assertions can now use identical semantics on either side of the bridge.
+
+- **`Fix128Gpu::is_negative(self) -> bool`** — `hi < 0` (two's-complement sign bit; same as WGSL `hi_hi & 0x8000_0000u`)
+- **`Fix128Gpu::is_zero(self) -> bool`** — `hi == 0 && lo == 0`
+- **`Fix128Gpu::is_positive(self) -> bool`** — strict `> 0`, structured for `const fn` compatibility on the pinned MSRV
+
+### Tests
+
+- **2 new tests**:
+  - `fix128_gpu_sign_predicates_cover_every_case` — every predicate exercised across negative / zero / positive / boundary values
+  - `fix128_gpu_sign_predicates_are_mutually_exclusive` — for every fixture, exactly one of the three predicates holds
+- Total: 33 fix128 tests (+2 sign predicates)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.0.3 at the Rust API level
+- All new methods are additive `const fn`; v1.0.0 semver stability commitment preserved
+
 ## [1.0.3] - 2026-07-05
 
 ### Added — `From` / `Into` trait impls for the Fix128 ↔ Fix128Gpu bridge
