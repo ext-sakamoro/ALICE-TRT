@@ -1066,6 +1066,28 @@ impl crate::fix128::Fix128Gpu {
     }
 }
 
+/// Idiomatic `Into<Fix128Gpu>` for callers that already have an
+/// ALICE-Physics `Fix128` in hand. Delegates to
+/// [`crate::fix128::Fix128Gpu::from_physics`] so the layout and semantics
+/// stay centralised in one place.
+#[cfg(feature = "physics-solver")]
+impl From<alice_physics::math::Fix128> for crate::fix128::Fix128Gpu {
+    fn from(v: alice_physics::math::Fix128) -> Self {
+        Self::from_physics(v)
+    }
+}
+
+/// Idiomatic `Into<Fix128>` for callers that need to hand a GPU-side
+/// value back to ALICE-Physics APIs. Delegates to
+/// [`crate::fix128::Fix128Gpu::to_physics`] so the round-trip through the
+/// bridge is guaranteed to be layout-exact.
+#[cfg(feature = "physics-solver")]
+impl From<crate::fix128::Fix128Gpu> for alice_physics::math::Fix128 {
+    fn from(v: crate::fix128::Fix128Gpu) -> Self {
+        v.to_physics()
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "physics-solver")]
 mod fix128_gpu_sqrt_tests {
@@ -1074,6 +1096,27 @@ mod fix128_gpu_sqrt_tests {
 
     fn fix128_to_gpu(v: Fix128) -> Fix128Gpu {
         Fix128Gpu::from_physics(v)
+    }
+
+    /// The `From` / `Into` trait impls must be layout-exact and
+    /// round-trip cleanly through both directions.
+    #[test]
+    fn from_into_trait_impls_round_trip() {
+        let fix = Fix128::from_raw(-3, 0xCAFE_BABE_1234_5678);
+        let gpu: Fix128Gpu = fix.into();
+        assert_eq!(gpu.hi, fix.hi);
+        assert_eq!(gpu.lo, fix.lo);
+        let back: Fix128 = gpu.into();
+        assert_eq!(back.hi, fix.hi);
+        assert_eq!(back.lo, fix.lo);
+
+        // Chained `.into()` on generic call sites also works.
+        fn accept<T: Into<Fix128Gpu>>(v: T) -> Fix128Gpu {
+            v.into()
+        }
+        let via_generic = accept(fix);
+        assert_eq!(via_generic.hi, fix.hi);
+        assert_eq!(via_generic.lo, fix.lo);
     }
 
     /// Round-trip: `from_physics` then `to_physics` returns the same

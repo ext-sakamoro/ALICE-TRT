@@ -2,6 +2,35 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.0.3] - 2026-07-05
+
+### Added — `From` / `Into` trait impls for the Fix128 ↔ Fix128Gpu bridge
+
+Two idiomatic Rust conversion trait implementations that let callers write `.into()` and generic `Into<T>` bounds when routing values between the CPU-side ALICE-Physics `Fix128` type and the GPU-side `Fix128Gpu` type.
+
+- **`impl From<alice_physics::math::Fix128> for Fix128Gpu`** (physics-solver feature) — delegates to `Fix128Gpu::from_physics`
+- **`impl From<Fix128Gpu> for alice_physics::math::Fix128`** (physics-solver feature) — delegates to `Fix128Gpu::to_physics`
+
+Usage:
+
+```rust
+let gpu: Fix128Gpu = fix.into();     // was: Fix128Gpu::from_physics(fix)
+let back: Fix128 = gpu.into();       // was: gpu.to_physics()
+
+fn accept<T: Into<Fix128Gpu>>(v: T) { /* ... */ }
+accept(fix);
+```
+
+### Tests
+
+- **1 new test** `from_into_trait_impls_round_trip` — covers both directions, layout equivalence, and generic `Into<T>` bounds
+- Total: 160 physics-solver tests (+1 sqrt module)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.0.2 at the Rust API level
+- All new impls are additive; v1.0.0 semver stability commitment preserved
+
 ## [1.0.2] - 2026-07-05
 
 ### Added — `Fix128Gpu` constructor helpers
