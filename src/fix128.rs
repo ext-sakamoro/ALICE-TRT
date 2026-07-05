@@ -83,7 +83,7 @@ impl Fix128Gpu {
 
     /// Reference `mul` — Fix128 (`I64F64`) multiplication that takes
     /// the middle 128 bits of the 256-bit signed product. Mirrors
-    /// [`alice_physics::math::Fix128::mul`] so the WGSL kernel
+    /// `alice_physics::math::Fix128::mul` so the WGSL kernel
     /// (scheduled for the follow-up commit) can be certified
     /// byte-for-byte against this reference.
     ///
@@ -471,7 +471,7 @@ fn fix128_mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// WGSL compute shader source for `Fix128 dot` — Σ a[i] × b[i] as a
+/// WGSL compute shader source for `Fix128 dot` — Σ `a[i] × b[i]` as a
 /// single Fix128 output. The kernel dispatches a single workgroup of a
 /// single thread that walks the input arrays in index order, mirroring
 /// the CPU golden `acc = acc.add(a[i].mul(b[i]))` reduction loop.

@@ -2,6 +2,61 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.0.0] - 2026-07-05
+
+**Semver stability commitment**: from this release forward, ALICE-TRT commits to no breaking changes on its public Rust API until v2.0.0. The 0.x era's month-scale API churn (four `TrtSolverAdapter` refactors in one week) is behind us; downstream crates can pin to `alice-trt = "1"` and expect Cargo's semver-compatible dependency resolution to deliver bug fixes and additive features without integration work.
+
+### Added
+
+- **`benches/pgs_dispatch.rs`** — criterion benchmark suite for the PGS live dispatch
+  - `pgs_iters_at_n_256` — iteration-count scaling at fixed N = 256 bodies (1 / 4 / 16 / 64 / 256 iterations)
+  - `pgs_bodies_at_16_iters` — body-count scaling at fixed iters = 16 (N = 64 / 256 / 1 024 / 4 096 / 16 384)
+  - `pgs_kernel_compositions` — marginal cost of enabling gravity (v0.9.1) and floor projection (v0.9.2) on top of the v0.9.0 baseline
+  - Run with `cargo bench --features physics-solver --bench pgs_dispatch`
+  - Gracefully skips when no GPU adapter is available so CI executions produce no numbers
+- **rustdoc broken-intra-doc-link cleanup** — `RUSTDOCFLAGS='-Dwarnings' cargo doc --lib --features physics-solver --no-deps` now returns clean (two links in `FIX128_DOT_WGSL` / `Fix128Gpu::mul` rustdoc were unresolvable inter-crate references)
+
+### Public API surface (frozen for v1 / v2 semver contract)
+
+The following surface is committed to remain source-compatible until v2.0.0:
+
+- `device::GpuDevice` — construction, `device()`, `queue()`, `info()`, `create_buffer_init`, `create_uniform_buffer`, `create_buffer_empty`, `submit`, `poll_wait`, `read_buffer`
+- `fix128` — `Fix128Gpu` struct, `Fix128GpuKernel` trait, `Fix128WgpuKernel<'a>` (add / sub / mul / dot), and the five WGSL shader source constants (`FIX128_ADD_WGSL` / `SUB` / `MUL` / `DOT` / `DOT_FINAL` / `PGS_INTEGRATE` / `PGS_PROJECT_FLOOR`)
+- `physics_bridge::TrtSolverAdapter<'a>` — `new`, `set_gravity`, `set_floor_enabled`, and all `alice_physics::gpu_bridge::GpuSolverBridge` trait methods
+- Legacy `physics_bridge::GpuPhysicsController` (ternary NN control policy inference) — construction, `infer_single`, `infer_batch`, `input_dim`, `output_dim`
+
+**Feature flags** are also frozen: `ffi`, `python`, `cuda`, `physics`, `sdf`, `db`, `view`, `voice`, `fix128-arithmetic`, `physics-solver`.
+
+### Verified on platform matrix CI
+
+| Platform | Backend | fix128 (29) | physics-solver | Wall time |
+|----------|---------|:-----------:|:--------------:|----------:|
+| macos-latest | Metal (Apple M3) | ✓ | ✓ | fast |
+| ubuntu-latest | Vulkan (lavapipe SW) | ✓ | ✓ | fast |
+| windows-latest | DX12 (WARP SW) | ✓ | ✓ | fast |
+
+All three backends run the full 29-test fix128 suite + 4 solver_bridge tests + shader-source coverage + naga compile validity + real-GPU dispatch bit-exact golden.
+
+### Migration from 0.x → 1.0
+
+No API changes between v0.9.2 and v1.0.0 — the version bump is purely a **semver stability signal**. Downstream crates already on v0.9.2 can bump their Cargo.toml to `alice-trt = "1"` (or `= "1.0.0"`) without touching any Rust code.
+
+The breaking changes that landed during the 0.x era, all of which are baked into v1.0.0:
+
+- **v0.7.1** (2026-07-04): `FIX128_DOT_WGSL::fix128_dot_main` entry point renamed to `fix128_dot_partial_main`; new companion `FIX128_DOT_FINAL_WGSL`
+- **v0.8.0** (2026-07-04): `wgpu` bumped 23 → 24; `wgpu::Instance::new()` now takes `&InstanceDescriptor`
+- **v0.9.0** (2026-07-05): `TrtSolverAdapter` gained a lifetime and `new()` now takes `&GpuDevice`; `Default` impl removed
+- **v0.9.1** (2026-07-05): Bind group layout for the integrate kernel: `velocities` binding is now `read_only: false`
+
+### Deferred to v1.1.0+
+
+Not shipped in v1.0.0 (the semver line is drawn where the guarantees are strongest):
+
+- Distance / spring / rigid rod constraints (require Fix128 sqrt + cross-thread coord)
+- Constraint graph coloring for multi-constraint XPBD parity with the CPU-side solver
+- Real-hardware CI (self-hosted runner or GitHub GPU tier) — user operational decision, out of scope
+- `criterion` benchmark integration into CI matrix — software adapters cannot produce meaningful numbers
+
 ## [0.9.2] - 2026-07-05
 
 ### Added — first constraint: infinite floor plane at `y = 0`
