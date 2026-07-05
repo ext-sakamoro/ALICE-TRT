@@ -44,6 +44,16 @@ pub struct Fix128Gpu {
     pub lo: u64,
 }
 
+impl std::fmt::Display for Fix128Gpu {
+    /// Formats as the `f64` approximation so log lines and panic
+    /// messages remain human-readable. Uses the same non-deterministic
+    /// [`Self::to_f64`] path — never rely on `Display` output inside
+    /// determinism-sensitive assertions.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_f64())
+    }
+}
+
 impl Fix128Gpu {
     /// Additive identity.
     pub const ZERO: Self = Self { hi: 0, lo: 0 };
@@ -106,6 +116,33 @@ impl Fix128Gpu {
         } else {
             self.lo > 0
         }
+    }
+
+    /// Absolute value.
+    ///
+    /// Delegates to the existing `sub` primitive so the two's-
+    /// complement handling stays in one place: for negative values,
+    /// the result is `Self::ZERO.sub(self)`. Positive values and
+    /// zero are returned unchanged.
+    #[must_use]
+    #[inline]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            Self::ZERO.sub(self)
+        } else {
+            self
+        }
+    }
+
+    /// Unary minus (arithmetic negation).
+    ///
+    /// Equivalent to `Self::ZERO.sub(self)` — kept as a first-class
+    /// method so callers can spell it in the natural way rather than
+    /// constructing the zero themselves. `const fn` compatible.
+    #[must_use]
+    #[inline]
+    pub const fn neg(self) -> Self {
+        Self::ZERO.sub(self)
     }
 
     /// Approximate `f64` conversion for logging / debugging only.
@@ -1689,6 +1726,37 @@ pub trait Fix128GpuKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fix128_gpu_abs_and_neg() {
+        // Positive stays the same
+        let pos = Fix128Gpu::from_int(5);
+        assert_eq!(pos.abs().hi, 5);
+        assert_eq!(pos.abs().lo, 0);
+        // Zero stays zero
+        assert!(Fix128Gpu::ZERO.abs().is_zero());
+        // Negative flips
+        let neg = Fix128Gpu::from_int(-3);
+        assert_eq!(neg.abs().hi, 3);
+        assert_eq!(neg.abs().lo, 0);
+        // neg round-trip
+        assert_eq!(pos.neg().hi, -5);
+        assert_eq!(pos.neg().neg().hi, 5);
+        assert!(Fix128Gpu::ZERO.neg().is_zero());
+    }
+
+    #[test]
+    fn fix128_gpu_display_shows_approximate_f64() {
+        // Display goes through to_f64 (non-deterministic float
+        // conversion) so we assert the resulting string contains a
+        // recognisable prefix rather than the exact bytes.
+        let s = format!("{}", Fix128Gpu::ONE);
+        assert!(s.starts_with('1'));
+        let s = format!("{}", Fix128Gpu::from_int(-42));
+        assert!(s.starts_with('-'));
+        let s = format!("{}", Fix128Gpu::ZERO);
+        assert!(s.starts_with('0'));
+    }
 
     #[test]
     fn fix128_gpu_sign_predicates_cover_every_case() {

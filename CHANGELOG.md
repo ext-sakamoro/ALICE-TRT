@@ -2,6 +2,24 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.0.5] - 2026-07-05
+
+### Added — `Fix128Gpu` arithmetic + Display
+
+- **`Fix128Gpu::abs(self) -> Self`** (`const fn`) — absolute value via existing `sub`
+- **`Fix128Gpu::neg(self) -> Self`** (`const fn`) — unary minus, equivalent to `Self::ZERO.sub(self)`
+- **`impl std::fmt::Display for Fix128Gpu`** — via `to_f64`, non-deterministic (documented)
+
+### Tests
+
+- 2 new: `fix128_gpu_abs_and_neg` / `fix128_gpu_display_shows_approximate_f64`
+- Total: 35 fix128 tests
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.0.4 at the Rust API level
+- All new methods are additive `const fn`; v1.0.0 semver stability commitment preserved
+
 ## [1.0.4] - 2026-07-05
 
 ### Added — `Fix128Gpu` sign predicates (CPU / WGSL parity helpers)
