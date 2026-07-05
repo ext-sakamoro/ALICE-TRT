@@ -1064,6 +1064,31 @@ impl crate::fix128::Fix128Gpu {
     pub fn sqrt(self) -> Self {
         Self::from_physics(self.to_physics().sqrt())
     }
+
+    /// Deterministic Fix128 division, delegating to
+    /// `alice_physics::math::Fix128 / Fix128`.
+    ///
+    /// # Semantics
+    ///
+    /// - Bit-for-bit equivalent to `self.to_physics() / other.to_physics()`.
+    /// - Behaviour for `other == Fix128::ZERO` matches the ALICE-Physics
+    ///   `Div` impl (typically returns a sentinel value; see the
+    ///   ALICE-Physics `Fix128::div` documentation for the exact
+    ///   contract).
+    ///
+    /// # Foundation for v1.1.0
+    ///
+    /// The v1.1.0 distance-constraint projection kernel needs both
+    /// `sqrt` (v1.0.1) and `div` (this release) as CPU references so
+    /// the follow-up WGSL implementation can be certified against a
+    /// stable arithmetic surface. Delegating here keeps the CPU
+    /// reference bit-for-bit identical to every other Fix128 caller
+    /// in the ecosystem.
+    #[must_use]
+    #[allow(clippy::should_implement_trait)]
+    pub fn div(self, other: Self) -> Self {
+        Self::from_physics(self.to_physics() / other.to_physics())
+    }
 }
 
 /// Idiomatic `Into<Fix128Gpu>` for callers that already have an
@@ -1117,6 +1142,48 @@ mod fix128_gpu_sqrt_tests {
         let via_generic = accept(fix);
         assert_eq!(via_generic.hi, fix.hi);
         assert_eq!(via_generic.lo, fix.lo);
+    }
+
+    /// The Fix128Gpu division bridge must return exactly the same
+    /// bits as the canonical `alice_physics::Fix128 / Fix128` for
+    /// every fixture.
+    #[test]
+    fn div_matches_alice_physics_reference() {
+        let fixtures: &[(Fix128, Fix128)] = &[
+            (Fix128::from_int(10), Fix128::from_int(2)),
+            (Fix128::from_int(1), Fix128::from_int(4)),
+            (Fix128::from_int(-6), Fix128::from_int(3)),
+            (Fix128::from_int(9), Fix128::from_int(-3)),
+            (Fix128::from_raw(1, 0xDEAD_BEEF), Fix128::from_int(7)),
+            (Fix128::ONE, Fix128::from_int(4)), // = 0.25
+        ];
+        for (i, &(a, b)) in fixtures.iter().enumerate() {
+            let cpu = a / b;
+            let bridged = fix128_to_gpu(a).div(fix128_to_gpu(b));
+            assert_eq!(bridged.hi, cpu.hi, "fixture[{i}] hi mismatch");
+            assert_eq!(bridged.lo, cpu.lo, "fixture[{i}] lo mismatch");
+        }
+    }
+
+    /// Behavioural spot check: `10 / 2 == 5`.
+    #[test]
+    fn div_of_integer_pair_is_integer_quotient() {
+        let ten = fix128_to_gpu(Fix128::from_int(10));
+        let two = fix128_to_gpu(Fix128::from_int(2));
+        let five = fix128_to_gpu(Fix128::from_int(5));
+        let quotient = ten.div(two);
+        assert_eq!(quotient.hi, five.hi);
+        assert_eq!(quotient.lo, five.lo);
+    }
+
+    /// Contract check: `x / 1 == x`.
+    #[test]
+    fn div_by_one_is_identity() {
+        let value = fix128_to_gpu(Fix128::from_raw(3, 0x1234_5678_9ABC_DEF0));
+        let one = fix128_to_gpu(Fix128::ONE);
+        let quotient = value.div(one);
+        assert_eq!(quotient.hi, value.hi);
+        assert_eq!(quotient.lo, value.lo);
     }
 
     /// Round-trip: `from_physics` then `to_physics` returns the same

@@ -2,6 +2,30 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.0.6] - 2026-07-05
+
+### Added — `Fix128Gpu::div` (foundation for v1.1.0 distance constraint)
+
+The second entry in the `Fix128Gpu ↔ ALICE-Physics scalar operations bridge` family (after `sqrt` in v1.0.1). Together they cover the arithmetic surface the v1.1.0 GPU distance-constraint projection kernel needs — every reference implementation the kernel is certified against will use these delegations.
+
+- **`Fix128Gpu::div(self, other: Self) -> Self`** (physics-solver feature)
+  - Delegates to `alice_physics::math::Fix128 / Fix128` byte-for-byte
+  - Zero-divisor behaviour matches ALICE-Physics `Div` contract
+  - `#[allow(clippy::should_implement_trait)]` on the inherent method (mirrors `mul`)
+
+### Tests
+
+- **3 new tests**:
+  - `div_matches_alice_physics_reference` — 6-fixture bit-exact agreement with `Fix128 / Fix128`
+  - `div_of_integer_pair_is_integer_quotient` — `10 / 2 == 5`
+  - `div_by_one_is_identity` — `x / 1 == x`
+- Total: 167 physics-solver tests (+3 sqrt module)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.0.5 at the Rust API level
+- All new methods are additive; v1.0.0 semver stability commitment preserved
+
 ## [1.0.5] - 2026-07-05
 
 ### Added — `Fix128Gpu` arithmetic + Display
