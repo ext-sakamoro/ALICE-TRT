@@ -2,6 +2,32 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [0.9.1] - 2026-07-05
+
+### Added — gravity acceleration on the GPU
+
+The PGS live dispatch now applies per-axis gravity every iteration. Semi-implicit Euler order is preserved: `v' = v + g_axis * dt`, then `p' = p + v' * dt`.
+
+- **`FIX128_PGS_INTEGRATE_WGSL`** — kernel body extended
+  - `velocities` binding switched from `read` to `read_write`
+  - `PgsParams` gains `gravity_x` / `gravity_y` / `gravity_z` (three `Fix128Gpu`, 48 bytes)
+  - Per-thread axis selection via `idx % 3` + branchless `select`-equivalent conditional — no barrier crossings so FXC uniformity is trivially satisfied
+- **`TrtSolverAdapter::set_gravity(&mut self, [Fix128; 3])`** — new opt-in API
+  - Default remains `[0, 0, 0]` (no gravity), so v0.9.0 callers see identical behaviour until they opt in
+- **`trt_solver_adapter_gravity_matches_cpu_reference`** — new determinism test
+  - N = 3 bodies × 3 axes = 9 Fix128 slots
+  - 10 iterations with `gravity = [0, -1, 0]` vs CPU reference
+  - Byte-for-byte agreement on **both positions AND velocities** (velocities now mutate)
+
+### Bind group layout change
+
+`binding = 1` (velocities) is now `Storage { read_only: false }` in the bind group layout to match the shader's read-write access. Downstream code that reused this layout for a different shader would need to update.
+
+### Backwards compatibility
+
+- Fully backwards compatible with v0.9.0 at the Rust API level
+- Default gravity is zero, so existing test / production behaviour is unchanged unless the caller explicitly sets gravity
+
 ## [0.9.0] - 2026-07-05
 
 ### Added — PGS live dispatch (bridge goes from wire-up to actually running)

@@ -197,14 +197,18 @@ mod solver_bridge {
     use crate::fix128::{Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL};
 
     /// Uniform block laid out to match the `PgsParams` struct in
-    /// `FIX128_PGS_INTEGRATE_WGSL`. 32 bytes total (16 for `dt`,
-    /// 16 for padding), which keeps the uniform buffer at a size
-    /// most backends accept without complaint.
+    /// `FIX128_PGS_INTEGRATE_WGSL`. 64 bytes total: 16 for `dt`
+    /// plus 16 × 3 for the per-axis gravity vector. All fields are
+    /// naturally 16-byte aligned so the block satisfies WGSL
+    /// uniform buffer layout requirements without additional
+    /// padding.
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
     struct PgsParamsGpu {
         dt: Fix128Gpu,
-        _pad: [u32; 4],
+        gravity_x: Fix128Gpu,
+        gravity_y: Fix128Gpu,
+        gravity_z: Fix128Gpu,
     }
 
     /// GPU offload adapter for the sub-stepping TGS solver.
@@ -221,6 +225,10 @@ mod solver_bridge {
         bind_group_layout: wgpu::BindGroupLayout,
         positions: Vec<Fix128Gpu>,
         velocities: Vec<Fix128Gpu>,
+        /// Per-axis gravity applied every dispatch iteration. Defaults
+        /// to zero (no gravity), so v0.9.0 callers see identical
+        /// behaviour until they opt in via [`Self::set_gravity`].
+        gravity: [Fix128; 3],
     }
 
     impl<'a> TrtSolverAdapter<'a> {
@@ -257,7 +265,10 @@ mod solver_bridge {
                                 binding: 1,
                                 visibility: wgpu::ShaderStages::COMPUTE,
                                 ty: wgpu::BindingType::Buffer {
-                                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                    // v0.9.1: velocities become read-write so
+                                    // the shader can apply per-axis gravity
+                                    // (v += g * dt) into the same buffer.
+                                    ty: wgpu::BufferBindingType::Storage { read_only: false },
                                     has_dynamic_offset: false,
                                     min_binding_size: None,
                                 },
@@ -303,7 +314,21 @@ mod solver_bridge {
                 bind_group_layout,
                 positions: Vec::new(),
                 velocities: Vec::new(),
+                gravity: [Fix128::ZERO; 3],
             }
+        }
+
+        /// Set the per-axis gravity vector applied at every iteration
+        /// of [`GpuSolverBridge::dispatch_iterations`]. Defaults to
+        /// `[0, 0, 0]` when the adapter is constructed, so gravity is
+        /// strictly opt-in.
+        ///
+        /// Typical usage sets `[0, -9.81 * dt_scale, 0]` for a Y-up
+        /// world, but any Fix128 triple is accepted. Callers are
+        /// responsible for choosing the sign convention that matches
+        /// their world axes.
+        pub fn set_gravity(&mut self, gravity: [Fix128; 3]) {
+            self.gravity = gravity;
         }
     }
 
@@ -315,22 +340,36 @@ mod solver_bridge {
         Fix128::from_raw(v.hi, v.lo)
     }
 
-    /// CPU reference for the WGSL kernel body: `p += v * dt`, one
-    /// application per iteration. Any deviation of the GPU dispatch
-    /// from this loop is a determinism violation.
+    /// CPU reference for the WGSL kernel body:
+    ///
+    /// ```text
+    /// v' = v + gravity[axis] * dt
+    /// p' = p + v' * dt
+    /// ```
+    ///
+    /// Any deviation of the GPU dispatch from this loop is a
+    /// determinism violation. Both `positions` and `velocities` are
+    /// updated in place; the axis is taken as `slot_index % 3` since
+    /// bodies are laid out as flat `Fix128Gpu[]` with three
+    /// consecutive slots per body.
     #[cfg(test)]
     fn cpu_semi_implicit_integrate(
         positions: &mut [Fix128Gpu],
-        velocities: &[Fix128Gpu],
+        velocities: &mut [Fix128Gpu],
+        gravity: [Fix128; 3],
         iters: u32,
         dt: Fix128,
     ) {
         for _ in 0..iters {
-            for (p, v) in positions.iter_mut().zip(velocities.iter()) {
-                let p_fix = gpu_to_fix128(*p);
+            for (i, (p, v)) in positions.iter_mut().zip(velocities.iter_mut()).enumerate() {
+                let axis = i % 3;
+                let g = gravity[axis];
                 let v_fix = gpu_to_fix128(*v);
-                let updated = p_fix + v_fix * dt;
-                *p = fix128_to_gpu(updated);
+                let v_new = v_fix + g * dt;
+                *v = fix128_to_gpu(v_new);
+                let p_fix = gpu_to_fix128(*p);
+                let p_new = p_fix + v_new * dt;
+                *p = fix128_to_gpu(p_new);
             }
         }
     }
@@ -367,7 +406,9 @@ mod solver_bridge {
                 .create_buffer_init("pgs_integrate_vel", bytemuck::cast_slice(&self.velocities));
             let params = PgsParamsGpu {
                 dt: fix128_to_gpu(dt),
-                _pad: [0; 4],
+                gravity_x: fix128_to_gpu(self.gravity[0]),
+                gravity_y: fix128_to_gpu(self.gravity[1]),
+                gravity_z: fix128_to_gpu(self.gravity[2]),
             };
             let buf_params = self
                 .device
@@ -420,9 +461,14 @@ mod solver_bridge {
                 self.device.poll_wait();
             }
 
-            let raw = self.device.read_buffer(&buf_pos, bytes);
-            let updated: &[Fix128Gpu] = bytemuck::cast_slice(&raw);
-            self.positions.copy_from_slice(updated);
+            let raw_pos = self.device.read_buffer(&buf_pos, bytes);
+            self.positions
+                .copy_from_slice(bytemuck::cast_slice(&raw_pos));
+            // v0.9.1: velocities are also mutated on the GPU (gravity
+            // accumulation), so we must read them back too.
+            let raw_vel = self.device.read_buffer(&buf_vel, bytes);
+            self.velocities
+                .copy_from_slice(bytemuck::cast_slice(&raw_vel));
         }
 
         fn recv_island(&self, positions: &mut [[Fix128; 3]], velocities: &mut [[Fix128; 3]]) {
@@ -560,16 +606,23 @@ mod solver_bridge {
             let iters = 10u32;
             adapter.dispatch_iterations(iters, dt);
 
-            // CPU reference against the same math.
+            // CPU reference against the same math (gravity = 0, so
+            // velocity stays constant and only positions integrate).
             let mut cpu_positions: Vec<Fix128Gpu> = positions
                 .iter()
                 .flat_map(|p| p.iter().map(|f| fix128_to_gpu(*f)))
                 .collect();
-            let cpu_velocities: Vec<Fix128Gpu> = velocities
+            let mut cpu_velocities: Vec<Fix128Gpu> = velocities
                 .iter()
                 .flat_map(|v| v.iter().map(|f| fix128_to_gpu(*f)))
                 .collect();
-            cpu_semi_implicit_integrate(&mut cpu_positions, &cpu_velocities, iters, dt);
+            cpu_semi_implicit_integrate(
+                &mut cpu_positions,
+                &mut cpu_velocities,
+                [Fix128::ZERO; 3],
+                iters,
+                dt,
+            );
 
             for (i, gpu) in adapter.positions.iter().enumerate() {
                 assert_eq!(
@@ -584,7 +637,8 @@ mod solver_bridge {
                 );
             }
 
-            // Velocities are read-only in the kernel; verify unchanged.
+            // Gravity is zero here, so velocities must remain
+            // unchanged even though the kernel now writes them back.
             let mut out_p = vec![[Fix128::ZERO; 3]; 4];
             let mut out_v = vec![[Fix128::ZERO; 3]; 4];
             adapter.recv_island(&mut out_p, &mut out_v);
@@ -592,10 +646,95 @@ mod solver_bridge {
                 for axis in 0..3 {
                     assert_eq!(
                         out_v[i][axis].hi, velocities[i][axis].hi,
-                        "velocity mutated at body {i} axis {axis}"
+                        "velocity mutated at body {i} axis {axis} despite zero gravity"
                     );
                     assert_eq!(out_v[i][axis].lo, velocities[i][axis].lo);
                 }
+            }
+        }
+
+        /// v0.9.1 gravity determinism proof: with `[0, -1, 0]` gravity,
+        /// ten iterations must match the CPU reference byte-for-byte
+        /// in both positions AND velocities (velocities now mutate).
+        #[test]
+        fn trt_solver_adapter_gravity_matches_cpu_reference() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+
+            // Simple deterministic gravity (avoids the non-deterministic
+            // `Fix128::from_f64` path used by realistic -9.81 constants).
+            let gravity = [Fix128::ZERO, Fix128::NEG_ONE, Fix128::ZERO];
+            adapter.set_gravity(gravity);
+
+            let positions = vec![
+                [Fix128::ZERO, Fix128::ZERO, Fix128::ZERO],
+                [
+                    Fix128::from_int(1),
+                    Fix128::from_int(2),
+                    Fix128::from_int(3),
+                ],
+                [
+                    Fix128::from_int(-1),
+                    Fix128::from_raw(0, 1u64 << 40),
+                    Fix128::from_raw(2, 0x1234_5678_9ABC_DEF0),
+                ],
+            ];
+            let velocities = vec![
+                [Fix128::ZERO; 3],
+                [
+                    Fix128::from_int(1),
+                    Fix128::ZERO,
+                    Fix128::from_raw(0, 1u64 << 32),
+                ],
+                [Fix128::ONE, Fix128::from_int(-1), Fix128::ZERO],
+            ];
+
+            adapter.send_island(&positions, &velocities);
+
+            let dt = Fix128::from_ratio(1, 60);
+            let iters = 10u32;
+            adapter.dispatch_iterations(iters, dt);
+
+            let mut cpu_positions: Vec<Fix128Gpu> = positions
+                .iter()
+                .flat_map(|p| p.iter().map(|f| fix128_to_gpu(*f)))
+                .collect();
+            let mut cpu_velocities: Vec<Fix128Gpu> = velocities
+                .iter()
+                .flat_map(|v| v.iter().map(|f| fix128_to_gpu(*f)))
+                .collect();
+            cpu_semi_implicit_integrate(
+                &mut cpu_positions,
+                &mut cpu_velocities,
+                gravity,
+                iters,
+                dt,
+            );
+
+            for (i, gpu_p) in adapter.positions.iter().enumerate() {
+                assert_eq!(
+                    gpu_p.hi, cpu_positions[i].hi,
+                    "position hi mismatch at slot {i}"
+                );
+                assert_eq!(
+                    gpu_p.lo, cpu_positions[i].lo,
+                    "position lo mismatch at slot {i}: GPU {:#x} vs CPU {:#x}",
+                    gpu_p.lo, cpu_positions[i].lo
+                );
+            }
+            for (i, gpu_v) in adapter.velocities.iter().enumerate() {
+                assert_eq!(
+                    gpu_v.hi, cpu_velocities[i].hi,
+                    "velocity hi mismatch at slot {i}"
+                );
+                assert_eq!(
+                    gpu_v.lo, cpu_velocities[i].lo,
+                    "velocity lo mismatch at slot {i}: GPU {:#x} vs CPU {:#x}",
+                    gpu_v.lo, cpu_velocities[i].lo
+                );
             }
         }
     }

@@ -857,11 +857,13 @@ struct Fix128Gpu {
 
 struct PgsParams {
     dt: Fix128Gpu,
-    _pad: vec4<u32>,
+    gravity_x: Fix128Gpu,
+    gravity_y: Fix128Gpu,
+    gravity_z: Fix128Gpu,
 }
 
 @group(0) @binding(0) var<storage, read_write> positions:  array<Fix128Gpu>;
-@group(0) @binding(1) var<storage, read>       velocities: array<Fix128Gpu>;
+@group(0) @binding(1) var<storage, read_write> velocities: array<Fix128Gpu>;
 @group(0) @binding(2) var<uniform>             params:     PgsParams;
 
 // -- helper: u32 × u32 → u64 (16-bit halving schoolbook) ----------------------
@@ -990,14 +992,37 @@ fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
 }
 
 // One dispatch = one PGS iteration. Every thread updates a distinct
-// `positions[idx]` in place: p += v * dt (semi-implicit Euler,
-// gravity omitted for the MVV — will land in v0.9.1+).
+// `positions[idx]` / `velocities[idx]` pair via semi-implicit Euler
+// with per-axis gravity:
+//
+//   v' = v + g_axis * dt
+//   p' = p + v' * dt
+//
+// The axis is `idx % 3` because bodies are laid out as flat
+// `Fix128Gpu[]` with three consecutive slots per body (x, y, z).
+// Selecting `params.gravity_x/y/z` via a dynamic branch on `axis`
+// keeps the uniform block's layout simple and avoids
+// `array<Fix128Gpu, 3>` indexing (which requires the index to be
+// statically or dynamically uniform — the per-thread `idx % 3` is
+// neither). The `select` chain compiles to branchless code on all
+// three backends (Metal / Vulkan / DX12).
 @compute @workgroup_size(64)
 fn fix128_pgs_integrate_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= arrayLength(&positions)) { return; }
-    let vel_dt = fix128_mul_kernel(velocities[idx], params.dt);
-    positions[idx] = fix128_add_kernel(positions[idx], vel_dt);
+
+    // Pick the axis-specific gravity component via branchless select.
+    let axis = idx % 3u;
+    var g: Fix128Gpu;
+    g = params.gravity_x;
+    if (axis == 1u) { g = params.gravity_y; }
+    if (axis == 2u) { g = params.gravity_z; }
+
+    let g_dt   = fix128_mul_kernel(g, params.dt);
+    let v_new  = fix128_add_kernel(velocities[idx], g_dt);
+    velocities[idx] = v_new;
+    let v_dt   = fix128_mul_kernel(v_new, params.dt);
+    positions[idx]  = fix128_add_kernel(positions[idx], v_dt);
 }
 "#;
 
