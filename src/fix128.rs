@@ -1768,6 +1768,24 @@ fn fix128_pgs_project_floor_main(@builtin(global_invocation_id) gid: vec3<u32>) 
 /// - `@group(0) @binding(1) var<uniform>              params: DistanceParams`
 ///
 /// `DistanceParams` packs `(body_a: u32, body_b: u32, _pad: vec2<u32>, scalar: Fix128Gpu)` in 32 bytes.
+///
+/// # Deprecated in v1.7.0, scheduled for removal in v2.0.0
+///
+/// Superseded by [`FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL`] (v1.4.2 — computes the
+/// projection scalar on-device from the rest length, no CPU precompute) and
+/// [`FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL`] (v1.5.1 — same as the rigid
+/// variant but reads a `storage` array of params for color-parallel dispatch).
+/// The internal `TrtSolverAdapter` hasn't referenced this constant since v1.4.2;
+/// the only remaining reason to keep it public is external `Fix128GpuKernel`
+/// implementers who mirror the wgpu backend. Those callers should migrate to
+/// the v1.4.2 / v1.5.1 variants before v2.0.0. See the CHANGELOG for
+/// migration notes.
+#[deprecated(
+    since = "1.7.0",
+    note = "superseded by FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL (v1.4.2) and \
+            FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL (v1.5.1); the adapter no \
+            longer uses this shader. Scheduled for removal in v2.0.0."
+)]
 pub const FIX128_PGS_PROJECT_DISTANCE_WGSL: &str = r#"
 struct Fix128Gpu {
     hi_lo: u32,
@@ -4110,7 +4128,13 @@ mod tests {
     /// v1.1.0 PGS distance projection shader ships every helper it
     /// needs to compute `p += s * (pa - pb)` on the GPU, plus the
     /// single-thread entry point.
+    ///
+    /// The constant is deprecated in v1.7.0 (scheduled for removal in
+    /// v2.0.0); the test remains until then so external
+    /// [`Fix128GpuKernel`] implementers who still reference the shader
+    /// stay covered.
     #[test]
+    #[allow(deprecated)]
     fn wgsl_pgs_project_distance_shader_helpers_present() {
         assert!(FIX128_PGS_PROJECT_DISTANCE_WGSL.contains("u64_add"));
         assert!(FIX128_PGS_PROJECT_DISTANCE_WGSL.contains("u64_sub"));
@@ -4126,7 +4150,13 @@ mod tests {
 
     /// The distance projection shader must compile as valid WGSL.
     /// Skips when no GPU adapter is available (headless CI).
+    ///
+    /// The constant is deprecated in v1.7.0 (scheduled for removal in
+    /// v2.0.0); the compile check remains until then so external
+    /// [`Fix128GpuKernel`] implementers who still reference the shader
+    /// stay covered on the 3-platform CI matrix.
     #[test]
+    #[allow(deprecated)]
     fn wgsl_pgs_project_distance_shader_compiles() {
         let device = match crate::device::GpuDevice::new() {
             Ok(d) => d,

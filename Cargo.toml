@@ -1,6 +1,6 @@
 [package]
 name = "alice-trt"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 description = "GPU Ternary Inference Engine - Don't move data. Move the law."

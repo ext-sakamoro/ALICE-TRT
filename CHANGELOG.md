@@ -2,6 +2,43 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.7.0] - 2026-07-06
+
+### Deprecated — v1.1.0 uniform-based distance projection shader
+
+- **`FIX128_PGS_PROJECT_DISTANCE_WGSL`** is deprecated (with a `#[deprecated]` attribute pointing at both replacements). Scheduled for removal in v2.0.0.
+
+The adapter internal has not referenced this constant since v1.4.2, when the rigid rod path (`FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL`) took over. It remains in the `pub` surface only for external `Fix128GpuKernel` implementers who mirror the wgpu backend and haven't migrated yet.
+
+### Migration
+
+External implementers who reference the deprecated shader:
+
+- **Batched color-parallel dispatch (recommended)**: switch to `FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL` (v1.5.1). Reads a `storage` array of `DistanceParamsRigid` items and selects the target constraint via `@builtin(workgroup_id).x`. Dispatches all constraints of one color in a single compute call.
+- **Single-constraint rigid rod**: switch to `FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL` (v1.4.2). Same 3-buffer bind group layout as the deprecated shader; the uniform layout swaps `scalar: Fix128Gpu` for `rest_length: Fix128Gpu` and the shader computes the correction scalar on-device using the byte-exact v1.4.0 div + v1.4.1 sqrt kernels.
+- **Sequential v1.4.2 behaviour without touching the shader**: `TrtSolverAdapter::set_parallel_dispatch(false)` restores the pre-v1.6.0 default and continues to satisfy the byte-exact contract vs the v1.4.2 `cpu_semi_implicit_integrate` golden.
+
+### v2.0.0 planning notes
+
+The v1.6.0 default flip (`parallel_dispatch = true` at construction time) was documented three releases ahead and ships under MINOR semver on the grounds that:
+
+1. Public API surface is unchanged.
+2. `set_parallel_dispatch(false)` restores prior behaviour in one line.
+3. The new default is byte-exact against a published CPU golden (`cpu_semi_implicit_integrate_colored`, v1.5.2).
+
+If external adopters report that the semantic change materially broke a downstream deterministic test, we retain the option to promote v1.6.0 into a v2.0.0 major bump retroactively (via yank + re-release). Current expectation is that v2.0.0 will formalise removal of the deprecated shader and any accumulated tidy-ups rather than the default flip itself.
+
+### Tests
+
+- Existing `wgsl_pgs_project_distance_shader_helpers_present` and `wgsl_pgs_project_distance_shader_compiles` gained `#[allow(deprecated)]` so the deprecation warning does not break `-Dwarnings` clippy while the constant remains available for external implementers.
+- Total 191 lib tests, all pass on macOS Metal.
+
+### Backwards compatibility
+
+- v1.0.0 semver stability commitment intact.
+- No API removals, only a `#[deprecated]` attribute.
+- The deprecated shader still compiles and runs correctly; consumers get a compile-time warning until they migrate.
+
 ## [1.6.0] - 2026-07-06
 
 ### Changed — Parallel dispatch is now the default
