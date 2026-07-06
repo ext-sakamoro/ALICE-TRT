@@ -2,6 +2,44 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.4.1] - 2026-07-06
+
+### Added — Fix128 GPU square root kernel (`FIX128_SQRT_WGSL`)
+
+Second release of Phase 1 in the [GPU offload roadmap](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md). Introduces the compute-shader-level Fix128 sqrt primitive on top of the v1.4.0 div kernel, unblocking the v1.4.2 rigid rod constraint and any future GPU stage that needs on-device scalar sqrt (narrow-phase distance, cloth constraint length, etc.).
+
+- **`FIX128_SQRT_WGSL`** WGSL constant: 64-iter Newton-Raphson `x = (x + a/x) / 2`, byte-for-byte port of `alice_physics::math::Fix128::sqrt`.
+  - Initial guess via `countLeadingZeros` bit-width estimation (deterministic, no FPU).
+  - Newton loop uses the same `fix128_div_kernel` (128-iter + 64-iter long division) as v1.4.0, embedded inline in the shader.
+  - `fix128_half` helper: arithmetic right-shift by 1 with signed preservation on the top word (via `bitcast<i32>` round-trip).
+  - `sqrt(x)` for `x <= 0` returns `Fix128Gpu::ZERO`, matching the CPU sentinel.
+- **`Fix128WgpuKernel::sqrt(&self, a, out)`** unary dispatch method: reuses the shared 3-buffer bind group by passing `a` as the ignored `input_b`, so the same `dispatch_binary` helper drives it without a separate unary path.
+- **`Fix128GpuKernel::sqrt`** trait method: additive extension.
+
+### Determinism
+
+- No `workgroupBarrier()`, no subgroup ops, no atomics.
+- Fixed 64 Newton iterations, no early exit — cross-platform (Metal / Vulkan / DX12 WARP) equivalence follows from the shared div contract.
+- `countLeadingZeros` is a WGSL builtin with well-defined semantics on every backend.
+
+### Tests (3 new)
+
+- `wgsl_sqrt_shader_helpers_present` — shader source sanity check (helpers + entry point + workgroup size + all three iteration bounds).
+- `wgpu_sqrt_matches_cpu_golden` (feature `physics-solver`) — 6 fixtures (perfect square, prime, fractional, large, negative sentinel, zero sentinel) with byte-for-byte assertion against `Fix128Gpu::sqrt`.
+- `wgpu_trait_sqrt_matches_inherent_sqrt` (feature `physics-solver`) — verifies the `Fix128GpuKernel::sqrt` trait route matches `Fix128WgpuKernel::sqrt` byte-for-byte.
+
+Total: 179 lib tests (176 prior + 3 new) — all pass on macOS Metal.
+
+### Backwards compatibility
+
+- **Trait extension**: `Fix128GpuKernel` gained a required `sqrt` method. External implementers must add the routing.
+- Additive at the WGSL / dispatch method level (new pipeline field, new dispatch method, new WGSL constant).
+- v1.0.0 semver stability commitment for the `TrtSolverAdapter` surface remains intact.
+
+### Next up (Phase 1)
+
+- **v1.4.2** — Rigid rod constraint (strict distance = L, iterate to convergence on GPU end-to-end using v1.4.0 div + v1.4.1 sqrt).
+
 ## [1.4.0] - 2026-07-06
 
 ### Added — Fix128 GPU division kernel (`FIX128_DIV_WGSL`)
