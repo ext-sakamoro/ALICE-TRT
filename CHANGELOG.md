@@ -2,6 +2,35 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.3.0] - 2026-07-06
+
+### Added — multi-distance constraints (Gauss-Seidel order)
+
+`TrtSolverAdapter` now accepts an arbitrary number of distance constraints. Each iteration projects every constraint in insertion order (Gauss-Seidel style — each constraint sees the position updates that earlier constraints in the same iteration performed).
+
+- **`TrtSolverAdapter::push_distance_constraint(body_a, body_b, rest_length)`** — appends without clearing
+- **`TrtSolverAdapter::clear_distance_constraints()`** — empties the list
+- **`TrtSolverAdapter::set_distance_constraint(Option<(...)>)`** — v1.2.0-compatible: `Some(_)` clears the list and installs a single element, `None` clears
+
+### Internal changes
+
+- Field renamed: `distance_constraint: Option<(usize, usize, Fix128)>` → `distance_constraints: Vec<(usize, usize, Fix128)>`
+- `dispatch_iterations` now loops through every installed constraint per iteration, uploading a fresh uniform for each (one `sqrt` + one `div` on the CPU per constraint per iteration)
+- `cpu_semi_implicit_integrate` test helper signature: `distance_constraint: Option<...>` → `distance_constraints: &[(usize, usize, Fix128)]`
+
+### Tests
+
+- **`trt_solver_adapter_multi_distance_constraint_matches_cpu_reference`** — 3-body triangle with 3 constraints ((0,1), (1,2), (2,0)), 10 iterations, byte-for-byte GPU vs CPU agreement
+- **`trt_solver_adapter_clear_distance_constraints_disables_projection`** — confirms that after `clear_distance_constraints`, subsequent iterations skip the projection dispatch
+- Total: 7 solver_bridge tests (+2 new)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.2.0 at the Rust API level
+- The v1.2.0 `set_distance_constraint(Some(...))` continues to work exactly as before (single constraint, replaces existing list)
+- Default `distance_constraints = Vec::new()`, so behaviour is unchanged unless the caller explicitly installs constraints
+- v1.0.0 semver stability commitment preserved
+
 ## [1.2.0] - 2026-07-06
 
 ### Added — `TrtSolverAdapter::set_distance_constraint` adapter integration

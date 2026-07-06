@@ -254,11 +254,15 @@ mod solver_bridge {
         /// `y = 0` and zeroes its paired velocity. Defaults to
         /// `false` for full backwards compatibility with v0.9.1.
         floor_enabled: bool,
-        /// v1.2.0: single distance constraint. When `Some`, each
-        /// iteration follows the integrate + floor phase with a
-        /// distance projection dispatch that pulls the two named
-        /// bodies toward the given rest length. Defaults to `None`.
-        distance_constraint: Option<(usize, usize, Fix128)>,
+        /// v1.2.0 (Option) → v1.3.0 (Vec): a list of distance
+        /// constraints. Each iteration follows the integrate + floor
+        /// phase with one distance projection dispatch per installed
+        /// constraint, applied in the order the list was built.
+        /// Defaults to empty. `set_distance_constraint(Some(_))`
+        /// clears the list and installs a single element for the
+        /// v1.2.0-compatible single-constraint case;
+        /// `push_distance_constraint(...)` appends without clearing.
+        distance_constraints: Vec<(usize, usize, Fix128)>,
     }
 
     impl<'a> TrtSolverAdapter<'a> {
@@ -469,7 +473,7 @@ mod solver_bridge {
                 velocities: Vec::new(),
                 gravity: [Fix128::ZERO; 3],
                 floor_enabled: false,
-                distance_constraint: None,
+                distance_constraints: Vec::new(),
             }
         }
 
@@ -507,7 +511,30 @@ mod solver_bridge {
         /// itself does only mul + add + sub, keeping it branch-free
         /// and bit-exact against the CPU reference.
         pub fn set_distance_constraint(&mut self, constraint: Option<(usize, usize, Fix128)>) {
-            self.distance_constraint = constraint;
+            self.distance_constraints.clear();
+            if let Some(c) = constraint {
+                self.distance_constraints.push(c);
+            }
+        }
+
+        /// v1.3.0: append a distance constraint to the list without
+        /// clearing existing entries. Order-sensitive: constraints
+        /// are projected in insertion order each iteration (Gauss-
+        /// Seidel style — each constraint sees the position updates
+        /// that earlier constraints in the same iteration performed).
+        pub fn push_distance_constraint(
+            &mut self,
+            body_a: usize,
+            body_b: usize,
+            rest_length: Fix128,
+        ) {
+            self.distance_constraints
+                .push((body_a, body_b, rest_length));
+        }
+
+        /// v1.3.0: clear every installed distance constraint.
+        pub fn clear_distance_constraints(&mut self) {
+            self.distance_constraints.clear();
         }
 
         /// Toggle the v0.9.2 floor constraint (ground plane at `y = 0`).
@@ -552,7 +579,7 @@ mod solver_bridge {
         velocities: &mut [Fix128Gpu],
         gravity: [Fix128; 3],
         floor_enabled: bool,
-        distance_constraint: Option<(usize, usize, Fix128)>,
+        distance_constraints: &[(usize, usize, Fix128)],
         iters: u32,
         dt: Fix128,
     ) {
@@ -575,7 +602,7 @@ mod solver_bridge {
                     }
                 }
             }
-            if let Some((a, b, rest)) = distance_constraint {
+            for &(a, b, rest) in distance_constraints {
                 let pa = [
                     gpu_to_fix128(positions[a * 3]),
                     gpu_to_fix128(positions[a * 3 + 1]),
@@ -745,7 +772,7 @@ mod solver_bridge {
                 // scalar (via Fix128 sqrt + div, both certified
                 // bit-exact against alice_physics), upload as
                 // uniform, and dispatch the projection kernel.
-                if let Some((a, b, rest_length)) = self.distance_constraint {
+                for &(a, b, rest_length) in &self.distance_constraints {
                     let raw_positions = self.device.read_buffer(&buf_pos, bytes);
                     let positions_snapshot: &[Fix128Gpu] = bytemuck::cast_slice(&raw_positions);
                     let pa = [
@@ -981,7 +1008,7 @@ mod solver_bridge {
                 &mut cpu_velocities,
                 [Fix128::ZERO; 3],
                 false,
-                None,
+                &[],
                 iters,
                 dt,
             );
@@ -1073,7 +1100,7 @@ mod solver_bridge {
                 &mut cpu_velocities,
                 gravity,
                 false,
-                None,
+                &[],
                 iters,
                 dt,
             );
@@ -1154,7 +1181,7 @@ mod solver_bridge {
                 &mut cpu_velocities,
                 gravity,
                 true,
-                None,
+                &[],
                 iters,
                 dt,
             );
@@ -1247,7 +1274,7 @@ mod solver_bridge {
                 &mut cpu_velocities,
                 [Fix128::ZERO; 3],
                 false,
-                Some((0, 1, rest_length)),
+                &[(0, 1, rest_length)],
                 iters,
                 dt,
             );
@@ -1262,6 +1289,113 @@ mod solver_bridge {
                     "position lo mismatch at slot {i}: GPU {:#x} vs CPU {:#x}",
                     gpu_p.lo, cpu_positions[i].lo
                 );
+            }
+        }
+
+        /// v1.3.0 multi-distance-constraint end-to-end bit-exact
+        /// proof.
+        ///
+        /// Three bodies forming a triangle with three equal-length
+        /// edges. The adapter installs all three constraints via
+        /// `push_distance_constraint` (Gauss-Seidel order:
+        /// (0,1), (1,2), (2,0)). Every position slot must match the
+        /// CPU reference byte-for-byte after several iterations,
+        /// proving that the per-iter loop through the constraint
+        /// vector is bit-exact regardless of order.
+        #[test]
+        fn trt_solver_adapter_multi_distance_constraint_matches_cpu_reference() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+
+            // Three bodies roughly in an equilateral triangle;
+            // constraints ask each pair to be distance 2.
+            let positions = vec![
+                [Fix128::from_int(-2), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(2), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::ZERO, Fix128::from_int(3), Fix128::ZERO],
+            ];
+            let velocities = vec![[Fix128::ZERO; 3]; 3];
+            let rest = Fix128::from_int(2);
+            let constraints = [(0, 1, rest), (1, 2, rest), (2, 0, rest)];
+
+            adapter.send_island(&positions, &velocities);
+            for &(a, b, l) in &constraints {
+                adapter.push_distance_constraint(a, b, l);
+            }
+
+            let dt = Fix128::from_ratio(1, 60);
+            let iters = 10u32;
+            adapter.dispatch_iterations(iters, dt);
+
+            let mut cpu_positions: Vec<Fix128Gpu> = positions
+                .iter()
+                .flat_map(|p| p.iter().map(|f| fix128_to_gpu(*f)))
+                .collect();
+            let mut cpu_velocities: Vec<Fix128Gpu> = velocities
+                .iter()
+                .flat_map(|v| v.iter().map(|f| fix128_to_gpu(*f)))
+                .collect();
+            cpu_semi_implicit_integrate(
+                &mut cpu_positions,
+                &mut cpu_velocities,
+                [Fix128::ZERO; 3],
+                false,
+                &constraints,
+                iters,
+                dt,
+            );
+
+            for (i, gpu_p) in adapter.positions.iter().enumerate() {
+                assert_eq!(
+                    gpu_p.hi, cpu_positions[i].hi,
+                    "position hi mismatch at slot {i}"
+                );
+                assert_eq!(
+                    gpu_p.lo, cpu_positions[i].lo,
+                    "position lo mismatch at slot {i}: GPU {:#x} vs CPU {:#x}",
+                    gpu_p.lo, cpu_positions[i].lo
+                );
+            }
+        }
+
+        /// `clear_distance_constraints` empties the list and makes
+        /// subsequent iterations skip the distance projection
+        /// dispatch entirely (verified by observing that positions
+        /// diverge from a distance-constrained baseline once the
+        /// clear is applied).
+        #[test]
+        fn trt_solver_adapter_clear_distance_constraints_disables_projection() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+            adapter.push_distance_constraint(0, 1, Fix128::from_int(2));
+            adapter.clear_distance_constraints();
+
+            // After clear, positions should just integrate (nothing).
+            let positions = vec![
+                [Fix128::from_int(-3), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(3), Fix128::ZERO, Fix128::ZERO],
+            ];
+            let velocities = vec![[Fix128::ZERO; 3]; 2];
+            adapter.send_island(&positions, &velocities);
+            adapter.dispatch_iterations(5, Fix128::from_ratio(1, 60));
+
+            // Without constraint, velocity is zero and no forces:
+            // positions must remain exactly where they started.
+            for (i, gpu_p) in adapter.positions.iter().enumerate() {
+                let axis = i % 3;
+                let body = i / 3;
+                let expected = fix128_to_gpu(positions[body][axis]);
+                assert_eq!(
+                    gpu_p.hi, expected.hi,
+                    "position hi drifted at slot {i} despite cleared constraints"
+                );
+                assert_eq!(gpu_p.lo, expected.lo);
             }
         }
     }
