@@ -2,6 +2,44 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.5.1] - 2026-07-06
+
+### Added — Batched rigid rod kernel + parallel dispatch toggle
+
+Second release of Phase 2 in the [GPU offload roadmap](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md). Wires the v1.5.0 constraint graph coloring into a new WGSL kernel that dispatches all constraints of one color in a single compute call, and adds an **opt-in** toggle to activate it. Default behaviour is unchanged; existing byte-exact tests still pass on the sequential path.
+
+- **New WGSL constant** `FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL`: same rigid rod projection as v1.4.2 but with a **storage buffer array** of `DistanceParamsRigid` instead of a uniform, and per-workgroup constraint selection via `@builtin(workgroup_id).x`. Correctness follows from the coloring invariant — constraints in one color operate on disjoint body sets, so workgroup-parallel writes cannot alias.
+- **`TrtSolverAdapter` opt-in toggle**:
+  - `set_parallel_dispatch(&mut self, enabled: bool)` — flip the batched path on. Default `false`.
+  - `parallel_dispatch_enabled(&self) -> bool` — accessor.
+- **Adapter internals**: when the toggle is on, `dispatch_iterations` builds a `ConstraintGraph`, greedy-colors it, and dispatches one `pipeline_project_distance_batched` call per color with `dispatch_workgroups(color.len(), 1, 1)`. When off, the v1.4.2 sequential path runs verbatim — no behavioural change.
+
+### Determinism
+
+- **Default path (toggle off) preserves the byte-exact contract**: all 8 v1.4.2 `solver_bridge` tests, including `trt_solver_adapter_multi_distance_constraint_matches_cpu_reference`, continue to pass byte-for-byte on macOS Metal.
+- **Toggle-on path is byte-exact vs sequential when the graph is 1-colorable** (all constraints on disjoint bodies) — verified by the new `parallel_dispatch_disjoint_matches_sequential_byte_for_byte` test.
+- **Toggle-on path with graph coloring** changes constraint iteration order (color-major instead of insertion-major), so it is not byte-exact vs the v1.4.2 CPU golden. A dedicated colored CPU golden lands in v1.5.2.
+
+### Tests (3 new)
+
+- `parallel_dispatch_default_off_and_toggles` — toggle setter/getter round-trip.
+- `parallel_dispatch_disjoint_matches_sequential_byte_for_byte` — 2 disjoint ropes × 10 iterations, byte-for-byte assertion between sequential and parallel dispatch (proves the batched kernel arithmetic matches the sequential kernel arithmetic in the 1-color case).
+- `parallel_dispatch_chain_produces_finite_positions` — 4-body chain × 3 conflicting constraints × 5 iterations, verifies the parallel path converges (each pair distance shortens from 3 m toward the 2 m rest length) without NaN/collapse under colored dispatch order.
+
+Total: 190 lib tests (187 prior + 3 new) — all pass on macOS Metal.
+
+### Backwards compatibility
+
+- Public `TrtSolverAdapter` surface additions only (`set_parallel_dispatch` / `parallel_dispatch_enabled`); no removals, no signature changes to existing methods.
+- Default toggle state is `false`, so v1.4.2 byte-exact contract remains the observable behaviour for every existing caller.
+- v1.0.0 semver stability commitment intact.
+
+### Next up (Phase 2 continuation)
+
+- **v1.5.2** — Colored CPU golden and byte-exact assertion for the toggle-on path.
+- **v1.6.0** — Default the parallel dispatch on after cross-platform validation.
+- **v2.0.0** — Formalise as major bump (semantic-change acknowledgement).
+
 ## [1.5.0] - 2026-07-06
 
 ### Added — Phase 2 foundation: deterministic constraint graph coloring

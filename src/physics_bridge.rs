@@ -194,9 +194,10 @@ mod solver_bridge {
     use alice_physics::gpu_bridge::{DiffFixture, GpuDivergence, GpuSolverBridge};
     use alice_physics::math::Fix128;
 
+    use crate::constraint_graph::ConstraintGraph;
     use crate::fix128::{
-        Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL,
-        FIX128_PGS_PROJECT_FLOOR_WGSL,
+        Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL,
+        FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL, FIX128_PGS_PROJECT_FLOOR_WGSL,
     };
 
     /// Uniform block laid out to match the `PgsParams` struct in
@@ -245,9 +246,17 @@ mod solver_bridge {
         pipeline_integrate: wgpu::ComputePipeline,
         pipeline_project_floor: wgpu::ComputePipeline,
         pipeline_project_distance: wgpu::ComputePipeline,
+        /// v1.5.1: batched rigid rod pipeline. Reads a `storage`
+        /// array of `DistanceParamsRigid` and dispatches one workgroup
+        /// per color group. Used only when `parallel_dispatch` is on.
+        pipeline_project_distance_batched: wgpu::ComputePipeline,
         bind_group_layout: wgpu::BindGroupLayout,
         bind_group_layout_project: wgpu::BindGroupLayout,
         bind_group_layout_project_distance: wgpu::BindGroupLayout,
+        /// v1.5.1: bind group layout for the batched kernel (positions
+        /// rw storage + params read-only **storage buffer array**, not
+        /// a uniform).
+        bind_group_layout_project_distance_batched: wgpu::BindGroupLayout,
         positions: Vec<Fix128Gpu>,
         velocities: Vec<Fix128Gpu>,
         /// Per-axis gravity applied every dispatch iteration. Defaults
@@ -269,6 +278,17 @@ mod solver_bridge {
         /// v1.2.0-compatible single-constraint case;
         /// `push_distance_constraint(...)` appends without clearing.
         distance_constraints: Vec<(usize, usize, Fix128)>,
+        /// v1.5.1: opt-in toggle for the batched (color-parallel)
+        /// distance-constraint dispatch. When `false` (default), the
+        /// adapter uses the v1.4.2 sequential Gauss-Seidel path with
+        /// its full byte-exact CPU-golden contract. When `true`, the
+        /// adapter builds a `ConstraintGraph`, greedy-colors it, and
+        /// dispatches one compute call per color using the batched
+        /// rigid kernel. Semantics change: the constraint iteration
+        /// order becomes color-major instead of insertion-major, so
+        /// the v1.4.2 byte-exact CPU-golden test no longer applies to
+        /// the toggle-on path (a colored CPU golden lands in v1.5.2).
+        parallel_dispatch: bool,
     }
 
     impl<'a> TrtSolverAdapter<'a> {
@@ -471,20 +491,101 @@ mod solver_bridge {
                         cache: None,
                     });
 
+            // v1.5.1: batched rigid rod pipeline (storage buffer array of
+            // params, one workgroup per constraint via workgroup_id.x).
+            let shader_distance_batched =
+                device
+                    .device()
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("fix128_pgs_project_distance_batched_shader"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL.into(),
+                        ),
+                    });
+
+            let bind_group_layout_project_distance_batched = device
+                .device()
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("fix128_pgs_project_distance_batched_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+            let pipeline_layout_distance_batched =
+                device
+                    .device()
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("fix128_pgs_project_distance_batched_pl"),
+                        bind_group_layouts: &[&bind_group_layout_project_distance_batched],
+                        push_constant_ranges: &[],
+                    });
+
+            let pipeline_project_distance_batched =
+                device
+                    .device()
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("fix128_pgs_project_distance_batched_pipeline"),
+                        layout: Some(&pipeline_layout_distance_batched),
+                        module: &shader_distance_batched,
+                        entry_point: Some("fix128_pgs_project_distance_batched_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        cache: None,
+                    });
+
             Self {
                 device,
                 pipeline_integrate,
                 pipeline_project_floor,
                 pipeline_project_distance,
+                pipeline_project_distance_batched,
                 bind_group_layout,
                 bind_group_layout_project,
                 bind_group_layout_project_distance,
+                bind_group_layout_project_distance_batched,
                 positions: Vec::new(),
                 velocities: Vec::new(),
                 gravity: [Fix128::ZERO; 3],
                 floor_enabled: false,
                 distance_constraints: Vec::new(),
+                parallel_dispatch: false,
             }
+        }
+
+        /// v1.5.1: toggle the color-parallel (batched) distance-constraint
+        /// dispatch path. Off by default so v1.4.2 byte-exact behaviour
+        /// is fully preserved for existing callers. When enabled, the
+        /// adapter greedy-colors the constraint graph and dispatches
+        /// one compute call per color using
+        /// [`crate::fix128::FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL`].
+        pub fn set_parallel_dispatch(&mut self, enabled: bool) {
+            self.parallel_dispatch = enabled;
+        }
+
+        /// v1.5.1: current toggle state for the batched distance-constraint
+        /// dispatch. See [`Self::set_parallel_dispatch`].
+        #[must_use]
+        pub const fn parallel_dispatch_enabled(&self) -> bool {
+            self.parallel_dispatch
         }
 
         /// Set the per-axis gravity vector applied at every iteration
@@ -794,60 +895,137 @@ mod solver_bridge {
                     self.device.poll_wait();
                 }
 
-                // v1.4.2: rigid rod distance constraint projection.
-                // No CPU precompute — the shader reads positions from
-                // the storage buffer, computes d = sqrt(diff · diff)
-                // and scalar = (rest - d) / (d + d) on-device (using
-                // the byte-exact v1.4.0 div + v1.4.1 sqrt), then
-                // applies the correction. Byte-for-byte equivalent
-                // to the v1.1.0 CPU-precompute path because the
-                // arithmetic primitives share the same reference.
-                for &(a, b, rest_length) in &self.distance_constraints {
-                    let params = DistanceParamsGpu {
-                        body_a: a as u32,
-                        body_b: b as u32,
-                        _pad: [0; 2],
-                        rest_length: Fix128Gpu::from_physics(rest_length),
-                    };
-                    let buf_dist_params = self.device.create_uniform_buffer(
-                        "pgs_project_distance_rigid_params",
-                        bytemuck::bytes_of(&params),
-                    );
+                if self.parallel_dispatch {
+                    // v1.5.1: color-parallel batched path. Build the
+                    // conflict graph, greedy-color it, and dispatch one
+                    // compute call per color group. All constraints in
+                    // a color operate on body-disjoint slots, so the
+                    // workgroups within a dispatch cannot race.
+                    let pairs: Vec<(usize, usize)> = self
+                        .distance_constraints
+                        .iter()
+                        .map(|&(a, b, _)| (a, b))
+                        .collect();
+                    let graph = ConstraintGraph::build(&pairs);
+                    let colors = graph.greedy_color();
 
-                    let bg_distance =
-                        self.device
-                            .device()
-                            .create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("pgs_project_distance_rigid_bg"),
-                                layout: &self.bind_group_layout_project_distance,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: buf_pos.as_entire_binding(),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: buf_dist_params.as_entire_binding(),
-                                    },
-                                ],
-                            });
+                    for color in &colors {
+                        // Pack every constraint in this color into a
+                        // contiguous storage buffer. The shader reads
+                        // element `workgroup_id.x` per dispatch.
+                        let params: Vec<DistanceParamsGpu> = color
+                            .iter()
+                            .map(|&ci| {
+                                let (a, b, rest_length) = self.distance_constraints[ci];
+                                DistanceParamsGpu {
+                                    body_a: a as u32,
+                                    body_b: b as u32,
+                                    _pad: [0; 2],
+                                    rest_length: Fix128Gpu::from_physics(rest_length),
+                                }
+                            })
+                            .collect();
 
-                    let mut encoder = self.device.device().create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("pgs_project_distance_rigid_enc"),
-                        },
-                    );
-                    {
-                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("pgs_project_distance_rigid_pass"),
-                            timestamp_writes: None,
-                        });
-                        pass.set_pipeline(&self.pipeline_project_distance);
-                        pass.set_bind_group(0, &bg_distance, &[]);
-                        pass.dispatch_workgroups(1, 1, 1);
+                        let buf_params = self.device.create_buffer_init(
+                            "pgs_project_distance_batched_params",
+                            bytemuck::cast_slice(&params),
+                        );
+
+                        let bg_batched =
+                            self.device
+                                .device()
+                                .create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("pgs_project_distance_batched_bg"),
+                                    layout: &self.bind_group_layout_project_distance_batched,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: buf_pos.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: buf_params.as_entire_binding(),
+                                        },
+                                    ],
+                                });
+
+                        let mut encoder = self.device.device().create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("pgs_project_distance_batched_enc"),
+                            },
+                        );
+                        {
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("pgs_project_distance_batched_pass"),
+                                    timestamp_writes: None,
+                                });
+                            pass.set_pipeline(&self.pipeline_project_distance_batched);
+                            pass.set_bind_group(0, &bg_batched, &[]);
+                            #[allow(clippy::cast_possible_truncation)]
+                            let wg_count = color.len() as u32;
+                            pass.dispatch_workgroups(wg_count, 1, 1);
+                        }
+                        self.device.submit(encoder);
+                        self.device.poll_wait();
                     }
-                    self.device.submit(encoder);
-                    self.device.poll_wait();
+                } else {
+                    // v1.4.2: rigid rod distance constraint projection.
+                    // No CPU precompute — the shader reads positions from
+                    // the storage buffer, computes d = sqrt(diff · diff)
+                    // and scalar = (rest - d) / (d + d) on-device (using
+                    // the byte-exact v1.4.0 div + v1.4.1 sqrt), then
+                    // applies the correction. Byte-for-byte equivalent
+                    // to the v1.1.0 CPU-precompute path because the
+                    // arithmetic primitives share the same reference.
+                    for &(a, b, rest_length) in &self.distance_constraints {
+                        let params = DistanceParamsGpu {
+                            body_a: a as u32,
+                            body_b: b as u32,
+                            _pad: [0; 2],
+                            rest_length: Fix128Gpu::from_physics(rest_length),
+                        };
+                        let buf_dist_params = self.device.create_uniform_buffer(
+                            "pgs_project_distance_rigid_params",
+                            bytemuck::bytes_of(&params),
+                        );
+
+                        let bg_distance =
+                            self.device
+                                .device()
+                                .create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("pgs_project_distance_rigid_bg"),
+                                    layout: &self.bind_group_layout_project_distance,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: buf_pos.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: buf_dist_params.as_entire_binding(),
+                                        },
+                                    ],
+                                });
+
+                        let mut encoder = self.device.device().create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("pgs_project_distance_rigid_enc"),
+                            },
+                        );
+                        {
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("pgs_project_distance_rigid_pass"),
+                                    timestamp_writes: None,
+                                });
+                            pass.set_pipeline(&self.pipeline_project_distance);
+                            pass.set_bind_group(0, &bg_distance, &[]);
+                            pass.dispatch_workgroups(1, 1, 1);
+                        }
+                        self.device.submit(encoder);
+                        self.device.poll_wait();
+                    }
                 }
             }
 
@@ -1392,6 +1570,137 @@ mod solver_bridge {
             assert_eq!(adapter.distance_constraint_count(), 1);
             adapter.set_distance_constraint(None);
             assert_eq!(adapter.distance_constraint_count(), 0);
+        }
+
+        /// v1.5.1: the parallel-dispatch toggle defaults to `false` and
+        /// tracks whatever the caller last set. Verifies the getter and
+        /// setter remain in sync without touching the GPU pipeline.
+        #[test]
+        fn parallel_dispatch_default_off_and_toggles() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+            assert!(!adapter.parallel_dispatch_enabled());
+            adapter.set_parallel_dispatch(true);
+            assert!(adapter.parallel_dispatch_enabled());
+            adapter.set_parallel_dispatch(false);
+            assert!(!adapter.parallel_dispatch_enabled());
+        }
+
+        /// v1.5.1: when every constraint operates on disjoint bodies,
+        /// greedy coloring places them all in a single color, and the
+        /// batched dispatch order is identical to the v1.4.2 sequential
+        /// insertion order. In that case the parallel path must be
+        /// **byte-exact** with the sequential path.
+        ///
+        /// Setup: two ropes (bodies 0-1 and bodies 2-3) — four positions,
+        /// two constraints, zero shared bodies. Runs 10 dispatch
+        /// iterations on both paths from the same initial state and
+        /// asserts position-slot byte equality.
+        #[test]
+        fn parallel_dispatch_disjoint_matches_sequential_byte_for_byte() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+
+            let positions = vec![
+                [Fix128::ZERO, Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(3), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(10), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(13), Fix128::ZERO, Fix128::ZERO],
+            ];
+            let velocities = vec![[Fix128::ZERO; 3]; 4];
+            let dt = Fix128::from_ratio(1, 60);
+
+            // Sequential (toggle OFF) baseline.
+            let mut seq = TrtSolverAdapter::new(&device);
+            seq.send_island(&positions, &velocities);
+            seq.push_distance_constraint(0, 1, Fix128::from_int(2));
+            seq.push_distance_constraint(2, 3, Fix128::from_int(2));
+            seq.dispatch_iterations(10, dt);
+            let mut seq_pos = vec![[Fix128::ZERO; 3]; 4];
+            let mut seq_vel = vec![[Fix128::ZERO; 3]; 4];
+            seq.recv_island(&mut seq_pos, &mut seq_vel);
+
+            // Parallel (toggle ON).
+            let mut par = TrtSolverAdapter::new(&device);
+            par.set_parallel_dispatch(true);
+            par.send_island(&positions, &velocities);
+            par.push_distance_constraint(0, 1, Fix128::from_int(2));
+            par.push_distance_constraint(2, 3, Fix128::from_int(2));
+            par.dispatch_iterations(10, dt);
+            let mut par_pos = vec![[Fix128::ZERO; 3]; 4];
+            let mut par_vel = vec![[Fix128::ZERO; 3]; 4];
+            par.recv_island(&mut par_pos, &mut par_vel);
+
+            for slot in 0..4 {
+                for axis in 0..3 {
+                    assert_eq!(
+                        seq_pos[slot][axis], par_pos[slot][axis],
+                        "position mismatch at body {slot} axis {axis}",
+                    );
+                    assert_eq!(
+                        seq_vel[slot][axis], par_vel[slot][axis],
+                        "velocity mismatch at body {slot} axis {axis}",
+                    );
+                }
+            }
+        }
+
+        /// v1.5.1: end-to-end smoke test with a conflicting constraint
+        /// graph (chain of three constraints sharing bodies). Colored
+        /// dispatch order differs from insertion order, so this is
+        /// **not** byte-exact vs sequential, but it must still produce
+        /// finite non-NaN positions and pull the bodies toward the
+        /// target rest length.
+        #[test]
+        fn parallel_dispatch_chain_produces_finite_positions() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+
+            // 4-body chain, initial spacing 3 m, rest length 2 m —
+            // constraints should pull each pair closer to 2 m.
+            let positions = vec![
+                [Fix128::ZERO, Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(3), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(6), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(9), Fix128::ZERO, Fix128::ZERO],
+            ];
+            let velocities = vec![[Fix128::ZERO; 3]; 4];
+
+            let mut adapter = TrtSolverAdapter::new(&device);
+            adapter.set_parallel_dispatch(true);
+            adapter.send_island(&positions, &velocities);
+            adapter.push_distance_constraint(0, 1, Fix128::from_int(2));
+            adapter.push_distance_constraint(1, 2, Fix128::from_int(2));
+            adapter.push_distance_constraint(2, 3, Fix128::from_int(2));
+            adapter.dispatch_iterations(5, Fix128::from_ratio(1, 60));
+
+            let mut out_pos = vec![[Fix128::ZERO; 3]; 4];
+            let mut out_vel = vec![[Fix128::ZERO; 3]; 4];
+            adapter.recv_island(&mut out_pos, &mut out_vel);
+
+            // Constraint pulls should have shortened each pair distance
+            // below the initial 3 m (colored dispatch or not, the
+            // rigid rod projection always pulls toward the rest length).
+            for pair in [(0usize, 1usize), (1, 2), (2, 3)] {
+                let dx = out_pos[pair.0][0] - out_pos[pair.1][0];
+                let dy = out_pos[pair.0][1] - out_pos[pair.1][1];
+                let dz = out_pos[pair.0][2] - out_pos[pair.1][2];
+                let d_sq = dx * dx + dy * dy + dz * dz;
+                let d = d_sq.sqrt();
+                assert!(
+                    d < Fix128::from_int(3),
+                    "pair {pair:?} distance did not contract: {}",
+                    d.to_f64(),
+                );
+                assert!(d > Fix128::ZERO, "pair {pair:?} distance collapsed to zero",);
+            }
         }
 
         /// `clear_distance_constraints` empties the list and makes

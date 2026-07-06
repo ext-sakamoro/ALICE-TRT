@@ -2411,6 +2411,447 @@ fn fix128_pgs_project_distance_rigid_main() {
 }
 "#;
 
+/// WGSL compute shader source for the **batched rigid rod distance
+/// constraint** (v1.5.1). Same body as
+/// [`FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL`] except the params bind
+/// point is a **storage buffer array** and each workgroup selects its
+/// constraint from `@builtin(workgroup_id).x`.
+///
+/// This is Phase 2's one-dispatch-per-color kernel: given a color of
+/// K body-disjoint constraints, the caller dispatches
+/// `dispatch_workgroups(K, 1, 1)` and every workgroup applies its own
+/// constraint concurrently. Correctness follows from the coloring
+/// invariant (no two constraints in the same color share a body, so
+/// there is no race on `positions`).
+///
+/// # Layout
+///
+/// - `@group(0) @binding(0)` positions: `array<Fix128Gpu>` — read-write.
+/// - `@group(0) @binding(1)` params: `array<DistanceParamsRigid>` —
+///   **storage, read-only** (was uniform in the v1.4.2 single-constraint
+///   variant). One element per constraint in the color; workgroup `w`
+///   reads `params[w]`.
+///
+/// # Determinism
+///
+/// The workgroup-parallel dispatch is safe by construction: constraints
+/// in a color operate on disjoint body sets, so the memory writes never
+/// alias. Every element of `params` is applied independently, and the
+/// per-workgroup arithmetic is identical to
+/// [`FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL`] (which is already
+/// byte-exact vs the CPU golden). No workgroupBarrier, no subgroup ops,
+/// no atomics — cross-platform equivalence follows from the shared v1.4.0
+/// div + v1.4.1 sqrt contract.
+pub const FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+struct DistanceParamsRigid {
+    body_a: u32,
+    body_b: u32,
+    _pad:   vec2<u32>,
+    rest_length: Fix128Gpu,
+}
+
+@group(0) @binding(0) var<storage, read_write> positions: array<Fix128Gpu>;
+@group(0) @binding(1) var<storage, read>       params:    array<DistanceParamsRigid>;
+
+// ---- Same helpers as FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL ----
+
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let lo_sub  = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid     = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let hi_sub  = mid - borrow1;
+    let borrow3 = select(0u, 1u, mid < borrow1);
+    return vec3<u32>(lo_sub, hi_sub, borrow2 + borrow3);
+}
+
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+    let r0 = ll.x;
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+    let r3 = hh.y + carry_to_3;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_sub_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+// Byte-exact copy of the certified fix128_mul_kernel (Karatsuba + two's-comp).
+fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+
+    let ll = u64_mul_wide(a_lo, b_lo);
+    let lh = u64_mul_wide(a_lo, b_hi);
+    let hl = u64_mul_wide(a_hi, b_lo);
+    let hh = u64_mul_wide(a_hi, b_hi);
+
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+
+    let s5a = lh.w + hl.w;
+    let s5b = s5a + hh.y;
+    let p5_u = s5b + carry_to_5;
+
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+    var p4 = p4_u;
+    var p5 = p5_u;
+    if (a_negative) {
+        let sub_lo = b.lo_lo;
+        let sub_hi = b.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    if (b_negative) {
+        let sub_lo = a.lo_lo;
+        let sub_hi = a.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
+    return out;
+}
+
+fn fix128_neg(x: Fix128Gpu) -> Fix128Gpu {
+    let inv_lo_lo = ~x.lo_lo;
+    let inv_lo_hi = ~x.lo_hi;
+    let inv_hi_lo = ~x.hi_lo;
+    let inv_hi_hi = ~x.hi_hi;
+    let s0 = inv_lo_lo + 1u;
+    let c0 = select(0u, 1u, s0 < inv_lo_lo);
+    let s1 = inv_lo_hi + c0;
+    let c1 = select(0u, 1u, s1 < inv_lo_hi);
+    let s2 = inv_hi_lo + c1;
+    let c2 = select(0u, 1u, s2 < inv_hi_lo);
+    let s3 = inv_hi_hi + c2;
+    var out: Fix128Gpu;
+    out.lo_lo = s0;
+    out.lo_hi = s1;
+    out.hi_lo = s2;
+    out.hi_hi = s3;
+    return out;
+}
+
+fn fix128_is_zero(x: Fix128Gpu) -> bool {
+    return (x.hi_lo | x.hi_hi | x.lo_lo | x.lo_hi) == 0u;
+}
+
+fn fix128_is_negative(x: Fix128Gpu) -> bool {
+    return ((x.hi_hi >> 31u) & 1u) == 1u;
+}
+
+fn fix128_abs(x: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(x)) { return fix128_neg(x); }
+    return x;
+}
+
+fn fix128_zero() -> Fix128Gpu {
+    return Fix128Gpu(0u, 0u, 0u, 0u);
+}
+
+fn fix128_half(x: Fix128Gpu) -> Fix128Gpu {
+    var out: Fix128Gpu;
+    out.lo_lo = (x.lo_lo >> 1u) | ((x.lo_hi & 1u) << 31u);
+    out.lo_hi = (x.lo_hi >> 1u) | ((x.hi_lo & 1u) << 31u);
+    out.hi_lo = (x.hi_lo >> 1u) | ((x.hi_hi & 1u) << 31u);
+    out.hi_hi = bitcast<u32>(bitcast<i32>(x.hi_hi) >> 1u);
+    return out;
+}
+
+fn u128_shl1(x: vec4<u32>) -> vec4<u32> {
+    let c0 = x.x >> 31u;
+    let c1 = x.y >> 31u;
+    let c2 = x.z >> 31u;
+    return vec4<u32>(x.x << 1u, (x.y << 1u) | c0, (x.z << 1u) | c1, (x.w << 1u) | c2);
+}
+
+fn u128_ge(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if (a.w != b.w) { return a.w > b.w; }
+    if (a.z != b.z) { return a.z > b.z; }
+    if (a.y != b.y) { return a.y > b.y; }
+    return a.x >= b.x;
+}
+
+fn u128_sub(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
+    let d0        = a.x - b.x;
+    let borrow0   = select(0u, 1u, a.x < b.x);
+    let m1        = a.y - b.y;
+    let borrow1a  = select(0u, 1u, a.y < b.y);
+    let d1        = m1 - borrow0;
+    let borrow1b  = select(0u, 1u, m1 < borrow0);
+    let borrow1   = borrow1a + borrow1b;
+    let m2        = a.z - b.z;
+    let borrow2a  = select(0u, 1u, a.z < b.z);
+    let d2        = m2 - borrow1;
+    let borrow2b  = select(0u, 1u, m2 < borrow1);
+    let borrow2   = borrow2a + borrow2b;
+    let m3        = a.w - b.w;
+    let d3        = m3 - borrow2;
+    return vec4<u32>(d0, d1, d2, d3);
+}
+
+fn u128_set_bit(x: vec4<u32>, bit_pos: u32) -> vec4<u32> {
+    let word  = bit_pos >> 5u;
+    let shift = bit_pos & 31u;
+    let mask  = 1u << shift;
+    var out = x;
+    if      (word == 0u) { out.x = out.x | mask; }
+    else if (word == 1u) { out.y = out.y | mask; }
+    else if (word == 2u) { out.z = out.z | mask; }
+    else                 { out.w = out.w | mask; }
+    return out;
+}
+
+fn fix128_div_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_zero(b)) { return fix128_zero(); }
+
+    let neg_a = fix128_is_negative(a);
+    let neg_b = fix128_is_negative(b);
+    let result_neg = neg_a != neg_b;
+
+    let abs_a = fix128_abs(a);
+    let abs_b = fix128_abs(b);
+
+    let a_full = vec4<u32>(abs_a.lo_lo, abs_a.lo_hi, abs_a.hi_lo, abs_a.hi_hi);
+    let b_full = vec4<u32>(abs_b.lo_lo, abs_b.lo_hi, abs_b.hi_lo, abs_b.hi_hi);
+
+    var q_int = vec4<u32>(0u);
+    var r_int = vec4<u32>(0u);
+    var d     = a_full;
+    for (var i: i32 = 0; i < 128; i = i + 1) {
+        let msb = d.w >> 31u;
+        r_int   = u128_shl1(r_int);
+        r_int.x = r_int.x | msb;
+        d       = u128_shl1(d);
+        if (u128_ge(r_int, b_full)) {
+            r_int = u128_sub(r_int, b_full);
+            q_int = u128_set_bit(q_int, u32(127 - i));
+        }
+    }
+
+    var quot_lo_lo: u32 = 0u;
+    var quot_lo_hi: u32 = 0u;
+    var r = r_int;
+    for (var i: i32 = 63; i >= 0; i = i - 1) {
+        let overflow_bit = r.w >> 31u;
+        r = u128_shl1(r);
+        if (overflow_bit != 0u || u128_ge(r, b_full)) {
+            r = u128_sub(r, b_full);
+            if (i < 32) {
+                quot_lo_lo = quot_lo_lo | (1u << u32(i));
+            } else {
+                quot_lo_hi = quot_lo_hi | (1u << u32(i - 32));
+            }
+        }
+    }
+
+    var result: Fix128Gpu;
+    result.hi_lo = q_int.x;
+    result.hi_hi = q_int.y;
+    result.lo_lo = quot_lo_lo;
+    result.lo_hi = quot_lo_hi;
+
+    if (result_neg) { return fix128_neg(result); }
+    return result;
+}
+
+fn fix128_sqrt(a: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(a) || fix128_is_zero(a)) { return fix128_zero(); }
+
+    var sig_bits: u32;
+    if (a.hi_hi != 0u || a.hi_lo != 0u) {
+        var lz: u32;
+        if (a.hi_hi != 0u) { lz = countLeadingZeros(a.hi_hi); }
+        else               { lz = 32u + countLeadingZeros(a.hi_lo); }
+        sig_bits = 128u - lz;
+    } else {
+        var lz: u32;
+        if (a.lo_hi != 0u) { lz = countLeadingZeros(a.lo_hi); }
+        else               { lz = 32u + countLeadingZeros(a.lo_lo); }
+        sig_bits = 64u - lz;
+    }
+    let result_bit = (sig_bits + 63u) / 2u;
+
+    var x: Fix128Gpu;
+    x.hi_lo = 0u;
+    x.hi_hi = 0u;
+    x.lo_lo = 0u;
+    x.lo_hi = 0u;
+    if (result_bit >= 64u) {
+        let shift_raw = result_bit - 64u;
+        let shift = min(shift_raw, 62u);
+        if (shift < 32u) { x.hi_lo = 1u << shift; }
+        else             { x.hi_hi = 1u << (shift - 32u); }
+    } else {
+        if (result_bit < 32u) { x.lo_lo = 1u << result_bit; }
+        else                  { x.lo_hi = 1u << (result_bit - 32u); }
+    }
+
+    for (var i: i32 = 0; i < 64; i = i + 1) {
+        let div = fix128_div_kernel(a, x);
+        let sum = fix128_add_kernel(x, div);
+        x = fix128_half(sum);
+    }
+    return x;
+}
+
+// ---- Main: batched rigid rod projection (one workgroup per constraint) ----
+
+@compute @workgroup_size(1)
+fn fix128_pgs_project_distance_batched_main(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+) {
+    let idx = wg_id.x;
+    if (idx >= arrayLength(&params)) { return; }
+
+    let p = params[idx];
+    let a = p.body_a;
+    let b = p.body_b;
+    let rest = p.rest_length;
+
+    let pa0 = positions[a * 3u + 0u];
+    let pa1 = positions[a * 3u + 1u];
+    let pa2 = positions[a * 3u + 2u];
+    let pb0 = positions[b * 3u + 0u];
+    let pb1 = positions[b * 3u + 1u];
+    let pb2 = positions[b * 3u + 2u];
+
+    let dx = fix128_sub_kernel(pa0, pb0);
+    let dy = fix128_sub_kernel(pa1, pb1);
+    let dz = fix128_sub_kernel(pa2, pb2);
+
+    let dx_sq = fix128_mul_kernel(dx, dx);
+    let dy_sq = fix128_mul_kernel(dy, dy);
+    let dz_sq = fix128_mul_kernel(dz, dz);
+    let d_sq  = fix128_add_kernel(fix128_add_kernel(dx_sq, dy_sq), dz_sq);
+    let d = fix128_sqrt(d_sq);
+
+    if (!fix128_is_zero(d)) {
+        let numerator   = fix128_sub_kernel(rest, d);
+        let denominator = fix128_add_kernel(d, d);
+        let scalar      = fix128_div_kernel(numerator, denominator);
+
+        let delta_x = fix128_mul_kernel(scalar, dx);
+        let delta_y = fix128_mul_kernel(scalar, dy);
+        let delta_z = fix128_mul_kernel(scalar, dz);
+
+        positions[a * 3u + 0u] = fix128_add_kernel(pa0, delta_x);
+        positions[a * 3u + 1u] = fix128_add_kernel(pa1, delta_y);
+        positions[a * 3u + 2u] = fix128_add_kernel(pa2, delta_z);
+        positions[b * 3u + 0u] = fix128_sub_kernel(pb0, delta_x);
+        positions[b * 3u + 1u] = fix128_sub_kernel(pb1, delta_y);
+        positions[b * 3u + 2u] = fix128_sub_kernel(pb2, delta_z);
+    }
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
