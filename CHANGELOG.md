@@ -2,6 +2,43 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.4.0] - 2026-07-06
+
+### Added — Fix128 GPU division kernel (`FIX128_DIV_WGSL`)
+
+First release of Phase 1 in the [GPU offload roadmap](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md). Introduces the compute-shader-level Fix128 division primitive, unblocking the v1.4.1 GPU sqrt kernel and, ultimately, the v1.4.2+ rigid rod constraint.
+
+- **`FIX128_DIV_WGSL`** WGSL constant: 128-iter binary long division for the integer quotient + 64-iter refinement for the fractional part, mirroring the CPU reference (`alice_physics::math::Fix128 / Fix128`) exactly.
+  - u128 helpers (`u128_shl1`, `u128_ge`, `u128_sub`, `u128_set_bit`) shipped inside the shader source.
+  - Sign extraction from bit 31 of `hi_hi`, absolutise via two's-complement negation, sign restoration at the end.
+  - Divide-by-zero returns `Fix128Gpu::ZERO`, matching the CPU sentinel.
+- **`Fix128WgpuKernel::div(&self, a, b, out)`** dispatch method: reuses the 3-buffer bind group layout (`input_a`, `input_b`, `output`) shared by `add`/`sub`/`mul`.
+- **`Fix128GpuKernel::div`** trait method: additive extension to the trait (required method; existing external implementers must add the routing).
+
+### Determinism
+
+- Per-element scalar op, no `workgroupBarrier()`, no subgroup ops, no atomics — every thread produces its own answer independently, so cross-platform (Metal / Vulkan / DX12 WARP) byte-exactness derives from the shared u128 arithmetic sequence alone.
+- Fixed 128 + 64 iteration counts, no early exit — mirrors the CPU loop bounds exactly.
+
+### Tests (3 new)
+
+- `wgsl_div_shader_helpers_present` — shader source sanity check (helpers + entry point + workgroup size + loop bounds).
+- `wgpu_div_matches_cpu_golden` (feature `physics-solver`) — 5 fixtures (identity, negative operands, fractional, divide-by-zero sentinel) with byte-for-byte assertion against `Fix128Gpu::div`.
+- `wgpu_trait_div_matches_inherent_div` (feature `physics-solver`) — verifies the `Fix128GpuKernel::div` trait route matches `Fix128WgpuKernel::div` byte-for-byte.
+
+Total: 176 lib tests (173 prior + 3 new) — all pass on macOS Metal.
+
+### Backwards compatibility
+
+- **Trait extension**: `Fix128GpuKernel` gained a required `div` method. External implementers must add the routing (or stub it with `todo!`).
+- Additive at the WGSL / dispatch method level (new pipeline field, new dispatch method, new WGSL constant).
+- v1.0.0 semver stability commitment for the `TrtSolverAdapter` surface remains intact — no changes to `send_island` / `dispatch_iterations` / distance-constraint API.
+
+### Next up (Phase 1)
+
+- **v1.4.1** — `FIX128_SQRT_WGSL` (Newton-Raphson, 64 iterations, uses the v1.4.0 div kernel).
+- **v1.4.2** — Rigid rod constraint (strict distance = L, iterate to convergence on GPU end-to-end).
+
 ## [1.3.1] - 2026-07-06
 
 ### Added — distance constraint accessors
