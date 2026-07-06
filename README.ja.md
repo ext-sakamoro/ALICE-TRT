@@ -345,9 +345,12 @@ alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
 | `dot` (2 段 reduce) | v0.7.1 / v0.8.1 | `FIX128_DOT_WGSL` + `FIX128_DOT_FINAL_WGSL` |
 | PGS integrate (semi-implicit Euler) | v0.4.0 | `FIX128_PGS_INTEGRATE_WGSL` |
 | PGS project (floor) | v0.6.0 | `FIX128_PGS_PROJECT_FLOOR_WGSL` |
-| PGS project (distance) | v1.1.0 | `FIX128_PGS_PROJECT_DISTANCE_WGSL` |
+| PGS project (distance, rigid rod) | v1.4.2 | `FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL` |
+| PGS project (distance, batched) | v1.5.1 | `FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL` |
+| Fix128 GPU `div` | v1.4.0 | `FIX128_DIV_WGSL` |
+| Fix128 GPU `sqrt` | v1.4.1 | `FIX128_SQRT_WGSL` |
 
-CPU 側 `Fix128Gpu` は `sqrt` (v1.0.1、`alice_physics::Fix128::sqrt` に delegate) と `div` (v1.0.6) も持つ (host precompute 用、距離制約 scalar 等)。GPU sqrt カーネルは v1.4+ のロードマップ。
+CPU 側 `Fix128Gpu` は `sqrt` (v1.0.1、`alice_physics::Fix128::sqrt` に delegate) と `div` (v1.0.6) も持つ (host precompute 用)。v1.1.0 の単一制約 uniform 版 (`FIX128_PGS_PROJECT_DISTANCE_WGSL`) は v1.7.0 で deprecate、v2.0.0 で削除済。外部 `Fix128GpuKernel` 実装者は上表の rigid rod / batched シェーダーへ移行を。
 
 **37 Fix128 単体テスト + 170 physics-solver テスト** を毎リリース 3 プラットフォーム全通し。
 

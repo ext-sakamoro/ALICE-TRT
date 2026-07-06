@@ -2,6 +2,56 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.0.0] - 2026-07-07
+
+### Removed — Deprecated v1.1.0 uniform-based distance projection shader (breaking)
+
+- **`FIX128_PGS_PROJECT_DISTANCE_WGSL`** is removed. Deprecated in v1.7.0 with a migration runway of one MINOR release; internal `TrtSolverAdapter` had not referenced it since v1.4.2.
+- The two shader-content assertions (`wgsl_pgs_project_distance_shader_helpers_present`, `wgsl_pgs_project_distance_shader_compiles`) are removed with it.
+- README kernel tables (English + Japanese) updated: the removed entry is replaced by the two current replacements plus explicit references to the `div` and `sqrt` primitive kernels; a prose note documents the removal for external `Fix128GpuKernel` implementers who may still be mid-migration.
+
+### Migration
+
+External `Fix128GpuKernel` implementers who still reference the removed constant have two supported replacements:
+
+- **Batched color-parallel dispatch (recommended)** — `FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL` (v1.5.1). Reads a `storage` array of `DistanceParamsRigid` and selects the target constraint via `@builtin(workgroup_id).x`; one dispatch handles a whole color.
+- **Single-constraint rigid rod** — `FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL` (v1.4.2). Same 3-buffer bind group layout as the removed shader; the uniform layout swaps `scalar: Fix128Gpu` for `rest_length: Fix128Gpu` and the shader computes the correction scalar on-device via the byte-exact v1.4.0 `div` + v1.4.1 `sqrt` kernels.
+- **Sequential v1.4.2 behaviour without touching the shader** — `TrtSolverAdapter::set_parallel_dispatch(false)` restores the pre-v1.6.0 default. The v1.6.0 CHANGELOG documented this one-liner opt-out; it remains supported in v2.0.0.
+
+The deprecated shader path had no adapter callers within the crate. External implementers who missed the v1.7.0 deprecation warning will see a compile error at the removed symbol; the fix is one line for either replacement above.
+
+### Phase 2 (GPU offload roadmap) formally complete
+
+- ✅ v1.5.0: constraint graph builder + greedy coloring
+- ✅ v1.5.1: batched rigid kernel + opt-in toggle
+- ✅ v1.5.2: colored CPU golden + toggle-on byte-exact assertion
+- ✅ v1.6.0: parallel dispatch by default
+- ✅ v1.7.0: deprecation of the superseded v1.1.0 shader
+- ✅ **v2.0.0: removal + Phase 3 gate satisfied (this release)**
+
+### Phase 3 (GPU BVH / narrow-phase / CCD) — gate satisfied on 2026-07-06
+
+The [ALICE-Physics GPU offload roadmap](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md) gated Phase 3 on:
+
+1. Adding a collider-attached bench variant to measure real narrow-phase cost (previously a no-op fast-path).
+2. Confirming a target workload spends **>30% of frame time** in one of these stages.
+3. Documenting the target workload as a real user requirement.
+
+Gates 1 and 2 were satisfied on 2026-07-06 with the `stage_breakdown_collider` bench (ALICE-Physics commit `ac7d1b1`), which measured **narrow-phase + PGS at 97.4% of total frame cost at N=100 pile and 99.8% at N=1000 pile**. Gate 3 (workload requirement documentation) is deferred to Phase 3 design; the measurement alone lifts the "premature optimisation" concern.
+
+Phase 3 implementation is not part of this release — it lands in a future v2.1+ series. This release formalises the removal and Phase 2 wrap so v2.1 can start clean.
+
+### Backwards compatibility
+
+- **Breaking**: the removed constant was `pub`; downstream code that referenced it will not compile until migrated.
+- The migration was documented three releases ahead (v1.6.0 → v1.7.0 deprecation → v2.0.0 removal), the deprecation warning has been in place for one MINOR release, and both replacements have been in production since v1.4.2 / v1.5.1.
+- All other public API is unchanged from v1.7.0.
+
+### Tests
+
+- Total 189 lib tests (previously 191; the two shader-content assertions for the removed constant are gone with it), all pass on macOS Metal.
+- 3-platform CI matrix (Metal / Vulkan lavapipe / DX12 WARP) continues to gate every kernel-level change.
+
 ## [1.7.0] - 2026-07-06
 
 ### Deprecated — v1.1.0 uniform-based distance projection shader

@@ -575,9 +575,12 @@ alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
 | `dot` (2-stage reduce) | v0.7.1 / v0.8.1 | `FIX128_DOT_WGSL` + `FIX128_DOT_FINAL_WGSL` |
 | PGS integrate (semi-implicit Euler) | v0.4.0 | `FIX128_PGS_INTEGRATE_WGSL` |
 | PGS project (floor) | v0.6.0 | `FIX128_PGS_PROJECT_FLOOR_WGSL` |
-| PGS project (distance) | v1.1.0 | `FIX128_PGS_PROJECT_DISTANCE_WGSL` |
+| PGS project (distance, rigid rod) | v1.4.2 | `FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL` |
+| PGS project (distance, batched) | v1.5.1 | `FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL` |
+| Fix128 GPU `div` | v1.4.0 | `FIX128_DIV_WGSL` |
+| Fix128 GPU `sqrt` | v1.4.1 | `FIX128_SQRT_WGSL` |
 
-CPU-side `Fix128Gpu` also exposes `sqrt` (v1.0.1, delegates to `alice_physics::Fix128::sqrt`) and `div` (v1.0.6) for host precompute paths (e.g. the distance-constraint scalar). GPU sqrt kernel is roadmap for v1.4+.
+CPU-side `Fix128Gpu` also exposes `sqrt` (v1.0.1, delegates to `alice_physics::Fix128::sqrt`) and `div` (v1.0.6) for host precompute paths. The v1.1.0 single-constraint uniform variant (`FIX128_PGS_PROJECT_DISTANCE_WGSL`) was deprecated in v1.7.0 and removed in v2.0.0; external `Fix128GpuKernel` implementers should migrate to the rigid-rod or batched shader listed above.
 
 **37 Fix128 unit tests + 170 physics-solver tests** run on all three platforms per release.
 
