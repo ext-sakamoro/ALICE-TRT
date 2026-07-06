@@ -761,6 +761,84 @@ mod solver_bridge {
         }
     }
 
+    /// v1.5.2: colored variant of [`cpu_semi_implicit_integrate`].
+    ///
+    /// Reference implementation that mirrors the GPU batched-dispatch
+    /// path (`parallel_dispatch = true`): the distance projections are
+    /// applied color-by-color instead of in insertion order. Within a
+    /// color, constraints operate on disjoint body sets, so the result
+    /// is independent of the intra-color iteration order and every
+    /// per-constraint step reduces to the exact same Fix128 arithmetic
+    /// as the sequential CPU golden.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_semi_implicit_integrate_colored(
+        positions: &mut [Fix128Gpu],
+        velocities: &mut [Fix128Gpu],
+        gravity: [Fix128; 3],
+        floor_enabled: bool,
+        distance_constraints: &[(usize, usize, Fix128)],
+        coloring: &[Vec<usize>],
+        iters: u32,
+        dt: Fix128,
+    ) {
+        for _ in 0..iters {
+            for (i, (p, v)) in positions.iter_mut().zip(velocities.iter_mut()).enumerate() {
+                let axis = i % 3;
+                let g = gravity[axis];
+                let v_fix = gpu_to_fix128(*v);
+                let v_new = v_fix + g * dt;
+                *v = fix128_to_gpu(v_new);
+                let p_fix = gpu_to_fix128(*p);
+                let p_new = p_fix + v_new * dt;
+                *p = fix128_to_gpu(p_new);
+            }
+            if floor_enabled {
+                for (i, (p, v)) in positions.iter_mut().zip(velocities.iter_mut()).enumerate() {
+                    if i % 3 == 1 && p.hi < 0 {
+                        *p = Fix128Gpu { hi: 0, lo: 0 };
+                        *v = Fix128Gpu { hi: 0, lo: 0 };
+                    }
+                }
+            }
+            // Colored constraint pass: iterate colors in ascending order,
+            // then constraints inside each color in ascending index order.
+            // Bodies within a color are disjoint by the coloring
+            // invariant, so intra-color order does not affect results.
+            for color in coloring {
+                for &ci in color {
+                    let (a, b, rest) = distance_constraints[ci];
+                    let pa = [
+                        gpu_to_fix128(positions[a * 3]),
+                        gpu_to_fix128(positions[a * 3 + 1]),
+                        gpu_to_fix128(positions[a * 3 + 2]),
+                    ];
+                    let pb = [
+                        gpu_to_fix128(positions[b * 3]),
+                        gpu_to_fix128(positions[b * 3 + 1]),
+                        gpu_to_fix128(positions[b * 3 + 2]),
+                    ];
+                    let dx = pa[0] - pb[0];
+                    let dy = pa[1] - pb[1];
+                    let dz = pa[2] - pb[2];
+                    let d_sq = dx * dx + dy * dy + dz * dz;
+                    let d = d_sq.sqrt();
+                    if !d.is_zero() {
+                        let scalar = (rest - d) / (d + d);
+                        for axis in 0..3 {
+                            let pa_axis = gpu_to_fix128(positions[a * 3 + axis]);
+                            let pb_axis = gpu_to_fix128(positions[b * 3 + axis]);
+                            let diff = pa_axis - pb_axis;
+                            let delta = scalar * diff;
+                            positions[a * 3 + axis] = fix128_to_gpu(pa_axis + delta);
+                            positions[b * 3 + axis] = fix128_to_gpu(pb_axis - delta);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     impl GpuSolverBridge for TrtSolverAdapter<'_> {
         fn send_island(&mut self, positions: &[[Fix128; 3]], velocities: &[[Fix128; 3]]) {
             self.positions.clear();
@@ -1645,6 +1723,120 @@ mod solver_bridge {
                     assert_eq!(
                         seq_vel[slot][axis], par_vel[slot][axis],
                         "velocity mismatch at body {slot} axis {axis}",
+                    );
+                }
+            }
+        }
+
+        /// v1.5.2: **byte-exact** contract for the toggle-on path with
+        /// a multi-color graph. Runs a 4-body chain (3 conflicting
+        /// distance constraints, greedy-colors to 2 colors) through 10
+        /// dispatch iterations with `set_parallel_dispatch(true)`, then
+        /// runs the same setup through
+        /// [`cpu_semi_implicit_integrate_colored`] with the same
+        /// coloring, and asserts byte-for-byte equality of every
+        /// position and velocity slot.
+        ///
+        /// This closes the byte-exact contract that v1.4.2 established
+        /// for the sequential path — the toggle-on path is now
+        /// certified equivalent to a **colored** CPU golden even when
+        /// the coloring reorders constraints across insertion order.
+        #[test]
+        fn trt_solver_adapter_parallel_dispatch_matches_colored_cpu_reference() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+
+            // 4-body chain, initial spacing 3 m, rest length 2 m.
+            let initial_positions = vec![
+                [Fix128::ZERO, Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(3), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(6), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(9), Fix128::ZERO, Fix128::ZERO],
+            ];
+            let initial_velocities = vec![[Fix128::ZERO; 3]; 4];
+            let iters: u32 = 10;
+            let dt = Fix128::from_ratio(1, 60);
+
+            let constraint_pairs = [(0usize, 1usize), (1, 2), (2, 3)];
+            let rest_length = Fix128::from_int(2);
+            let distance_constraints: Vec<(usize, usize, Fix128)> = constraint_pairs
+                .iter()
+                .map(|&(a, b)| (a, b, rest_length))
+                .collect();
+
+            // GPU: parallel dispatch enabled.
+            let mut adapter = TrtSolverAdapter::new(&device);
+            adapter.set_parallel_dispatch(true);
+            adapter.send_island(&initial_positions, &initial_velocities);
+            for &(a, b, rest) in &distance_constraints {
+                adapter.push_distance_constraint(a, b, rest);
+            }
+            adapter.dispatch_iterations(iters, dt);
+            let mut gpu_pos = vec![[Fix128::ZERO; 3]; 4];
+            let mut gpu_vel = vec![[Fix128::ZERO; 3]; 4];
+            adapter.recv_island(&mut gpu_pos, &mut gpu_vel);
+
+            // CPU golden: rebuild the same coloring and integrate in
+            // color-major order.
+            let pairs: Vec<(usize, usize)> = distance_constraints
+                .iter()
+                .map(|&(a, b, _)| (a, b))
+                .collect();
+            let graph = crate::constraint_graph::ConstraintGraph::build(&pairs);
+            let coloring = graph.greedy_color();
+            // 4-body chain (0-1, 1-2, 2-3) greedy-colors to two groups:
+            //   color 0 = [0, 2] (constraints (0,1) and (2,3), no shared body)
+            //   color 1 = [1]   (constraint (1,2), conflicts with both)
+            assert_eq!(coloring, vec![vec![0, 2], vec![1]]);
+
+            let mut cpu_positions: Vec<Fix128Gpu> = initial_positions
+                .iter()
+                .flat_map(|p| p.iter().copied().map(fix128_to_gpu))
+                .collect();
+            let mut cpu_velocities: Vec<Fix128Gpu> = initial_velocities
+                .iter()
+                .flat_map(|v| v.iter().copied().map(fix128_to_gpu))
+                .collect();
+
+            cpu_semi_implicit_integrate_colored(
+                &mut cpu_positions,
+                &mut cpu_velocities,
+                [Fix128::ZERO; 3],
+                false,
+                &distance_constraints,
+                &coloring,
+                iters,
+                dt,
+            );
+
+            // Byte-for-byte assertion across every slot.
+            for slot in 0..4 {
+                for axis in 0..3 {
+                    let gpu_p = gpu_pos[slot][axis];
+                    let cpu_p = gpu_to_fix128(cpu_positions[slot * 3 + axis]);
+                    assert_eq!(
+                        gpu_p.hi, cpu_p.hi,
+                        "position hi mismatch body={slot} axis={axis}: GPU {} vs CPU {}",
+                        gpu_p.hi, cpu_p.hi,
+                    );
+                    assert_eq!(
+                        gpu_p.lo, cpu_p.lo,
+                        "position lo mismatch body={slot} axis={axis}: GPU {:#x} vs CPU {:#x}",
+                        gpu_p.lo, cpu_p.lo,
+                    );
+                    let gpu_v = gpu_vel[slot][axis];
+                    let cpu_v = gpu_to_fix128(cpu_velocities[slot * 3 + axis]);
+                    assert_eq!(
+                        gpu_v.hi, cpu_v.hi,
+                        "velocity hi mismatch body={slot} axis={axis}: GPU {} vs CPU {}",
+                        gpu_v.hi, cpu_v.hi,
+                    );
+                    assert_eq!(
+                        gpu_v.lo, cpu_v.lo,
+                        "velocity lo mismatch body={slot} axis={axis}: GPU {:#x} vs CPU {:#x}",
+                        gpu_v.lo, cpu_v.lo,
                     );
                 }
             }

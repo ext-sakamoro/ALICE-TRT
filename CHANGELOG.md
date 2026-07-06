@@ -2,6 +2,37 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.5.2] - 2026-07-06
+
+### Added — Colored CPU golden + byte-exact assertion for the toggle-on path
+
+Third release of Phase 2 in the [GPU offload roadmap](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md). Closes the byte-exact contract for the v1.5.1 `set_parallel_dispatch(true)` path: the GPU batched dispatch is now certified equivalent to a **colored CPU golden** even when the graph coloring reorders constraints across insertion order.
+
+- **New CPU reference helper** `cpu_semi_implicit_integrate_colored` (test-only) — mirrors the GPU batched-dispatch color-major iteration order. Uses the exact same Fix128 arithmetic as the sequential `cpu_semi_implicit_integrate`, so any byte divergence would come from ordering alone; because constraints within a color operate on disjoint bodies, the intra-color order does not matter and the result is deterministic regardless.
+
+### Determinism
+
+- **Sequential (toggle off) path**: v1.4.2 byte-exact contract remains — all 8 v1.4.2 `solver_bridge` tests continue to pass byte-for-byte against `cpu_semi_implicit_integrate`.
+- **Batched (toggle on) path**: new certification against `cpu_semi_implicit_integrate_colored`. 4-body chain × 3 conflicting constraints × 2 colors × 10 dispatch iterations produces byte-for-byte equal positions and velocities on GPU and CPU-colored.
+- Every WGSL primitive underneath (`FIX128_DIV_WGSL` v1.4.0, `FIX128_SQRT_WGSL` v1.4.1, `FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL` v1.5.1) is already certified byte-exact against `alice_physics`; v1.5.2 lifts that guarantee to the full end-to-end pipeline under coloring.
+
+### Tests (1 new)
+
+- `trt_solver_adapter_parallel_dispatch_matches_colored_cpu_reference` — 4-body chain, 3 conflicting constraints (0-1, 1-2, 2-3), greedy-colors to `[[0, 2], [1]]`, 10 dispatch iterations, byte-for-byte assertion across 12 position slots and 12 velocity slots.
+
+Total: 191 lib tests (190 prior + 1 new) — all pass on macOS Metal.
+
+### Backwards compatibility
+
+- Zero public-API changes.
+- v1.5.1's `set_parallel_dispatch` / `parallel_dispatch_enabled` continue to behave identically.
+- v1.0.0 semver stability commitment intact.
+
+### Next up (Phase 2 continuation)
+
+- **v1.6.0** — Flip the parallel dispatch on by default after cross-platform validation lands (this release green on Metal, next tag will collect Vulkan + WARP evidence).
+- **v2.0.0** — Formalise as major bump (semantic-change acknowledgement).
+
 ## [1.5.1] - 2026-07-06
 
 ### Added — Batched rigid rod kernel + parallel dispatch toggle
