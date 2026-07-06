@@ -89,9 +89,46 @@ CPU baseline: ALICE-ML (branchless 三値 matvec + SIMD)。
 
 ## クイックスタート
 
+### パスを選ぶ
+
+役割ごとに最適な入り口を選んでください。全パスは同じ `GpuTernaryWeight` / `GpuTensor` プリミティブを共有するので、wgpu で書いて後から CUDA / FFI に載せ替えても書き直し不要。
+
+| あなたは… | パス | 用途 | セクション |
+|-----------|------|-----|-----------|
+| **初めて触る** | [Hello, first inference](#hello-first-inference-30-秒) ↓ | インストール確認、1 回の matvec | ↓ |
+| **クロスプラットフォーム Rust** | [wgpu backend](#wgpu-backend-クロスプラットフォームデフォルト) | Metal (macOS) / Vulkan (Linux) / DX12 (Windows)、NVIDIA 依存なし | ↓ |
+| **NVIDIA CUDA ユーザー** | [CUDA backend](#cuda-backend-nvidia-gpu) | Tensor Core (`wmma` / `dp4a`)、最大スループット | ↓ |
+| **マルチレイヤ推論** | Multi-layer (英語版参照) | 3+ 層 feed-forward、順伝播、活性化 | [README.md](README.md#multi-layer-inference) |
+| **ALICE-ML (CPU) から移行** | Import from ALICE-ML | 量子化 CPU 重みを GPU で再利用、drop-in 移行 | [README.md](README.md#import-from-alice-ml) |
+| **物理オフロード (Fix128)** | [物理ソルバブリッジ](#物理ソルバブリッジ-feature-physics-solverv100-以降-stable) | ALICE-Physics 向け GPU PGS、CPU と byte-exact | ↓ Cross-Crate |
+| **Neural SDF (リアルタイム)** | [SDF ブリッジ](#sdf-ブリッジ-feature-sdf) | 三値 NN で CSG tree を fit、GPU 大量点評価 | ↓ Cross-Crate |
+| **Unity / UE5 統合** | [C-ABI FFI](#c-abi-ffi-unity--ue5) | 37 個の `extern "C"` 関数、ABI version 付き | ↓ |
+| **ベンチマーク / 研究** | [ベンチマーク](#ベンチマーク) + `cargo bench` | スループット、クロスオーバー、圧縮率 | ↑ |
+
+### Hello, First Inference (30 秒)
+
+最小の動くサンプル — wgpu クロスプラットフォーム backend で 2 要素 matvec 1 回:
+
+```rust
+use alice_trt::prelude::*;
+
+let device  = GpuDevice::new().unwrap();
+let compute = TernaryCompute::new(&device);
+
+// 2x2 三値重み行列 { {1, -1}, {0, 1} }
+let weights = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
+let input   = GpuTensor::from_f32(&device, &[2.0, 3.0], &[2]);
+
+let output = compute.matvec(&device, &input, &weights);
+let result = output.download(&device);
+assert_eq!(result, vec![-1.0, 3.0]);
+```
+
+これが動いたら表の中から自分の役割に合ったパスに進んでください。
+
 ### wgpu backend (クロスプラットフォーム、デフォルト)
 
-詳細な rust コード例は [README.md](README.md#quick-start) を参照。
+詳細な Rust コード例は [README.md](README.md#quick-start) を参照。
 
 ```rust
 use alice_trt::prelude::*;
@@ -107,6 +144,76 @@ let result = output.to_vec(&device);
 ### CUDA backend (NVIDIA GPU)
 
 `--features cuda` を付けてビルド。CUDA Toolkit 12+ 必須。詳細は英語版参照。
+
+### よく使うレシピ
+
+繰り返し出てくるパターン。
+
+**1. バッチ matmul (多入力、単一重み)**
+
+```rust
+let batch  = GpuTensor::from_f32(&device, &batched_input, &[batch_size, in_dim]);
+let output = compute.matmul_batch(&device, &batch, &weights);
+```
+
+**2. ReLU 融合 (in-place、往復なし)**
+
+```rust
+let mut hidden = compute.matvec(&device, &input, &w1);
+compute.relu_inplace(&device, &mut hidden);
+let logits = compute.matvec(&device, &hidden, &w2);
+```
+
+**3. Physics ソルバブリッジ (v1.3.1、CPU と byte-exact)**
+
+```rust
+use alice_physics::gpu_bridge::{DiffFixture, GpuSolverBridge};
+use alice_physics::math::Fix128;
+use alice_trt::{GpuDevice, TrtSolverAdapter};
+
+let device      = GpuDevice::new()?;
+let mut adapter = TrtSolverAdapter::new(&device);
+adapter.send_island(&positions, &velocities);
+adapter.set_gravity(Some([Fix128::ZERO, Fix128::from_ratio(-98, 10), Fix128::ZERO]));
+adapter.push_distance_constraint(0, 1, Fix128::from_int(2));
+adapter.dispatch_iterations(10, Fix128::from_ratio(1, 60));
+adapter.recv_island(&mut positions, &mut velocities);
+```
+
+`--features physics-solver` 必要。ALICE-Physics 側の `gpu-solver-bridge` は自動有効化。
+
+**4. Neural SDF fit (三値 NN で CSG tree 近似)**
+
+```rust
+use alice_trt::sdf_bridge::{GpuNeuralSdf, NeuralSdfConfig};
+
+let neural = GpuNeuralSdf::fit(
+    &device, &sdf_node, bounds_min, bounds_max,
+    &NeuralSdfConfig { hidden_dim: 64, num_layers: 4, training_points: 100_000, ..Default::default() },
+)?;
+let dists = neural.eval_batch(&device, &compute, &query_points)?;
+```
+
+`--features sdf` 必要。
+
+### 次に見るべきドキュメント
+
+| やりたいこと | 参照先 |
+|------------|-------|
+| トロイの木馬圧縮を理解 | [トロイの木馬戦略](#トロイの木馬戦略) |
+| CUDA カーネル比較 (wmma / dp4a / popc) | [CUDA カーネルディスパッチ階層](#cuda-カーネルディスパッチ階層) |
+| 生スループット数値 | [ベンチマーク](#ベンチマーク) |
+| Fix128 物理を GPU オフロード | [クロスクレートブリッジ → 物理](#物理ソルバブリッジ-feature-physics-solverv100-以降-stable) |
+| CSG から neural SDF fit | [クロスクレートブリッジ → SDF](#sdf-ブリッジ-feature-sdf) |
+| 推論メトリクス永続化 | [ALICE-DB ブリッジ](#alice-db--alice-view--alice-voice-ブリッジ) |
+| Unity / UE5 統合 | [C-ABI FFI](#c-abi-ffi-unity--ue5) + `bindings/unity/` + `bindings/ue5/` |
+| CPU との byte-exact 保証 | [テストスイート](#テストスイート) (37 fix128 + 170 physics-solver、3 プラットフォーム CI) |
+
+ALICE-TRT に直接プラグインできるコンパニオンクレート:
+
+- **[ALICE-ML](https://github.com/ext-sakamoro/ALICE-ML)** — CPU 三値推論、重みは `GpuTernaryWeight::from_kernel` で 1:1 移行
+- **[ALICE-Physics](https://github.com/ext-sakamoro/ALICE-Physics)** — Fix128 物理、`gpu-solver-bridge` で GPU PGS オフロード opt-in
+- **[ALICE-SDF](https://github.com/ext-sakamoro/ALICE-SDF)** — `sdf_bridge` neural-fit 推論の CSG ソース
 
 ## C-ABI FFI (Unity / UE5)
 

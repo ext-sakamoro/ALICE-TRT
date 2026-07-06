@@ -135,6 +135,43 @@ CPU baseline: ALICE-ML (branchless ternary matvec with SIMD).
 
 ## Quick Start
 
+### Choose Your Path
+
+Pick the entry point that matches your role. All paths share the same `GpuTernaryWeight` / `GpuTensor` primitives, so you can start with wgpu and swap to CUDA (or add FFI later) without rewriting the model.
+
+| You are… | Path | Best for | Section |
+|----------|------|----------|---------|
+| **First time here** | [Hello, first inference](#hello-first-inference-30-seconds) ↓ | Sanity-check the install with one matvec | ↓ |
+| **Cross-platform Rust dev** | [wgpu backend](#wgpu-backend-cross-platform-default) | Metal (macOS) / Vulkan (Linux) / DX12 (Windows), no NVIDIA lock-in | ↓ |
+| **NVIDIA CUDA user** | [CUDA backend](#cuda-backend-nvidia-gpu) | Tensor Core (`wmma` / `dp4a`), maximum throughput | ↓ |
+| **Multi-layer inference** | [Multi-layer](#multi-layer-inference) | 3+ layer feed-forward, forward pass, activations | ↓ |
+| **Coming from ALICE-ML (CPU)** | [Import from ALICE-ML](#import-from-alice-ml) | Reuse quantized CPU weights on GPU, drop-in migration | ↓ |
+| **Physics offload (Fix128)** | [Physics Solver Bridge](#physics-solver-bridge-feature-physics-solver-stable-since-v100) | GPU PGS iteration for ALICE-Physics, byte-exact vs CPU | ↓ Cross-Crate |
+| **Neural SDF (real-time)** | [SDF Bridge](#sdf-bridge-feature-sdf) | Fit ternary NN to CSG tree, GPU eval millions of points | ↓ Cross-Crate |
+| **Unity / UE5 integrator** | [C-ABI FFI](#c-abi-ffi-unity--ue5) | 37 `extern "C"` functions, ABI-versioned | ↓ |
+| **Benchmarking / research** | [Benchmarks](#benchmarks) + `cargo bench` | Throughput, crossover point, compression ratio | ↑ |
+
+### Hello, First Inference (30 seconds)
+
+The smallest working sample — one 2-element matvec on the cross-platform wgpu backend:
+
+```rust
+use alice_trt::prelude::*;
+
+let device  = GpuDevice::new().unwrap();
+let compute = TernaryCompute::new(&device);
+
+// 2x2 ternary weight matrix { {1, -1}, {0, 1} }
+let weights = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
+let input   = GpuTensor::from_f32(&device, &[2.0, 3.0], &[2]);
+
+let output = compute.matvec(&device, &input, &weights);
+let result = output.download(&device);
+assert_eq!(result, vec![-1.0, 3.0]);
+```
+
+Once this runs, jump to the path that matches your role.
+
 ### wgpu backend (cross-platform, default)
 
 ```rust
@@ -210,6 +247,105 @@ let gpu_weights = GpuTernaryWeight::from_kernel(&device, &cpu_kernel);
 let cpu_packed = alice_ml::TernaryWeight::from_ternary(&weights, out, inp);
 let gpu_weights = GpuTernaryWeight::from_packed(&device, &cpu_packed);
 ```
+
+### Common Recipes
+
+Additional patterns that come up frequently — copy-paste starting points.
+
+**1. Batch matmul (many inputs, one weight)**
+
+```rust
+use alice_trt::prelude::*;
+
+let device  = GpuDevice::new().unwrap();
+let compute = TernaryCompute::new(&device);
+
+let weights = GpuTernaryWeight::from_ternary(&device, &packed_ternary, out_dim, in_dim);
+let batch   = GpuTensor::from_f32(&device, &batched_input, &[batch_size, in_dim]);
+
+let output = compute.matmul_batch(&device, &batch, &weights);   // stays in VRAM
+let host   = output.download(&device);
+```
+
+**2. Fused ReLU (in-place, no round-trip)**
+
+```rust
+let mut hidden = compute.matvec(&device, &input, &w1);
+compute.relu_inplace(&device, &mut hidden);              // no separate download
+let logits = compute.matvec(&device, &hidden, &w2);
+```
+
+**3. Physics solver bridge (v1.3.1, byte-exact vs CPU)**
+
+```rust
+use alice_physics::gpu_bridge::{DiffFixture, GpuSolverBridge};
+use alice_physics::math::Fix128;
+use alice_trt::{GpuDevice, TrtSolverAdapter};
+
+let device      = GpuDevice::new()?;
+let mut adapter = TrtSolverAdapter::new(&device);
+
+adapter.send_island(&positions, &velocities);
+adapter.set_gravity(Some([Fix128::ZERO, Fix128::from_ratio(-98, 10), Fix128::ZERO]));
+adapter.push_distance_constraint(0, 1, Fix128::from_int(2));
+adapter.dispatch_iterations(10, Fix128::from_ratio(1, 60));
+adapter.recv_island(&mut positions, &mut velocities);
+```
+
+Requires `--features physics-solver`; the ALICE-Physics side auto-enables its `gpu-solver-bridge` feature.
+
+**4. Neural SDF fit (ternary NN approximates a CSG tree)**
+
+```rust
+use alice_trt::sdf_bridge::{GpuNeuralSdf, NeuralSdfConfig};
+
+let neural = GpuNeuralSdf::fit(
+    &device,
+    &sdf_node,                    // any alice_sdf::SdfNode
+    bounds_min,
+    bounds_max,
+    &NeuralSdfConfig { hidden_dim: 64, num_layers: 4, training_points: 100_000, ..Default::default() },
+)?;
+let dists = neural.eval_batch(&device, &compute, &query_points)?;
+```
+
+Requires `--features sdf`.
+
+**5. FFI usage from Unity / UE5 (C ABI)**
+
+```c
+// Enable with cargo: --features ffi (produces libalice_trt.dylib / .so / .dll)
+AliceTrtDevice*   dev = alice_trt_device_new();
+AliceTrtWeight*   w   = alice_trt_weight_from_ternary(dev, plus_bits, minus_bits, out_dim, in_dim, scale);
+AliceTrtTensor*   in  = alice_trt_tensor_from_f32(dev, input, in_dim);
+AliceTrtTensor*   out = alice_trt_tensor_output(dev, out_dim);
+AliceTrtCompute*  c   = alice_trt_compute_new(dev);
+alice_trt_compute_matvec(c, in, w, out);
+float* result = alice_trt_tensor_download(out);
+```
+
+Full 37-function surface documented in the [C-ABI FFI](#c-abi-ffi-unity--ue5) section.
+
+### Where to go next
+
+| I want to… | See |
+|------------|-----|
+| Understand the Trojan Horse compression | [The Trojan Horse Strategy](#the-trojan-horse-strategy) |
+| Compare CUDA kernels (wmma / dp4a / popc) | [CUDA Kernel Dispatch Hierarchy](#cuda-kernel-dispatch-hierarchy) |
+| See raw throughput numbers | [Benchmarks](#benchmarks) |
+| Offload Fix128 physics to GPU | [Cross-Crate Bridges → Physics](#physics-solver-bridge-feature-physics-solver-stable-since-v100) |
+| Fit neural SDF from CSG | [Cross-Crate Bridges → SDF](#sdf-bridge-feature-sdf) |
+| Persist inference metrics | [Cross-Crate Bridges → DB](#alice-db-bridge-feature-db) |
+| Wire into Unity / UE5 | [C-ABI FFI](#c-abi-ffi-unity--ue5) + `bindings/unity/` + `bindings/ue5/` |
+| Prove byte-exact vs CPU | [Test Suite](#test-suite) (37 fix128 + 170 physics-solver, 3-platform CI) |
+
+Companion crates that plug directly into ALICE-TRT:
+
+- **[ALICE-ML](https://github.com/ext-sakamoro/ALICE-ML)** — CPU ternary inference, weights migrate 1:1 via `GpuTernaryWeight::from_kernel`
+- **[ALICE-Physics](https://github.com/ext-sakamoro/ALICE-Physics)** — Fix128 physics with `gpu-solver-bridge` opt-in for GPU PGS offload
+- **[ALICE-SDF](https://github.com/ext-sakamoro/ALICE-SDF)** — CSG source for `sdf_bridge` neural-fit inference
+
+Japanese version: [README.ja.md](README.ja.md).
 
 ## C-ABI FFI (Unity / UE5)
 
