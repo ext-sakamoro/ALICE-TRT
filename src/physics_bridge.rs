@@ -195,7 +195,7 @@ mod solver_bridge {
     use alice_physics::math::Fix128;
 
     use crate::fix128::{
-        Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_DISTANCE_WGSL,
+        Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL,
         FIX128_PGS_PROJECT_FLOOR_WGSL,
     };
 
@@ -214,16 +214,22 @@ mod solver_bridge {
         gravity_z: Fix128Gpu,
     }
 
-    /// Uniform block matching `DistanceParams` in
-    /// `FIX128_PGS_PROJECT_DISTANCE_WGSL`. 32 bytes total: 4 for
-    /// `body_a`, 4 for `body_b`, 8 padding, 16 for `scalar`.
+    /// Uniform block matching `DistanceParamsRigid` in
+    /// `FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL` (v1.4.2). 32 bytes total:
+    /// 4 for `body_a`, 4 for `body_b`, 8 padding, 16 for `rest_length`.
+    ///
+    /// Layout is bit-identical to the v1.1.0 `DistanceParams`
+    /// (which carried a pre-computed `scalar`); the semantic meaning
+    /// of the last 16 bytes flipped from `scalar` to `rest_length` in
+    /// v1.4.2 when the sqrt+div moved on-device. The struct is retained
+    /// under the same name for symmetric packing.
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
     struct DistanceParamsGpu {
         body_a: u32,
         body_b: u32,
         _pad: [u32; 2],
-        scalar: Fix128Gpu,
+        rest_length: Fix128Gpu,
     }
 
     /// GPU offload adapter for the sub-stepping TGS solver.
@@ -402,13 +408,17 @@ mod solver_bridge {
                         cache: None,
                     });
 
-            // v1.2.0: distance constraint shader + pipeline (positions rw + uniform).
+            // v1.4.2: rigid rod distance shader (scalar computed on-device
+            // via embedded sqrt + div, eliminates the per-iteration CPU
+            // round-trip that v1.1.0's scalar-uniform variant needed).
             let shader_distance =
                 device
                     .device()
                     .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("fix128_pgs_project_distance_shader"),
-                        source: wgpu::ShaderSource::Wgsl(FIX128_PGS_PROJECT_DISTANCE_WGSL.into()),
+                        label: Some("fix128_pgs_project_distance_rigid_shader"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL.into(),
+                        ),
                     });
 
             let bind_group_layout_project_distance =
@@ -453,10 +463,10 @@ mod solver_bridge {
                 device
                     .device()
                     .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("fix128_pgs_project_distance_pipeline"),
+                        label: Some("fix128_pgs_project_distance_rigid_pipeline"),
                         layout: Some(&pipeline_layout_distance),
                         module: &shader_distance,
-                        entry_point: Some("fix128_pgs_project_distance_main"),
+                        entry_point: Some("fix128_pgs_project_distance_rigid_main"),
                         compilation_options: wgpu::PipelineCompilationOptions::default(),
                         cache: None,
                     });
@@ -784,84 +794,60 @@ mod solver_bridge {
                     self.device.poll_wait();
                 }
 
-                // v1.2.0: distance constraint projection (only if set).
-                // Read positions back to CPU, compute the correction
-                // scalar (via Fix128 sqrt + div, both certified
-                // bit-exact against alice_physics), upload as
-                // uniform, and dispatch the projection kernel.
+                // v1.4.2: rigid rod distance constraint projection.
+                // No CPU precompute — the shader reads positions from
+                // the storage buffer, computes d = sqrt(diff · diff)
+                // and scalar = (rest - d) / (d + d) on-device (using
+                // the byte-exact v1.4.0 div + v1.4.1 sqrt), then
+                // applies the correction. Byte-for-byte equivalent
+                // to the v1.1.0 CPU-precompute path because the
+                // arithmetic primitives share the same reference.
                 for &(a, b, rest_length) in &self.distance_constraints {
-                    let raw_positions = self.device.read_buffer(&buf_pos, bytes);
-                    let positions_snapshot: &[Fix128Gpu] = bytemuck::cast_slice(&raw_positions);
-                    let pa = [
-                        positions_snapshot[a * 3].to_physics(),
-                        positions_snapshot[a * 3 + 1].to_physics(),
-                        positions_snapshot[a * 3 + 2].to_physics(),
-                    ];
-                    let pb = [
-                        positions_snapshot[b * 3].to_physics(),
-                        positions_snapshot[b * 3 + 1].to_physics(),
-                        positions_snapshot[b * 3 + 2].to_physics(),
-                    ];
-                    let dx = pa[0] - pb[0];
-                    let dy = pa[1] - pb[1];
-                    let dz = pa[2] - pb[2];
-                    let d_sq = dx * dx + dy * dy + dz * dz;
-                    let d = d_sq.sqrt();
+                    let params = DistanceParamsGpu {
+                        body_a: a as u32,
+                        body_b: b as u32,
+                        _pad: [0; 2],
+                        rest_length: Fix128Gpu::from_physics(rest_length),
+                    };
+                    let buf_dist_params = self.device.create_uniform_buffer(
+                        "pgs_project_distance_rigid_params",
+                        bytemuck::bytes_of(&params),
+                    );
 
-                    // Skip projection if the bodies are colocated —
-                    // the correction direction would be undefined.
-                    if !d.is_zero() {
-                        let numerator = rest_length - d;
-                        let denominator = d + d;
-                        let scalar = numerator / denominator;
+                    let bg_distance =
+                        self.device
+                            .device()
+                            .create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("pgs_project_distance_rigid_bg"),
+                                layout: &self.bind_group_layout_project_distance,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: buf_pos.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: buf_dist_params.as_entire_binding(),
+                                    },
+                                ],
+                            });
 
-                        let params = DistanceParamsGpu {
-                            body_a: a as u32,
-                            body_b: b as u32,
-                            _pad: [0; 2],
-                            scalar: Fix128Gpu::from_physics(scalar),
-                        };
-                        let buf_dist_params = self.device.create_uniform_buffer(
-                            "pgs_project_distance_params",
-                            bytemuck::bytes_of(&params),
-                        );
-
-                        let bg_distance =
-                            self.device
-                                .device()
-                                .create_bind_group(&wgpu::BindGroupDescriptor {
-                                    label: Some("pgs_project_distance_bg"),
-                                    layout: &self.bind_group_layout_project_distance,
-                                    entries: &[
-                                        wgpu::BindGroupEntry {
-                                            binding: 0,
-                                            resource: buf_pos.as_entire_binding(),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 1,
-                                            resource: buf_dist_params.as_entire_binding(),
-                                        },
-                                    ],
-                                });
-
-                        let mut encoder = self.device.device().create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("pgs_project_distance_enc"),
-                            },
-                        );
-                        {
-                            let mut pass =
-                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                    label: Some("pgs_project_distance_pass"),
-                                    timestamp_writes: None,
-                                });
-                            pass.set_pipeline(&self.pipeline_project_distance);
-                            pass.set_bind_group(0, &bg_distance, &[]);
-                            pass.dispatch_workgroups(1, 1, 1);
-                        }
-                        self.device.submit(encoder);
-                        self.device.poll_wait();
+                    let mut encoder = self.device.device().create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("pgs_project_distance_rigid_enc"),
+                        },
+                    );
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("pgs_project_distance_rigid_pass"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.pipeline_project_distance);
+                        pass.set_bind_group(0, &bg_distance, &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
                     }
+                    self.device.submit(encoder);
+                    self.device.poll_wait();
                 }
             }
 

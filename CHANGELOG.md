@@ -2,6 +2,47 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.4.2] - 2026-07-06
+
+### Changed — Rigid rod distance constraint runs end-to-end on GPU
+
+Phase 1 final release ([GPU offload roadmap](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md)). The distance constraint scalar computation (`d = sqrt(diff·diff)`, `scalar = (rest - d) / (2d)`) has been moved **entirely to the GPU** using the v1.4.0 div and v1.4.1 sqrt kernels. This eliminates the per-iteration, per-constraint `read_buffer` sync that v1.3.1 needed for CPU precompute.
+
+- **New WGSL constant** `FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL`: single-thread rigid rod projection kernel that reads positions from the storage buffer, computes `d²`, `d`, `scalar` on-device (via embedded v1.4.0 `fix128_div_kernel` + v1.4.1 `fix128_sqrt`), and applies the correction. All in one dispatch, no CPU round-trip.
+- **`TrtSolverAdapter::dispatch_iterations`** internal path swap: the CPU precompute + scalar upload path is gone. The new path uploads only `rest_length` in the uniform, dispatches the rigid kernel, done.
+- **`DistanceParamsGpu.scalar` renamed to `.rest_length`**: same 32-byte wire layout as the v1.1.0 struct, only the semantic meaning of the last 16 bytes flipped (was pre-computed scalar, now source rest length).
+
+### Determinism preserved
+
+- All 8 `solver_bridge` tests, including `trt_solver_adapter_multi_distance_constraint_matches_cpu_reference` (3-body triangle × 3 constraints × 10 iterations), pass **byte-for-byte** against the CPU golden. The GPU rigid kernel uses the certified byte-exact `fix128_mul_kernel` copy from `FIX128_DOT_WGSL` (Karatsuba-style two's-complement correction, not the "absolutise + negate" alternative — the two produce ~1 ULP different middle bits).
+- Cross-platform (Metal / Vulkan lavapipe / DX12 WARP) validated via CI.
+- Fixed loop bounds throughout: 128 + 64 for div, 64 for sqrt, 1 workgroup with 1 thread for the projection dispatch.
+
+### Perf implication (theoretical)
+
+For N distance constraints and K PGS iterations, v1.3.1 did **N × K** GPU→CPU sync operations per frame. v1.4.2 does **zero**. Measured wall-clock impact depends on driver latency of `read_buffer`; typically 50-200 μs per sync on desktop GPUs, so a rope with 30 links × 10 iterations = 300 syncs was consuming ~15-60 ms/frame just in stalls before v1.4.2.
+
+### Tests
+
+- No new tests added; the existing byte-exact contract (`solver_bridge` tests) is a stronger check than any new synthetic sqrt/div spot-check because it exercises the full pipeline including sqrt+div under real Newton conditions.
+- Total: 179 lib tests, all pass on macOS Metal.
+
+### Backwards compatibility
+
+- v1.0.0 semver stability commitment for `TrtSolverAdapter` public surface remains intact — same `push_distance_constraint(a, b, L)` signature, same result (byte-exact), just faster internally.
+- Additive at the WGSL / pipeline level (new shader constant + internal pipeline replacement).
+- The v1.1.0 `FIX128_PGS_PROJECT_DISTANCE_WGSL` constant is retained (still `pub`) for callers that specifically want the pre-computed-scalar variant, but the adapter no longer uses it. Consider deprecating in v2.0.
+
+### Phase 1 complete
+
+Phase 1 of the [GPU offload roadmap](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md) is now delivered:
+
+- ✅ v1.4.0: `FIX128_DIV_WGSL`
+- ✅ v1.4.1: `FIX128_SQRT_WGSL`
+- ✅ v1.4.2: Rigid rod constraint end-to-end on GPU
+
+Phase 2 (constraint graph coloring for parallel joint solve, ~4-6 weeks) and Phase 3 (BVH / narrow-phase / CCD, deferred pending measurement) remain future work.
+
 ## [1.4.1] - 2026-07-06
 
 ### Added — Fix128 GPU square root kernel (`FIX128_SQRT_WGSL`)
