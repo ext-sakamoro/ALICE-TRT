@@ -573,6 +573,242 @@ fn fix128_mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader source for **`Fix128 div`** — element-wise
+/// division `out[i] = a[i] / b[i]` on the GPU (v1.4.0).
+///
+/// # Algorithm
+///
+/// Faithful port of the CPU reference (`impl Div for alice_physics::Fix128`
+/// in `src/math.rs`), split into three phases per element:
+///
+/// 1. **Sign extraction** — extract the sign bit of both operands from
+///    bit 31 of `hi_hi` (two's-complement MSB of the `i64 hi` field),
+///    then absolutise both operands via two's-complement negation.
+/// 2. **Integer quotient** — 128-iteration binary long division of the
+///    absolute `a_full` by `b_full` (both u128 as `vec4<u32>` with `.x`
+///    the least-significant word), producing a 128-bit integer quotient
+///    (`quot_hi`) and remainder (`rem`). Only the low 64 bits of
+///    `quot_hi` map to `result.hi` (the CPU code does `hi: quot_hi as i64`).
+/// 3. **Fractional quotient** — 64-iteration bit-by-bit refinement of
+///    the remainder, mirroring the CPU loop exactly (`overflow_bit ||
+///    r >= b_full` → subtract & set bit).
+/// 4. **Sign restoration** — `neg(result)` if operand signs differed.
+///
+/// # Determinism contract
+///
+/// - No `workgroupBarrier()` (per-element scalar op, no cross-thread
+///   dependency).
+/// - Uniform flow gate: divisor-is-zero returns the same 0 value on
+///   every thread and every platform (guard the entire body with an
+///   early return **only** at the outermost level, all subsequent
+///   loops run for a fixed 128 + 64 iteration count without early exit).
+/// - No subgroup ops, no atomics; each thread produces its own answer
+///   independently.
+///
+/// # Layout
+///
+/// Same 3-buffer binding as [`FIX128_ADD_WGSL`] (`input_a`, `input_b`,
+/// `output` all `array<Fix128Gpu>` of equal length). Entry point
+/// `@compute @workgroup_size(64) fn fix128_div_main`.
+///
+/// # CPU reference
+///
+/// [`Fix128Gpu::div`] delegates to `alice_physics::math::Fix128 / Fix128`
+/// which uses the same algorithm; every GPU-produced element must equal
+/// the CPU result byte-for-byte (verified in the sibling
+/// `fix128_div_gpu_matches_cpu_reference` integration test).
+pub const FIX128_DIV_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+@group(0) @binding(0) var<storage, read>       input_a: array<Fix128Gpu>;
+@group(0) @binding(1) var<storage, read>       input_b: array<Fix128Gpu>;
+@group(0) @binding(2) var<storage, read_write> output:  array<Fix128Gpu>;
+
+// ---- 64-bit helpers (reused from add/sub/mul patterns) ----
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+// ---- Two's complement negation on the packed Fix128Gpu ----
+fn fix128_neg(x: Fix128Gpu) -> Fix128Gpu {
+    // ~x + 1 across all 128 bits.
+    let inv_lo_lo = ~x.lo_lo;
+    let inv_lo_hi = ~x.lo_hi;
+    let inv_hi_lo = ~x.hi_lo;
+    let inv_hi_hi = ~x.hi_hi;
+
+    // Add 1 to the least-significant word, propagating carry.
+    let s0 = inv_lo_lo + 1u;
+    let c0 = select(0u, 1u, s0 < inv_lo_lo);
+    let s1 = inv_lo_hi + c0;
+    let c1 = select(0u, 1u, s1 < inv_lo_hi);
+    let s2 = inv_hi_lo + c1;
+    let c2 = select(0u, 1u, s2 < inv_hi_lo);
+    let s3 = inv_hi_hi + c2;
+
+    var out: Fix128Gpu;
+    out.lo_lo = s0;
+    out.lo_hi = s1;
+    out.hi_lo = s2;
+    out.hi_hi = s3;
+    return out;
+}
+
+fn fix128_is_zero(x: Fix128Gpu) -> bool {
+    return (x.hi_lo | x.hi_hi | x.lo_lo | x.lo_hi) == 0u;
+}
+
+fn fix128_is_negative(x: Fix128Gpu) -> bool {
+    // Two's complement sign bit = bit 31 of hi_hi (MSB of the `i64 hi` field).
+    return ((x.hi_hi >> 31u) & 1u) == 1u;
+}
+
+fn fix128_abs(x: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(x)) {
+        return fix128_neg(x);
+    }
+    return x;
+}
+
+// ---- u128 helpers as vec4<u32> (LSB word first) ----
+
+fn u128_shl1(x: vec4<u32>) -> vec4<u32> {
+    let c0 = x.x >> 31u;
+    let c1 = x.y >> 31u;
+    let c2 = x.z >> 31u;
+    return vec4<u32>(x.x << 1u, (x.y << 1u) | c0, (x.z << 1u) | c1, (x.w << 1u) | c2);
+}
+
+fn u128_ge(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if (a.w != b.w) { return a.w > b.w; }
+    if (a.z != b.z) { return a.z > b.z; }
+    if (a.y != b.y) { return a.y > b.y; }
+    return a.x >= b.x;
+}
+
+// Unsigned subtract, assuming a >= b (caller-enforced).
+fn u128_sub(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
+    // word 0
+    let d0        = a.x - b.x;
+    let borrow0   = select(0u, 1u, a.x < b.x);
+    // word 1 (subtract b.y, then propagate borrow0)
+    let m1        = a.y - b.y;
+    let borrow1a  = select(0u, 1u, a.y < b.y);
+    let d1        = m1 - borrow0;
+    let borrow1b  = select(0u, 1u, m1 < borrow0);
+    let borrow1   = borrow1a + borrow1b;
+    // word 2
+    let m2        = a.z - b.z;
+    let borrow2a  = select(0u, 1u, a.z < b.z);
+    let d2        = m2 - borrow1;
+    let borrow2b  = select(0u, 1u, m2 < borrow1);
+    let borrow2   = borrow2a + borrow2b;
+    // word 3 (top; caller guarantees no final borrow-out because a >= b)
+    let m3        = a.w - b.w;
+    let d3        = m3 - borrow2;
+    return vec4<u32>(d0, d1, d2, d3);
+}
+
+// Set bit at position `bit_pos` (0..128) of a vec4<u32> u128 value.
+fn u128_set_bit(x: vec4<u32>, bit_pos: u32) -> vec4<u32> {
+    let word  = bit_pos >> 5u;             // /32
+    let shift = bit_pos & 31u;             // %32
+    let mask  = 1u << shift;
+    var out = x;
+    // Straight-line switch (per-thread divergence is fine; no barrier).
+    if      (word == 0u) { out.x = out.x | mask; }
+    else if (word == 1u) { out.y = out.y | mask; }
+    else if (word == 2u) { out.z = out.z | mask; }
+    else                 { out.w = out.w | mask; }
+    return out;
+}
+
+fn fix128_zero() -> Fix128Gpu {
+    return Fix128Gpu(0u, 0u, 0u, 0u);
+}
+
+fn fix128_div(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    // Mirrors CPU: zero divisor OR a=0 → return ZERO.
+    if (fix128_is_zero(b)) { return fix128_zero(); }
+
+    let neg_a = fix128_is_negative(a);
+    let neg_b = fix128_is_negative(b);
+    let result_neg = neg_a != neg_b;
+
+    let abs_a = fix128_abs(a);
+    let abs_b = fix128_abs(b);
+
+    // Pack Fix128Gpu into a vec4<u32> u128 (LSB word first).
+    let a_full = vec4<u32>(abs_a.lo_lo, abs_a.lo_hi, abs_a.hi_lo, abs_a.hi_hi);
+    let b_full = vec4<u32>(abs_b.lo_lo, abs_b.lo_hi, abs_b.hi_lo, abs_b.hi_hi);
+
+    // Phase 1: 128-iter binary long division for the integer quotient.
+    // Processes bits of `a_full` from MSB (bit 127) down to LSB (bit 0),
+    // shifting each into the running remainder. When remainder >= divisor
+    // subtract and set the corresponding bit of the quotient.
+    var q_int = vec4<u32>(0u);
+    var r_int = vec4<u32>(0u);
+    var d     = a_full;
+    for (var i: i32 = 0; i < 128; i = i + 1) {
+        let msb = d.w >> 31u;
+        r_int   = u128_shl1(r_int);
+        r_int.x = r_int.x | msb;
+        d       = u128_shl1(d);
+        if (u128_ge(r_int, b_full)) {
+            r_int = u128_sub(r_int, b_full);
+            q_int = u128_set_bit(q_int, u32(127 - i));
+        }
+    }
+
+    // Phase 2: 64-iter refinement for the fractional quotient.
+    // CPU: `overflow_bit = r >> 127; r <<= 1; if overflow_bit || r >= b_full { r -= b_full; quot_lo |= 1 << i; }`
+    var quot_lo_lo: u32 = 0u;
+    var quot_lo_hi: u32 = 0u;
+    var r = r_int;
+    for (var i: i32 = 63; i >= 0; i = i - 1) {
+        let overflow_bit = r.w >> 31u;
+        r = u128_shl1(r);
+        if (overflow_bit != 0u || u128_ge(r, b_full)) {
+            r = u128_sub(r, b_full);
+            if (i < 32) {
+                quot_lo_lo = quot_lo_lo | (1u << u32(i));
+            } else {
+                quot_lo_hi = quot_lo_hi | (1u << u32(i - 32));
+            }
+        }
+    }
+
+    // Assemble result: low 64 bits of q_int → result.hi (CPU `hi: quot_hi as i64`).
+    var result: Fix128Gpu;
+    result.hi_lo = q_int.x;
+    result.hi_hi = q_int.y;
+    result.lo_lo = quot_lo_lo;
+    result.lo_hi = quot_lo_hi;
+
+    if (result_neg) { return fix128_neg(result); }
+    return result;
+}
+
+@compute @workgroup_size(64)
+fn fix128_div_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&input_a)) { return; }
+    output[i] = fix128_div(input_a[i], input_b[i]);
+}
+"#;
+
 /// WGSL compute shader source for `Fix128 dot` — Σ `a[i] × b[i]` as a
 /// single Fix128 output. The kernel dispatches a single workgroup of a
 /// single thread that walks the input arrays in index order, mirroring
@@ -1442,6 +1678,7 @@ pub struct Fix128WgpuKernel<'a> {
     pipeline_add: wgpu::ComputePipeline,
     pipeline_sub: wgpu::ComputePipeline,
     pipeline_mul: wgpu::ComputePipeline,
+    pipeline_div: wgpu::ComputePipeline,
     pipeline_dot_partial: wgpu::ComputePipeline,
     pipeline_dot_final: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -1473,6 +1710,13 @@ impl<'a> Fix128WgpuKernel<'a> {
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fix128_mul_shader"),
                 source: wgpu::ShaderSource::Wgsl(FIX128_MUL_WGSL.into()),
+            });
+
+        let shader_div = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_div_shader"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_DIV_WGSL.into()),
             });
 
         let shader_dot = device
@@ -1609,6 +1853,17 @@ impl<'a> Fix128WgpuKernel<'a> {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+        let pipeline_div =
+            device
+                .device()
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("fix128_div_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader_div,
+                    entry_point: Some("fix128_div_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
         let pipeline_dot_partial =
             device
                 .device()
@@ -1637,6 +1892,7 @@ impl<'a> Fix128WgpuKernel<'a> {
             pipeline_add,
             pipeline_sub,
             pipeline_mul,
+            pipeline_div,
             pipeline_dot_partial,
             pipeline_dot_final,
             bind_group_layout,
@@ -1745,6 +2001,19 @@ impl<'a> Fix128WgpuKernel<'a> {
     /// for the signed 128×128→256 schoolbook algorithm.
     pub fn mul(&self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
         self.dispatch_binary(&self.pipeline_mul, "fix128_mul", a, b, out);
+    }
+
+    /// Dispatch the Fix128 `div` kernel (v1.4.0). `a`, `b`, and `out` must
+    /// have identical lengths; the caller owns the output slice.
+    ///
+    /// Byte-for-byte equivalent to `Fix128Gpu::div` (the CPU reference in
+    /// `physics_bridge`) on every input; the shader source
+    /// [`crate::fix128::FIX128_DIV_WGSL`] entry point `fix128_div_main`
+    /// implements the same 128-iter integer + 64-iter fractional long
+    /// division as the CPU reference. Division by zero returns
+    /// [`Fix128Gpu::ZERO`], matching `alice_physics::math::Fix128 / Fix128`.
+    pub fn div(&self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        self.dispatch_binary(&self.pipeline_div, "fix128_div", a, b, out);
     }
 
     /// Dispatch the Fix128 `dot` kernel — computes `Σ a[i] × b[i]`
@@ -1904,6 +2173,10 @@ impl Fix128GpuKernel for Fix128WgpuKernel<'_> {
         Fix128WgpuKernel::mul(self, a, b, out);
     }
 
+    fn div(&mut self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]) {
+        Fix128WgpuKernel::div(self, a, b, out);
+    }
+
     fn dot(&mut self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut Fix128Gpu) {
         *out = Fix128WgpuKernel::dot(self, a, b);
     }
@@ -1938,6 +2211,11 @@ pub trait Fix128GpuKernel {
 
     /// Element-wise multiplication (Fix128 semantics): `out[i] = a[i] * b[i]`.
     fn mul(&mut self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]);
+
+    /// Element-wise division (Fix128 semantics, v1.4.0): `out[i] = a[i] / b[i]`.
+    /// Division by zero returns `Fix128Gpu::ZERO`, matching the CPU reference
+    /// `alice_physics::math::Fix128 / Fix128`.
+    fn div(&mut self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]);
 
     /// Fix128 dot product: `out = Σ a[i] * b[i]` accumulated in
     /// ascending index order.
@@ -2344,6 +2622,98 @@ mod tests {
                 out[i].lo, cpu_ref.lo
             );
         }
+    }
+
+    /// The Fix128 div v1.4.0 shader ships the u128 helpers and the
+    /// 128 + 64 iteration long-division entry point.
+    #[test]
+    fn wgsl_div_shader_helpers_present() {
+        assert!(FIX128_DIV_WGSL.contains("u128_shl1"));
+        assert!(FIX128_DIV_WGSL.contains("u128_ge"));
+        assert!(FIX128_DIV_WGSL.contains("u128_sub"));
+        assert!(FIX128_DIV_WGSL.contains("u128_set_bit"));
+        assert!(FIX128_DIV_WGSL.contains("fix128_neg"));
+        assert!(FIX128_DIV_WGSL.contains("fix128_abs"));
+        assert!(FIX128_DIV_WGSL.contains("fix128_div_main"));
+        assert!(FIX128_DIV_WGSL.contains("@compute"));
+        assert!(FIX128_DIV_WGSL.contains("@workgroup_size(64)"));
+        // Loop bounds must be the exact CPU-mirror constants.
+        assert!(FIX128_DIV_WGSL.contains("i < 128"));
+        assert!(FIX128_DIV_WGSL.contains("i >= 0"));
+    }
+
+    /// GPU dispatch bit-exact contract for `div` v1.4.0 — feeds a small
+    /// panel of representative fixtures through the WGSL 128 + 64 iter
+    /// long-division pipeline and checks byte-for-byte equivalence with
+    /// the CPU reference [`Fix128Gpu::div`] (which delegates to
+    /// `alice_physics::math::Fix128 / Fix128`).
+    ///
+    /// Fixtures cover the four sign-correction paths plus the divide-by-zero
+    /// sentinel, mirroring the mul test structure.
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_div_matches_cpu_golden() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let kernel = Fix128WgpuKernel::new(&device);
+
+        let half_lo: u64 = 1u64 << 63;
+        let a = vec![
+            Fix128Gpu::from_raw(6, 0),       // 6
+            Fix128Gpu::from_raw(-6, 0),      // -6
+            Fix128Gpu::from_raw(6, 0),       // 6
+            Fix128Gpu::from_raw(0, half_lo), // 0.5
+            Fix128Gpu::from_raw(5, 0),       // 5 / 0 → zero sentinel
+        ];
+        let b = vec![
+            Fix128Gpu::from_raw(2, 0),       // 2
+            Fix128Gpu::from_raw(2, 0),       // 2
+            Fix128Gpu::from_raw(-2, 0),      // -2
+            Fix128Gpu::from_raw(0, half_lo), // 0.5
+            Fix128Gpu::from_raw(0, 0),       // 0 → sentinel
+        ];
+        let mut out = vec![Fix128Gpu::ZERO; 5];
+
+        kernel.div(&a, &b, &mut out);
+
+        for i in 0..a.len() {
+            let cpu_ref = a[i].div(b[i]);
+            assert_eq!(
+                out[i].hi, cpu_ref.hi,
+                "div hi mismatch at i={i}: GPU {} vs CPU {}",
+                out[i].hi, cpu_ref.hi
+            );
+            assert_eq!(
+                out[i].lo, cpu_ref.lo,
+                "div lo mismatch at i={i}: GPU {:#x} vs CPU {:#x}",
+                out[i].lo, cpu_ref.lo
+            );
+        }
+    }
+
+    /// The `Fix128GpuKernel` trait bridge now routes `div` to the live
+    /// wgpu pipeline (v1.4.0). Verifies the trait `div` matches
+    /// [`Fix128WgpuKernel::div`] byte-for-byte.
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_trait_div_matches_inherent_div() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut kernel = Fix128WgpuKernel::new(&device);
+
+        let a = vec![Fix128Gpu::from_raw(6, 0), Fix128Gpu::from_raw(-6, 0)];
+        let b = vec![Fix128Gpu::from_raw(2, 0), Fix128Gpu::from_raw(3, 0)];
+        let mut via_inherent = vec![Fix128Gpu::ZERO; 2];
+        let mut via_trait = vec![Fix128Gpu::ZERO; 2];
+
+        Fix128WgpuKernel::div(&kernel, &a, &b, &mut via_inherent);
+        <Fix128WgpuKernel<'_> as Fix128GpuKernel>::div(&mut kernel, &a, &b, &mut via_trait);
+
+        assert_eq!(via_inherent, via_trait);
     }
 
     /// The `Fix128GpuKernel` trait bridge routes `add` / `sub` / `mul`
