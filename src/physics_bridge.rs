@@ -567,7 +567,10 @@ mod solver_bridge {
                 gravity: [Fix128::ZERO; 3],
                 floor_enabled: false,
                 distance_constraints: Vec::new(),
-                parallel_dispatch: false,
+                // v1.6.0: color-parallel batched dispatch is the default
+                // starting this release. The sequential v1.4.2 path
+                // remains available via `set_parallel_dispatch(false)`.
+                parallel_dispatch: true,
             }
         }
 
@@ -1650,21 +1653,23 @@ mod solver_bridge {
             assert_eq!(adapter.distance_constraint_count(), 0);
         }
 
-        /// v1.5.1: the parallel-dispatch toggle defaults to `false` and
+        /// v1.6.0: the parallel-dispatch toggle defaults to `true` and
         /// tracks whatever the caller last set. Verifies the getter and
         /// setter remain in sync without touching the GPU pipeline.
+        /// (Previously v1.5.1 defaulted `false`; the sequential path
+        /// is still fully supported via `set_parallel_dispatch(false)`.)
         #[test]
-        fn parallel_dispatch_default_off_and_toggles() {
+        fn parallel_dispatch_default_on_and_toggles() {
             let device = match crate::device::GpuDevice::new() {
                 Ok(d) => d,
                 Err(_) => return,
             };
             let mut adapter = TrtSolverAdapter::new(&device);
-            assert!(!adapter.parallel_dispatch_enabled());
-            adapter.set_parallel_dispatch(true);
             assert!(adapter.parallel_dispatch_enabled());
             adapter.set_parallel_dispatch(false);
             assert!(!adapter.parallel_dispatch_enabled());
+            adapter.set_parallel_dispatch(true);
+            assert!(adapter.parallel_dispatch_enabled());
         }
 
         /// v1.5.1: when every constraint operates on disjoint bodies,
@@ -1693,8 +1698,11 @@ mod solver_bridge {
             let velocities = vec![[Fix128::ZERO; 3]; 4];
             let dt = Fix128::from_ratio(1, 60);
 
-            // Sequential (toggle OFF) baseline.
+            // Sequential (toggle OFF) baseline. v1.6.0 flipped the
+            // default to ON, so the sequential path now needs an
+            // explicit opt-out.
             let mut seq = TrtSolverAdapter::new(&device);
+            seq.set_parallel_dispatch(false);
             seq.send_island(&positions, &velocities);
             seq.push_distance_constraint(0, 1, Fix128::from_int(2));
             seq.push_distance_constraint(2, 3, Fix128::from_int(2));

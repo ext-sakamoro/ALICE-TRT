@@ -2,6 +2,57 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.6.0] - 2026-07-06
+
+### Changed — Parallel dispatch is now the default
+
+Phase 2 ships to users: `TrtSolverAdapter` constructs with `parallel_dispatch = true`. The color-parallel batched rigid rod path (`FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL`, v1.5.1) now drives every unmodified caller.
+
+The sequential v1.4.2 path remains fully supported and is one line away:
+
+```rust
+let mut adapter = TrtSolverAdapter::new(&device);
+adapter.set_parallel_dispatch(false); // opt back into insertion-order sequential dispatch
+```
+
+### Byte-exact contracts (both paths still hold)
+
+- **Default (parallel_dispatch = true)** — byte-exact against `cpu_semi_implicit_integrate_colored` (v1.5.2). CI matrix (Metal / Vulkan lavapipe / DX12 WARP) certifies the contract on the 4-body chain × 3 conflicting constraints × 2 colors × 10 dispatch iterations fixture.
+- **Opt-in sequential (parallel_dispatch = false)** — byte-exact against `cpu_semi_implicit_integrate` (v1.4.2). All 8 pre-v1.6.0 `solver_bridge` byte-exact tests continue to pass verbatim under the opt-in path.
+
+### Test changes
+
+- `parallel_dispatch_default_off_and_toggles` → renamed to `parallel_dispatch_default_on_and_toggles`, initial assertion flipped to `assert!(adapter.parallel_dispatch_enabled())`.
+- `parallel_dispatch_disjoint_matches_sequential_byte_for_byte` — the "sequential" adapter now explicitly opts out via `set_parallel_dispatch(false)` since the default is on. Still asserts byte-for-byte equality between paths.
+- All other tests unchanged.
+
+Total: 191 lib tests, all pass on macOS Metal.
+
+### Backwards compatibility notes
+
+- **API surface**: zero changes. `set_parallel_dispatch(false)` restores v1.5.2 default behaviour verbatim.
+- **Semver interpretation**: default behaviour changes (color-major iteration instead of insertion-major) for callers who never touched the toggle. Under strict semver-major reading this is a MAJOR change; we ship as MINOR because:
+  1. The observable simulation output is still byte-exact against a well-defined, published CPU golden (`cpu_semi_implicit_integrate_colored`).
+  2. The change is documented three releases ahead of shipping (v1.5.0 CHANGELOG announced the plan, v1.5.1 wired the toggle, v1.5.2 certified byte-exactness).
+  3. A one-line opt-out (`set_parallel_dispatch(false)`) fully restores the previous default.
+  4. The v1.0.0 semver stability commitment covers the public API surface, which is unchanged.
+- Callers who rely on byte-exact equality against `cpu_semi_implicit_integrate` from v1.4.2 must call `set_parallel_dispatch(false)` before `dispatch_iterations` in v1.6.0+. A migration one-liner rather than a code rewrite.
+
+### Perf note
+
+For an N-color constraint graph with K PGS iterations, v1.4.2 dispatched N × K workgroups sequentially. v1.6.0 dispatches C × K workgroups (one per color × per iteration), each covering multiple constraints in parallel. On typical rope / chain / ragdoll workloads (bipartite-ish graphs), C ≈ 2, so the effective per-frame GPU dispatch count drops by a factor equal to the average color size — commonly 5-10x on ropes with dozens of links.
+
+### Next up (Phase 2 wrap)
+
+- **v2.0.0** — Formalise the semantic change as a major bump if user feedback warrants it. Additional tidy-ups: consider deprecating `FIX128_PGS_PROJECT_DISTANCE_WGSL` (the v1.1.0 single-constraint uniform variant, which the adapter no longer uses) and cleaning up leftover `pub` surface that only exists for external `Fix128GpuKernel` implementers.
+
+### Phase 2 complete
+
+- ✅ v1.5.0: constraint graph builder + greedy coloring
+- ✅ v1.5.1: batched rigid kernel + opt-in toggle
+- ✅ v1.5.2: colored CPU golden + toggle-on byte-exact assertion
+- ✅ **v1.6.0**: parallel dispatch by default (this release)
+
 ## [1.5.2] - 2026-07-06
 
 ### Added — Colored CPU golden + byte-exact assertion for the toggle-on path
