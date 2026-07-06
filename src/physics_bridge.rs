@@ -537,6 +537,23 @@ mod solver_bridge {
             self.distance_constraints.clear();
         }
 
+        /// v1.3.1: how many distance constraints are currently
+        /// installed. Zero means no distance projection dispatch
+        /// runs during `dispatch_iterations`.
+        #[must_use]
+        pub fn distance_constraint_count(&self) -> usize {
+            self.distance_constraints.len()
+        }
+
+        /// v1.3.1: `true` when at least one distance constraint is
+        /// installed. Equivalent to `distance_constraint_count() > 0`
+        /// but expressed as a boolean for the common branch-on-empty
+        /// idiom in caller code.
+        #[must_use]
+        pub fn has_distance_constraints(&self) -> bool {
+            !self.distance_constraints.is_empty()
+        }
+
         /// Toggle the v0.9.2 floor constraint (ground plane at `y = 0`).
         /// When enabled, every dispatched iteration follows the
         /// integrate kernel with a second kernel that snaps any
@@ -1359,6 +1376,36 @@ mod solver_bridge {
                     gpu_p.lo, cpu_positions[i].lo
                 );
             }
+        }
+
+        /// v1.3.1 accessors: `distance_constraint_count` reflects
+        /// exactly the number of installed constraints and
+        /// `has_distance_constraints` mirrors it as a boolean.
+        #[test]
+        fn distance_constraint_count_and_has_predicate_track_installations() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+            assert_eq!(adapter.distance_constraint_count(), 0);
+            assert!(!adapter.has_distance_constraints());
+
+            adapter.push_distance_constraint(0, 1, Fix128::from_int(2));
+            assert_eq!(adapter.distance_constraint_count(), 1);
+            assert!(adapter.has_distance_constraints());
+
+            adapter.push_distance_constraint(1, 2, Fix128::from_int(3));
+            assert_eq!(adapter.distance_constraint_count(), 2);
+
+            adapter.clear_distance_constraints();
+            assert_eq!(adapter.distance_constraint_count(), 0);
+            assert!(!adapter.has_distance_constraints());
+
+            adapter.set_distance_constraint(Some((0, 1, Fix128::from_int(4))));
+            assert_eq!(adapter.distance_constraint_count(), 1);
+            adapter.set_distance_constraint(None);
+            assert_eq!(adapter.distance_constraint_count(), 0);
         }
 
         /// `clear_distance_constraints` empties the list and makes

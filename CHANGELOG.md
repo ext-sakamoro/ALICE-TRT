@@ -2,6 +2,31 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.3.1] - 2026-07-06
+
+### Added — distance constraint accessors
+
+Small additive patch: two inspection helpers for the distance constraint list.
+
+- **`TrtSolverAdapter::distance_constraint_count(&self) -> usize`**
+- **`TrtSolverAdapter::has_distance_constraints(&self) -> bool`**
+
+Useful for:
+- Test assertions (`assert_eq!(adapter.distance_constraint_count(), 3)`)
+- Branch-on-empty in caller code (`if adapter.has_distance_constraints() { ... }`)
+- Debugging / logging without exposing the internal `Vec`
+
+### Tests
+
+- **1 new test**: `distance_constraint_count_and_has_predicate_track_installations` — covers `push` / `set(Some)` / `set(None)` / `clear` combinations, verifying both accessors move together
+- Total: 8 solver_bridge tests (+1 new)
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.3.0 at the Rust API level
+- Both accessors are additive `#[must_use]` methods
+- v1.0.0 semver stability commitment preserved
+
 ## [1.3.0] - 2026-07-06
 
 ### Added — multi-distance constraints (Gauss-Seidel order)
