@@ -194,7 +194,10 @@ mod solver_bridge {
     use alice_physics::gpu_bridge::{DiffFixture, GpuDivergence, GpuSolverBridge};
     use alice_physics::math::Fix128;
 
-    use crate::fix128::{Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_FLOOR_WGSL};
+    use crate::fix128::{
+        Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_DISTANCE_WGSL,
+        FIX128_PGS_PROJECT_FLOOR_WGSL,
+    };
 
     /// Uniform block laid out to match the `PgsParams` struct in
     /// `FIX128_PGS_INTEGRATE_WGSL`. 64 bytes total: 16 for `dt`
@@ -211,6 +214,18 @@ mod solver_bridge {
         gravity_z: Fix128Gpu,
     }
 
+    /// Uniform block matching `DistanceParams` in
+    /// `FIX128_PGS_PROJECT_DISTANCE_WGSL`. 32 bytes total: 4 for
+    /// `body_a`, 4 for `body_b`, 8 padding, 16 for `scalar`.
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct DistanceParamsGpu {
+        body_a: u32,
+        body_b: u32,
+        _pad: [u32; 2],
+        scalar: Fix128Gpu,
+    }
+
     /// GPU offload adapter for the sub-stepping TGS solver.
     ///
     /// Owns a WGSL compute pipeline for the semi-implicit Euler
@@ -223,8 +238,10 @@ mod solver_bridge {
         device: &'a crate::device::GpuDevice,
         pipeline_integrate: wgpu::ComputePipeline,
         pipeline_project_floor: wgpu::ComputePipeline,
+        pipeline_project_distance: wgpu::ComputePipeline,
         bind_group_layout: wgpu::BindGroupLayout,
         bind_group_layout_project: wgpu::BindGroupLayout,
+        bind_group_layout_project_distance: wgpu::BindGroupLayout,
         positions: Vec<Fix128Gpu>,
         velocities: Vec<Fix128Gpu>,
         /// Per-axis gravity applied every dispatch iteration. Defaults
@@ -237,6 +254,11 @@ mod solver_bridge {
         /// `y = 0` and zeroes its paired velocity. Defaults to
         /// `false` for full backwards compatibility with v0.9.1.
         floor_enabled: bool,
+        /// v1.2.0: single distance constraint. When `Some`, each
+        /// iteration follows the integrate + floor phase with a
+        /// distance projection dispatch that pulls the two named
+        /// bodies toward the given rest length. Defaults to `None`.
+        distance_constraint: Option<(usize, usize, Fix128)>,
     }
 
     impl<'a> TrtSolverAdapter<'a> {
@@ -376,16 +398,78 @@ mod solver_bridge {
                         cache: None,
                     });
 
+            // v1.2.0: distance constraint shader + pipeline (positions rw + uniform).
+            let shader_distance =
+                device
+                    .device()
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("fix128_pgs_project_distance_shader"),
+                        source: wgpu::ShaderSource::Wgsl(FIX128_PGS_PROJECT_DISTANCE_WGSL.into()),
+                    });
+
+            let bind_group_layout_project_distance =
+                device
+                    .device()
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("fix128_pgs_project_distance_bgl"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Uniform,
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                        ],
+                    });
+
+            let pipeline_layout_distance =
+                device
+                    .device()
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("fix128_pgs_project_distance_pl"),
+                        bind_group_layouts: &[&bind_group_layout_project_distance],
+                        push_constant_ranges: &[],
+                    });
+
+            let pipeline_project_distance =
+                device
+                    .device()
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("fix128_pgs_project_distance_pipeline"),
+                        layout: Some(&pipeline_layout_distance),
+                        module: &shader_distance,
+                        entry_point: Some("fix128_pgs_project_distance_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        cache: None,
+                    });
+
             Self {
                 device,
                 pipeline_integrate,
                 pipeline_project_floor,
+                pipeline_project_distance,
                 bind_group_layout,
                 bind_group_layout_project,
+                bind_group_layout_project_distance,
                 positions: Vec::new(),
                 velocities: Vec::new(),
                 gravity: [Fix128::ZERO; 3],
                 floor_enabled: false,
+                distance_constraint: None,
             }
         }
 
@@ -400,6 +484,30 @@ mod solver_bridge {
         /// their world axes.
         pub fn set_gravity(&mut self, gravity: [Fix128; 3]) {
             self.gravity = gravity;
+        }
+
+        /// v1.2.0: install (or clear) a single distance constraint
+        /// between two bodies. When set, every iteration of
+        /// [`GpuSolverBridge::dispatch_iterations`] follows the
+        /// integrate + floor phase with a distance projection dispatch
+        /// that pulls the two bodies toward the given rest length.
+        ///
+        /// Pass `Some((body_a, body_b, rest_length))` to install,
+        /// `None` to clear. The `body_a` and `body_b` indices refer
+        /// to the body indices used in `send_island`; they must be
+        /// distinct and within bounds. The rest length is expressed
+        /// in the same Fix128 world-space units as `positions`.
+        ///
+        /// # Scalar precompute
+        ///
+        /// Each iteration the CPU reads back positions, computes
+        /// `d = |p_a - p_b|` (via `Fix128Gpu::sqrt`) and
+        /// `scalar = (rest_length - d) / (2d)` (via `Fix128Gpu::div`),
+        /// then uploads the scalar via a uniform buffer. The kernel
+        /// itself does only mul + add + sub, keeping it branch-free
+        /// and bit-exact against the CPU reference.
+        pub fn set_distance_constraint(&mut self, constraint: Option<(usize, usize, Fix128)>) {
+            self.distance_constraint = constraint;
         }
 
         /// Toggle the v0.9.2 floor constraint (ground plane at `y = 0`).
@@ -438,11 +546,13 @@ mod solver_bridge {
     /// bodies are laid out as flat `Fix128Gpu[]` with three
     /// consecutive slots per body.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn cpu_semi_implicit_integrate(
         positions: &mut [Fix128Gpu],
         velocities: &mut [Fix128Gpu],
         gravity: [Fix128; 3],
         floor_enabled: bool,
+        distance_constraint: Option<(usize, usize, Fix128)>,
         iters: u32,
         dt: Fix128,
     ) {
@@ -460,11 +570,36 @@ mod solver_bridge {
             if floor_enabled {
                 for (i, (p, v)) in positions.iter_mut().zip(velocities.iter_mut()).enumerate() {
                     if i % 3 == 1 && p.hi < 0 {
-                        // Y-axis slot with a negative Fix128: snap to
-                        // zero (matches the WGSL floor kernel, which
-                        // tests the same sign bit).
                         *p = Fix128Gpu { hi: 0, lo: 0 };
                         *v = Fix128Gpu { hi: 0, lo: 0 };
+                    }
+                }
+            }
+            if let Some((a, b, rest)) = distance_constraint {
+                let pa = [
+                    gpu_to_fix128(positions[a * 3]),
+                    gpu_to_fix128(positions[a * 3 + 1]),
+                    gpu_to_fix128(positions[a * 3 + 2]),
+                ];
+                let pb = [
+                    gpu_to_fix128(positions[b * 3]),
+                    gpu_to_fix128(positions[b * 3 + 1]),
+                    gpu_to_fix128(positions[b * 3 + 2]),
+                ];
+                let dx = pa[0] - pb[0];
+                let dy = pa[1] - pb[1];
+                let dz = pa[2] - pb[2];
+                let d_sq = dx * dx + dy * dy + dz * dz;
+                let d = d_sq.sqrt();
+                if !d.is_zero() {
+                    let scalar = (rest - d) / (d + d);
+                    for axis in 0..3 {
+                        let pa_axis = gpu_to_fix128(positions[a * 3 + axis]);
+                        let pb_axis = gpu_to_fix128(positions[b * 3 + axis]);
+                        let diff = pa_axis - pb_axis;
+                        let delta = scalar * diff;
+                        positions[a * 3 + axis] = fix128_to_gpu(pa_axis + delta);
+                        positions[b * 3 + axis] = fix128_to_gpu(pb_axis - delta);
                     }
                 }
             }
@@ -603,6 +738,86 @@ mod solver_bridge {
                     }
                     self.device.submit(encoder);
                     self.device.poll_wait();
+                }
+
+                // v1.2.0: distance constraint projection (only if set).
+                // Read positions back to CPU, compute the correction
+                // scalar (via Fix128 sqrt + div, both certified
+                // bit-exact against alice_physics), upload as
+                // uniform, and dispatch the projection kernel.
+                if let Some((a, b, rest_length)) = self.distance_constraint {
+                    let raw_positions = self.device.read_buffer(&buf_pos, bytes);
+                    let positions_snapshot: &[Fix128Gpu] = bytemuck::cast_slice(&raw_positions);
+                    let pa = [
+                        positions_snapshot[a * 3].to_physics(),
+                        positions_snapshot[a * 3 + 1].to_physics(),
+                        positions_snapshot[a * 3 + 2].to_physics(),
+                    ];
+                    let pb = [
+                        positions_snapshot[b * 3].to_physics(),
+                        positions_snapshot[b * 3 + 1].to_physics(),
+                        positions_snapshot[b * 3 + 2].to_physics(),
+                    ];
+                    let dx = pa[0] - pb[0];
+                    let dy = pa[1] - pb[1];
+                    let dz = pa[2] - pb[2];
+                    let d_sq = dx * dx + dy * dy + dz * dz;
+                    let d = d_sq.sqrt();
+
+                    // Skip projection if the bodies are colocated —
+                    // the correction direction would be undefined.
+                    if !d.is_zero() {
+                        let numerator = rest_length - d;
+                        let denominator = d + d;
+                        let scalar = numerator / denominator;
+
+                        let params = DistanceParamsGpu {
+                            body_a: a as u32,
+                            body_b: b as u32,
+                            _pad: [0; 2],
+                            scalar: Fix128Gpu::from_physics(scalar),
+                        };
+                        let buf_dist_params = self.device.create_uniform_buffer(
+                            "pgs_project_distance_params",
+                            bytemuck::bytes_of(&params),
+                        );
+
+                        let bg_distance =
+                            self.device
+                                .device()
+                                .create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("pgs_project_distance_bg"),
+                                    layout: &self.bind_group_layout_project_distance,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: buf_pos.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: buf_dist_params.as_entire_binding(),
+                                        },
+                                    ],
+                                });
+
+                        let mut encoder = self.device.device().create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("pgs_project_distance_enc"),
+                            },
+                        );
+                        {
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("pgs_project_distance_pass"),
+                                    timestamp_writes: None,
+                                });
+                            pass.set_pipeline(&self.pipeline_project_distance);
+                            pass.set_bind_group(0, &bg_distance, &[]);
+                            pass.dispatch_workgroups(1, 1, 1);
+                        }
+                        self.device.submit(encoder);
+                        self.device.poll_wait();
+                    }
                 }
             }
 
@@ -766,6 +981,7 @@ mod solver_bridge {
                 &mut cpu_velocities,
                 [Fix128::ZERO; 3],
                 false,
+                None,
                 iters,
                 dt,
             );
@@ -857,6 +1073,7 @@ mod solver_bridge {
                 &mut cpu_velocities,
                 gravity,
                 false,
+                None,
                 iters,
                 dt,
             );
@@ -937,6 +1154,7 @@ mod solver_bridge {
                 &mut cpu_velocities,
                 gravity,
                 true,
+                None,
                 iters,
                 dt,
             );
@@ -981,6 +1199,68 @@ mod solver_bridge {
                     y_pos.hi >= 0,
                     "body {body} Y position went below floor: {:?}",
                     y_pos
+                );
+            }
+        }
+
+        /// v1.2.0 distance-constraint end-to-end bit-exact proof.
+        ///
+        /// Two bodies start with distance != rest_length; running the
+        /// adapter with `set_distance_constraint(Some(...))` must
+        /// pull them toward L, and every position slot must match the
+        /// CPU reference byte-for-byte after any number of iterations.
+        /// This is the definitive test that the CPU-precompute + GPU-
+        /// apply split preserves ecosystem bit-exactness end-to-end.
+        #[test]
+        fn trt_solver_adapter_distance_constraint_matches_cpu_reference() {
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+
+            // Two bodies on the X axis; rest length = 2, initial d = 4.
+            let positions = vec![
+                [Fix128::from_int(-2), Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(2), Fix128::ZERO, Fix128::ZERO],
+            ];
+            let velocities = vec![[Fix128::ZERO; 3], [Fix128::ZERO; 3]];
+            let rest_length = Fix128::from_int(2);
+
+            adapter.send_island(&positions, &velocities);
+            adapter.set_distance_constraint(Some((0, 1, rest_length)));
+
+            let dt = Fix128::from_ratio(1, 60);
+            let iters = 20u32;
+            adapter.dispatch_iterations(iters, dt);
+
+            let mut cpu_positions: Vec<Fix128Gpu> = positions
+                .iter()
+                .flat_map(|p| p.iter().map(|f| fix128_to_gpu(*f)))
+                .collect();
+            let mut cpu_velocities: Vec<Fix128Gpu> = velocities
+                .iter()
+                .flat_map(|v| v.iter().map(|f| fix128_to_gpu(*f)))
+                .collect();
+            cpu_semi_implicit_integrate(
+                &mut cpu_positions,
+                &mut cpu_velocities,
+                [Fix128::ZERO; 3],
+                false,
+                Some((0, 1, rest_length)),
+                iters,
+                dt,
+            );
+
+            for (i, gpu_p) in adapter.positions.iter().enumerate() {
+                assert_eq!(
+                    gpu_p.hi, cpu_positions[i].hi,
+                    "position hi mismatch at slot {i}"
+                );
+                assert_eq!(
+                    gpu_p.lo, cpu_positions[i].lo,
+                    "position lo mismatch at slot {i}: GPU {:#x} vs CPU {:#x}",
+                    gpu_p.lo, cpu_positions[i].lo
                 );
             }
         }

@@ -2,6 +2,46 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.2.0] - 2026-07-06
+
+### Added — `TrtSolverAdapter::set_distance_constraint` adapter integration
+
+The v1.1.0 `FIX128_PGS_PROJECT_DISTANCE_WGSL` shader is now wired end-to-end into the `TrtSolverAdapter`. Each dispatch iteration reads positions back to the CPU, computes the correction scalar via `Fix128Gpu::sqrt` + `Fix128Gpu::div` (both certified bit-exact against ALICE-Physics), uploads it via a uniform buffer, and dispatches the projection kernel.
+
+- **`TrtSolverAdapter::set_distance_constraint(Option<(usize, usize, Fix128)>)`** — new API
+  - Pass `Some((body_a, body_b, rest_length))` to install
+  - Pass `None` to clear
+  - Constraint is applied after integrate + floor phases each iteration
+- **Adapter internals**:
+  - `pipeline_project_distance` compute pipeline (compiled once at construction)
+  - `bind_group_layout_project_distance` — 2-buffer layout (positions rw + params uniform)
+  - `DistanceParamsGpu` — 32-byte uniform struct (`body_a: u32, body_b: u32, _pad, scalar: Fix128Gpu`)
+- **Per-iteration flow** (only when a constraint is installed):
+  1. Integrate + floor dispatches (existing)
+  2. Read positions from GPU to CPU
+  3. CPU computes `d = sqrt(dx² + dy² + dz²)` and `scalar = (rest_length - d) / (2d)`
+  4. Skip if `d == 0` (colocated bodies, correction direction undefined)
+  5. Upload uniform, dispatch distance projection kernel
+  6. Positions on GPU are now corrected; loop continues
+
+### Design — CPU sqrt / div vs GPU sqrt / div
+
+The distance constraint kernel would nominally need `sqrt` and `div` on the GPU. Both are expensive in Fix128 (Newton iteration with 128-bit initial guess, bit-scan for div reciprocal, etc.) and would require substantial new WGSL code. Since the adapter already reads positions back to CPU for the outer step function, the scalar precompute costs **one sqrt + one div per constraint per iteration** on the CPU — negligible next to the workgroup dispatch cost. The GPU kernel then does only mul + add + sub, all bit-exact. Bit-exact CPU vs GPU agreement is a direct corollary of the primitive-level guarantees already on the platform matrix CI.
+
+### Tests
+
+- **`trt_solver_adapter_distance_constraint_matches_cpu_reference`** — new end-to-end determinism test
+  - N = 2 bodies × 3 axes at initial distance 4, rest_length 2
+  - 20 iterations of the full pipeline (integrate + no floor + distance)
+  - Byte-for-byte GPU vs CPU position agreement per slot
+- Total: 5 solver_bridge tests (+1 distance), 168 physics-solver tests, 37 fix128 tests
+
+### Backwards compatibility
+
+- Fully backwards compatible with v1.1.0 at the Rust API level
+- Default `distance_constraint = None`, so existing test / production behaviour is unchanged unless the caller explicitly opts in
+- v1.0.0 semver stability commitment preserved (all additions are additive)
+
 ## [1.1.0] - 2026-07-06
 
 ### Added — `FIX128_PGS_PROJECT_DISTANCE_WGSL` distance constraint kernel
