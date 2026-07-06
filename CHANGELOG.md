@@ -2,6 +2,50 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [1.5.0] - 2026-07-06
+
+### Added — Phase 2 foundation: deterministic constraint graph coloring
+
+First release of Phase 2 in the [GPU offload roadmap](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md). Ships the algorithm and its exhaustive test suite for the parallel-constraint-solve foundation. **No user-visible behaviour changes**: the module is a self-contained library primitive; the adapter wire-up (batched rigid kernel with `workgroup_id`-indexed constraint selection) lands in v1.5.1.
+
+- **New public module `alice_trt::constraint_graph`** exposing:
+  - `ConstraintGraph::build(pairs: &[(usize, usize)]) -> Self` — conflict graph builder (two constraints share an edge iff they share at least one body). O(N²) time, O(N + E) memory, fully deterministic (no `HashMap`, no unordered iteration).
+  - `ConstraintGraph::constraint_count() -> usize`
+  - `ConstraintGraph::edge_count() -> usize`
+  - `ConstraintGraph::neighbours(i: usize) -> &[usize]` — sorted neighbour list.
+  - `ConstraintGraph::greedy_color() -> Vec<Vec<usize>>` — smallest-color-not-used-by-earlier-neighbour greedy algorithm, returning ascending-order buckets of constraint indices per color.
+
+### Determinism
+
+- Both `build` and `greedy_color` walk constraints in ascending index order and use only `Vec` — no `HashMap`, no thread-local state, no cross-platform iteration surprises.
+- Result is bit-identical across platforms, threads, and rustc versions, matching the determinism contract already established for the v1.4.x GPU kernels.
+
+### Tests (8 new)
+
+- `empty_graph_has_no_colors`
+- `single_constraint_gets_one_color`
+- `disjoint_constraints_share_a_color` — constraints on disjoint bodies pack into one color.
+- `shared_body_forces_separate_colors` — the minimum K₂ case.
+- `chain_graph_uses_two_colors` — 5-body rope → alternating 2 colors (bipartite optimum).
+- `triangle_graph_needs_three_colors` — K₃, chromatic number 3.
+- `star_graph_needs_n_colors` — 5-constraint K₅, chromatic number 5.
+- `coloring_is_deterministic_across_repeated_calls` — smoke test for the determinism contract.
+
+Total: 187 lib tests (179 prior + 8 new) — all pass on macOS Metal.
+
+### Backwards compatibility
+
+- **Zero** public-API changes to `TrtSolverAdapter` or `Fix128WgpuKernel`; existing code paths are byte-identical to v1.4.2.
+- v1.0.0 semver stability commitment intact.
+- Additive at the module level (new `pub mod constraint_graph`).
+
+### Next up (Phase 2 continuation)
+
+- **v1.5.1** — Batched rigid kernel that dispatches all constraints of one color in a single `dispatch_workgroups(N_in_color, ...)` call, reading its constraint index from `@builtin(workgroup_id)`.
+- **v1.5.2** — CPU golden with colored iteration order + byte-exact assertion re-established under the toggle-on path.
+- **v1.6.0** — Default the parallel dispatch on after cross-platform validation.
+- **v2.0.0** — Formalise as major bump (semantic-change acknowledgement even though API is unchanged).
+
 ## [1.4.2] - 2026-07-06
 
 ### Changed — Rigid rod distance constraint runs end-to-end on GPU
