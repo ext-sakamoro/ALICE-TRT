@@ -5,6 +5,8 @@
 > "Don't move data. Move the law."
 > "The GPU thinks it's computing FP16. It's computing {-1, 0, +1}."
 
+**Current release: v1.3.1** — semver-stable PGS solver bridge (gravity + floor + multi-distance constraints, byte-exact on Metal / Vulkan / DX12 WARP). See [Cross-Crate Bridges](#cross-crate-bridges).
+
 ALICE-TRT is a GPU inference engine that exploits **memory bandwidth compression** for 1.58-bit ternary neural networks. Weights are stored as 2-bit bitplanes in VRAM, transported at 1/8 the bandwidth of FP16, and expanded on-the-fly in registers before hitting the compute units.
 
 Part of the [Project A.L.I.C.E.](https://github.com/ext-sakamoro) ecosystem.
@@ -350,13 +352,15 @@ ALICE-TRT connects to other ALICE ecosystem crates via feature-gated bridge modu
 | Bridge | Feature | Target Crate | Description |
 |--------|---------|--------------|-------------|
 | `physics_bridge::GpuPhysicsController` | `physics` | [ALICE-Physics](../ALICE-Physics) | GPU ternary inference for physics **control policies**, batched force computation |
-| `physics_bridge::TrtSolverAdapter` | `physics-solver` | [ALICE-Physics v0.8.0+](../ALICE-Physics) | Compute-shader-based Fix128 **PGS solver offload** (implements `alice_physics::gpu_bridge::GpuSolverBridge`) |
-| `fix128::Fix128GpuKernel` | `fix128-arithmetic` | [ALICE-Physics v0.8.0+](../ALICE-Physics) | Fix128 GPU primitive skeleton (`add` / `sub` / `mul` / `dot`) with WGSL kernels landing in follow-up |
+| `physics_bridge::TrtSolverAdapter` | `physics-solver` | [ALICE-Physics v0.8.0+](../ALICE-Physics) | Compute-shader-based Fix128 **PGS solver offload** — gravity + floor + N-way distance constraints (Gauss-Seidel), byte-exact vs CPU on Metal / Vulkan / DX12 |
+| `fix128::Fix128GpuKernel` | `fix128-arithmetic` | [ALICE-Physics v0.8.0+](../ALICE-Physics) | Fix128 GPU primitives — `add` / `sub` / `mul` / `dot` (2-stage reduce) + PGS `integrate` / `project_floor` / `project_distance` WGSL kernels |
 | `sdf_bridge` | `sdf` | [ALICE-SDF](../ALICE-SDF) | GPU neural SDF approximation via ternary networks for real-time distance field queries |
 
-### Physics Solver Bridge (feature: `physics-solver`, since v0.2.0)
+### Physics Solver Bridge (feature: `physics-solver`, stable since v1.0.0)
 
 Compute-shader-based Fix128 PGS solver offload for [ALICE-Physics v0.8.0+](../ALICE-Physics). `TrtSolverAdapter` implements the `alice_physics::gpu_bridge::GpuSolverBridge` trait so ALICE-Physics callers can inject the GPU path via dependency injection. The default CPU-native TGS pipeline remains untouched unless the adapter is explicitly wired in.
+
+**Semver stability commitment (v1.0.0+):** the public `TrtSolverAdapter` surface (constructor / `send_island` / `dispatch_iterations` / `set_gravity` / `set_floor` / `push_distance_constraint` / `recv_island` / `assert_bit_exact_vs_cpu`) is byte-stable across the v1.x line. Additive helpers ship as minor bumps; breaking changes go to v2.
 
 **Pair with `alice-physics/gpu-solver-bridge`.** The `physics-solver` feature automatically enables it on the ALICE-Physics side.
 
@@ -369,45 +373,77 @@ alice-physics = { path = "../ALICE-Physics", features = ["gpu-solver-bridge"] }
 ```rust
 use alice_physics::gpu_bridge::{DiffFixture, GpuSolverBridge};
 use alice_physics::math::Fix128;
-use alice_trt::TrtSolverAdapter;
+use alice_trt::{GpuDevice, TrtSolverAdapter};
 
-// 1. Construct an adapter (no GPU device required for the skeleton API).
-let mut adapter = TrtSolverAdapter::new();
+// 1. Construct an adapter bound to a wgpu device.
+let device = GpuDevice::new()?;
+let mut adapter = TrtSolverAdapter::new(&device);
 
 // 2. Upload the current island state.
 let positions:  Vec<[Fix128; 3]> = /* ... */;
 let velocities: Vec<[Fix128; 3]> = /* ... */;
 adapter.send_island(&positions, &velocities);
 
-// 3. Dispatch PGS iterations on the GPU (zero-iteration is a no-op echo
-//    today — WGSL kernels land in the follow-up).
-adapter.dispatch_iterations(0, Fix128::from_ratio(1, 60));
+// 3. Install constraints (all optional, all additive).
+adapter.set_gravity(Some([Fix128::ZERO, Fix128::from_ratio(-98, 10), Fix128::ZERO]));
+adapter.set_floor(Some(Fix128::ZERO));                             // y >= 0
+adapter.push_distance_constraint(0, 1, Fix128::from_int(2));       // |p0 - p1| = 2
+adapter.push_distance_constraint(1, 2, Fix128::from_int(2));       // Gauss-Seidel ordered
 
-// 4. Read back into caller-owned slices.
+// 4. Dispatch PGS iterations on the GPU (live shader path, not a stub).
+adapter.dispatch_iterations(10, Fix128::from_ratio(1, 60));
+
+// 5. Read back into caller-owned slices.
 let mut out_positions  = vec![[Fix128::ZERO; 3]; positions.len()];
 let mut out_velocities = vec![[Fix128::ZERO; 3]; velocities.len()];
 adapter.recv_island(&mut out_positions, &mut out_velocities);
 
-// 5. Certify byte-for-byte equivalence with the CPU-side solver before
-//    production runtime accepts the backend.
+// 6. Certify byte-for-byte equivalence with the CPU-side solver.
 adapter.assert_bit_exact_vs_cpu(&DiffFixture {
-    description: "gravity_fall_60_steps",
+    description: "3body_triangle_10iter",
     tolerance: Fix128::ZERO, // strict byte-for-byte equality
 })?;
 ```
 
-Companion release: [ALICE-Physics v0.8.0](https://github.com/ext-sakamoro/ALICE-Physics/releases/tag/v0.8.0).
+**Feature timeline (v0.3.0 → v1.3.1):**
 
-### Fix128 GPU Primitive (feature: `fix128-arithmetic`, since v0.2.0)
+| Feature | Since | Notes |
+|---------|-------|-------|
+| Live PGS dispatch (integrate) | v0.4.0 | Semi-implicit Euler on GPU, byte-exact vs CPU |
+| Gravity | v0.5.0 | `set_gravity(Option<[Fix128; 3]>)` |
+| Floor constraint | v0.6.0 | `set_floor(Option<Fix128>)`, projects `y >= floor` |
+| WARP crash fix (uniform-flow) | v0.8.1 | FXC X4026 discipline, 3-platform CI green |
+| Distance constraint (single) | v1.2.0 | CPU-precompute scalar + GPU project |
+| Multi-distance (Gauss-Seidel) | v1.3.0 | `push_distance_constraint(a, b, L)` × N |
+| Accessors | v1.3.1 | `distance_constraint_count()` / `has_distance_constraints()` |
 
-Standalone `Fix128Gpu` (`#[repr(C)]` + `bytemuck::Pod`, layout-compatible with `alice_physics::Fix128`) plus the `Fix128GpuKernel` trait providing the add / sub / mul / dot signatures. Enable this feature without `physics-solver` to build the Fix128 GPU primitive without pulling in ALICE-Physics.
+**CI matrix:** every release is validated on macOS (Metal) / Ubuntu (Vulkan lavapipe) / Windows (DX12 WARP) with byte-exact assertions against the CPU golden solver.
+
+Companion releases: [ALICE-Physics v0.8.0+](https://github.com/ext-sakamoro/ALICE-Physics/releases).
+
+### Fix128 GPU Primitive (feature: `fix128-arithmetic`, stable since v1.0.0)
+
+Standalone `Fix128Gpu` (`#[repr(C)]` + `bytemuck::Pod`, layout-compatible with `alice_physics::Fix128`) plus the `Fix128GpuKernel` trait. Enable this feature without `physics-solver` to build the Fix128 GPU primitive without pulling in ALICE-Physics.
 
 ```toml
 [dependencies]
 alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
 ```
 
-Follow-up commits will land the WGSL shader bodies and Metal / Vulkan / DX12 platform-diff test matrix.
+**Live GPU kernels (all WGSL, all byte-exact vs CPU reference):**
+
+| Kernel | Since | WGSL constant |
+|--------|-------|---------------|
+| `add` / `sub` | v0.3.0 | `FIX128_ADD_WGSL` / `FIX128_SUB_WGSL` |
+| `mul` | v0.3.0 | `FIX128_MUL_WGSL` |
+| `dot` (2-stage reduce) | v0.7.1 / v0.8.1 | `FIX128_DOT_WGSL` + `FIX128_DOT_FINAL_WGSL` |
+| PGS integrate (semi-implicit Euler) | v0.4.0 | `FIX128_PGS_INTEGRATE_WGSL` |
+| PGS project (floor) | v0.6.0 | `FIX128_PGS_PROJECT_FLOOR_WGSL` |
+| PGS project (distance) | v1.1.0 | `FIX128_PGS_PROJECT_DISTANCE_WGSL` |
+
+CPU-side `Fix128Gpu` also exposes `sqrt` (v1.0.1, delegates to `alice_physics::Fix128::sqrt`) and `div` (v1.0.6) for host precompute paths (e.g. the distance-constraint scalar). GPU sqrt kernel is roadmap for v1.4+.
+
+**37 Fix128 unit tests + 170 physics-solver tests** run on all three platforms per release.
 
 ### SDF Bridge (feature: `sdf`)
 
