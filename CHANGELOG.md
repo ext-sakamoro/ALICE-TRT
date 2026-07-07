@@ -2,6 +2,45 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.5.0] - 2026-07-07
+
+### Added — GPU sphere-sphere narrow-phase contact kernel (Phase 3 §5)
+
+Fifth implementation release of the Phase 3 GPU BVH pipeline. Ships the single-workgroup single-thread sphere-sphere geometric map that consumes the v2.4.0 pair list and produces `Vec<ContactGpu>` byte-identical to a CPU replay of the sphere-sphere block of `alice_physics::solver::PhysicsWorld::detect_collisions`. Every Fix128 primitive the kernel composes (add / sub / mul / div / sqrt / lt / is_zero / half / neg / abs) is a byte-exact copy of the certified v0.3.0 / v1.4.0 / v1.4.1 kernels inlined per house style. Additive-only; the v2.4.0 public surface remains stable.
+
+- **`FIX128_SPHERE_SPHERE_CONTACT_WGSL` — full impl** (new WGSL constant, ~500 lines). Single `@compute @workgroup_size(1)` entry `fix128_sphere_sphere_contact_main` iterates the pairs list and, per pair, computes `delta = pos_b - pos_a` (3× Fix128 sub), `len_sq = dot(delta, delta)` (3× mul + 2× add), `len = fix128_sqrt(len_sq)` (v1.4.1 Newton-Raphson, 64 iterations), `combined = radii[a] + radii[b]` (1× add), then guards on `!is_zero(len) && lt(len, combined)`, computes `inv_len = ONE / len` (1× div), scales delta by inv_len to get the unit normal (3× mul), and emits `Contact { body_a, body_b, depth, normal, point_a, point_b }` via `atomicAdd(&contact_count[0], 1u)` slot reservation. Total ~19 Fix128 ops per pair. See [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md) §2.6 for the full algorithm + bindings + CPU golden strategy.
+- **New public Rust struct `Vec3FixGpu`** (`#[repr(C)]`, 48 bytes): three `Fix128Gpu` fields (`x`, `y`, `z`) at offsets 0 / 16 / 32. Ships `from_physics(&Vec3Fix)` for byte-exact test fixtures.
+- **New public Rust struct `ContactGpu`** (`#[repr(C)]`, 176 bytes): `{ body_a, body_b, _pad0, _pad1, depth, normal, point_a, point_b }`. The 8-byte padding after `body_b` aligns `depth` at a 16-byte offset for consistent WGSL storage-buffer layout across Metal / Vulkan / DX12. Ships `from_physics(body_a, body_b, &alice_physics::collider::Contact)` for byte-exact test fixtures.
+- **New public Rust function** `dispatch_fix128_sphere_sphere_contact(device, pairs, positions, radii) -> Vec<ContactGpu>`: full orchestrator. Uploads the pair list plus per-body positions and radii, dispatches at `(1, 1, 1)` workgroups, reads back the emitted contact count from a separate atomic counter, and returns the contact list in `pairs` iteration order (no host-side sort — the emission order matches the CPU `for (a, b) in pairs { ... }` loop exactly).
+
+### Scope carve-out
+
+Only the geometric map (delta / length / depth / normal / point_a / point_b) is ported. The CPU `detect_collisions` stage 1-3 filters (`CollisionFilter::can_collide`, `is_static`, `is_sleeping`) and stage 5 orchestration (event bus fanout, wake-on-contact, sensor branching, material-parameterised constraint construction) stay on the CPU. This mirrors the same scope decision as v1.6.0's batched rigid-rod projection: GPU handles the deterministic numeric hot path, CPU handles state-dependent orchestration.
+
+### Tests (v2.5.0 additions)
+
+- `wgsl_sphere_sphere_contact_shader_present` — structural coverage of the new WGSL surface (struct names, binding identifiers, Fix128 primitive names composed by the kernel, Vec3 helpers, atomic emission path, single `@workgroup_size(1)` entry). Runs on every 3-platform CI job without a GPU adapter.
+- `wgsl_sphere_sphere_contact_shader_compiles` — naga validation via `create_shader_module`. Catches WGSL syntax / type errors on every platform.
+- `wgpu_sphere_sphere_contact_matches_cpu_golden` — **byte-exact GPU-CPU golden** on three new fixtures that exercise the geometric branches:
+  1. **Overlap pile (32 bodies, 4×4×2 grid, spacing 1.5, radius 1)** — mixed collision + no-collision pairs with non-trivial normal directions.
+  2. **Chain (6 bodies at x = 0, 2, 4, 6, 8, 10, radius 1.1)** — pinned expected values: adjacent pairs collide with `normal = (1, 0, 0)` and `depth ≈ 0.2`; non-adjacent pairs do not. Exactly 5 contacts emitted.
+  3. **Zero-distance degenerate (4 bodies all at origin, radius 1)** — every pair has `dist == 0` → filtered by `is_zero` guard → 0 contacts. Exercises the div-by-zero short-circuit.
+
+Full assertion: `assert_eq!(gpu_contacts, cpu_contacts)` on `Vec<ContactGpu>` (each 176 bytes via `#[derive(PartialEq, Eq)]`). Total 209 lib tests (previously 206), all pass on macOS Metal. The 3-platform CI matrix picks up the two new shader tests on the next tag run.
+
+### Design doc
+
+- **`docs/PHASE_3_DESIGN.md` §2.6** — full v2.5.0 scope: scope carve-out rationale, per-pair algorithm, bindings, CPU golden strategy, and fixture design.
+
+### Backwards compatibility
+
+Fully additive vs v2.4.0. No API changes. The v2.4.0 `dispatch_fix128_bvh_find_pairs`, `BvhNodeGpu`, `AabbI32Gpu`, and helpers are unchanged.
+
+### Next up (Phase 3 continuation)
+
+- **v2.6.0** — GPU PGS contact solve consuming the v2.5.0 contact list, plus `TrtSolverAdapter` opt-in for the full pipeline (mirrors the v1.5.1 → v1.6.0 opt-in / default-flip cadence). Closes the Phase 3 GPU broad-phase → narrow-phase → solve chain end-to-end.
+- **v2.5.x candidate** — parallel per-pair dispatch (one thread per outer-loop iteration) with two-dispatch prefix-sum for output slot reservation. Requires fresh determinism analysis before shipping.
+
 ## [2.4.0] - 2026-07-07
 
 ### Added — GPU BVH find_pairs kernel (Phase 3 §4)

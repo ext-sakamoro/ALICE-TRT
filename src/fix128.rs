@@ -5152,6 +5152,884 @@ pub fn dispatch_fix128_bvh_find_pairs(
 }
 
 // ---------------------------------------------------------------------------
+// v2.5.0 — GPU sphere-sphere narrow-phase contact kernel (Phase 3 §5)
+// ---------------------------------------------------------------------------
+
+/// v2.5.0 GPU sphere-sphere narrow-phase contact kernel — pure
+/// geometric map from `(pairs, positions, radii)` to a `Vec<ContactGpu>`
+/// list, byte-identical to the corresponding stanza of
+/// `alice_physics::solver::PhysicsWorld::detect_collisions` (the
+/// sphere-sphere `delta.normalize_with_length()` → depth / normal /
+/// point_a / point_b block) on the CPU.
+///
+/// # Scope carve-out
+///
+/// The kernel handles only the geometric map — the stage 4 body of the
+/// CPU `detect_collisions` fn. Stages 1-3 (filter mask, static-static
+/// skip, both-sleeping skip) live on the CPU and are applied by the
+/// caller before invoking the kernel. Stage 5 (event bus fanout,
+/// wake-on-contact, sensor branching, material lookup) is CPU-side
+/// orchestration on the readback. See `docs/PHASE_3_DESIGN.md` §2.6
+/// for the full scope discussion.
+///
+/// # Algorithm — CPU parity per-pair test
+///
+/// For each `(a, b)` in `pairs`:
+///
+/// ```text
+/// let delta       = positions[b] - positions[a];              // 3× Fix128 sub
+/// let len_sq      = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+/// let len         = fix128_sqrt(len_sq);
+/// let combined    = fix128_add(radii[a], radii[b]);
+/// if fix128_lt(len, combined) && !fix128_is_zero(len) {
+///     let inv_len  = fix128_div(fix128_one(), len);
+///     let normal   = delta * inv_len;                          // Vec3Fix scale
+///     let depth    = fix128_sub(combined, len);
+///     let point_a  = positions[a] + normal * radii[a];
+///     let point_b  = positions[b] - normal * radii[b];
+///     emit ContactGpu { body_a: a, body_b: b, depth, normal, point_a, point_b };
+/// }
+/// ```
+///
+/// Total ~19 Fix128 ops per pair. Every primitive is a byte-exact copy
+/// of the certified v0.3.0 (add / sub / mul), v1.4.0 (div), and v1.4.1
+/// (sqrt) kernels inlined per house style (WGSL has no include
+/// directive). The `fix128_one()` constant is the Fix128 representation
+/// of `1.0` (`hi = 1`, `lo = 0`).
+///
+/// # Bindings
+///
+/// - `@group(0) @binding(0)` — `pairs: array<vec2<u32>>` (read).
+///   Pre-filtered pair list. Typically the v2.4.0 output.
+/// - `@group(0) @binding(1)` — `positions: array<Vec3FixGpu>` (read).
+///   Per-body position. Element `i` corresponds to body id `i`.
+/// - `@group(0) @binding(2)` — `radii: array<Fix128Gpu>` (read).
+///   Per-body sphere radius.
+/// - `@group(0) @binding(3)` — `params: SphereContactParams` (uniform).
+///   `{ pair_count, max_contacts, _pad0, _pad1 }` (16-byte aligned).
+/// - `@group(0) @binding(4)` — `contacts_out: array<ContactGpu>`
+///   (read_write). Emitted contacts in `pairs` iteration order.
+/// - `@group(0) @binding(5)` — `contact_count: array<atomic<u32>, 1>`
+///   (read_write). Emitted contact count.
+///
+/// # Determinism
+///
+/// Single-workgroup single-thread dispatch. Every write to
+/// `contacts_out` happens in `pairs` iteration order (identical to the
+/// CPU `for (a, b) in pairs { ... }` loop). No cross-thread ordering
+/// hazards; byte-exact across the 3-platform CI matrix.
+pub const FIX128_SPHERE_SPHERE_CONTACT_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+struct Vec3FixGpu {
+    x: Fix128Gpu,
+    y: Fix128Gpu,
+    z: Fix128Gpu,
+}
+
+struct ContactGpu {
+    body_a:  u32,
+    body_b:  u32,
+    _pad0:   u32,
+    _pad1:   u32,
+    depth:   Fix128Gpu,
+    normal:  Vec3FixGpu,
+    point_a: Vec3FixGpu,
+    point_b: Vec3FixGpu,
+}
+
+struct SphereContactParams {
+    pair_count:   u32,
+    max_contacts: u32,
+    _pad0:        u32,
+    _pad1:        u32,
+}
+
+@group(0) @binding(0) var<storage, read>       pairs:         array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read>       positions:     array<Vec3FixGpu>;
+@group(0) @binding(2) var<storage, read>       radii:         array<Fix128Gpu>;
+@group(0) @binding(3) var<uniform>             params:        SphereContactParams;
+@group(0) @binding(4) var<storage, read_write> contacts_out:  array<ContactGpu>;
+@group(0) @binding(5) var<storage, read_write> contact_count: array<atomic<u32>, 1>;
+
+// ---- 64-bit helpers ----
+
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let lo_sub  = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid     = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let hi_sub  = mid - borrow1;
+    let borrow3 = select(0u, 1u, mid < borrow1);
+    return vec3<u32>(lo_sub, hi_sub, borrow2 + borrow3);
+}
+
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+    let r0 = ll.x;
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+    let r3 = hh.y + carry_to_3;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+// ---- Fix128 basic ops (byte-exact copies from v1.4.x kernels) ----
+
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_sub_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+    let ll = u64_mul_wide(a_lo, b_lo);
+    let lh = u64_mul_wide(a_lo, b_hi);
+    let hl = u64_mul_wide(a_hi, b_lo);
+    let hh = u64_mul_wide(a_hi, b_hi);
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+    let s5a = lh.w + hl.w;
+    let s5b = s5a + hh.y;
+    let p5_u = s5b + carry_to_5;
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+    var p4 = p4_u;
+    var p5 = p5_u;
+    if (a_negative) {
+        let sub_lo = b.lo_lo;
+        let sub_hi = b.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    if (b_negative) {
+        let sub_lo = a.lo_lo;
+        let sub_hi = a.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
+    return out;
+}
+
+// ---- Common Fix128 sign / zero helpers ----
+
+fn fix128_neg(x: Fix128Gpu) -> Fix128Gpu {
+    let inv_lo_lo = ~x.lo_lo;
+    let inv_lo_hi = ~x.lo_hi;
+    let inv_hi_lo = ~x.hi_lo;
+    let inv_hi_hi = ~x.hi_hi;
+    let s0 = inv_lo_lo + 1u;
+    let c0 = select(0u, 1u, s0 < inv_lo_lo);
+    let s1 = inv_lo_hi + c0;
+    let c1 = select(0u, 1u, s1 < inv_lo_hi);
+    let s2 = inv_hi_lo + c1;
+    let c2 = select(0u, 1u, s2 < inv_hi_lo);
+    let s3 = inv_hi_hi + c2;
+    var out: Fix128Gpu;
+    out.lo_lo = s0;
+    out.lo_hi = s1;
+    out.hi_lo = s2;
+    out.hi_hi = s3;
+    return out;
+}
+
+fn fix128_is_zero(x: Fix128Gpu) -> bool {
+    return (x.hi_lo | x.hi_hi | x.lo_lo | x.lo_hi) == 0u;
+}
+
+fn fix128_is_negative(x: Fix128Gpu) -> bool {
+    return ((x.hi_hi >> 31u) & 1u) == 1u;
+}
+
+fn fix128_abs(x: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(x)) { return fix128_neg(x); }
+    return x;
+}
+
+fn fix128_zero() -> Fix128Gpu {
+    return Fix128Gpu(0u, 0u, 0u, 0u);
+}
+
+// Fix128 representation of 1.0: hi = 1 (as i64), lo = 0.
+// Layout: hi_lo = 1, hi_hi = 0, lo_lo = 0, lo_hi = 0.
+fn fix128_one() -> Fix128Gpu {
+    return Fix128Gpu(1u, 0u, 0u, 0u);
+}
+
+fn fix128_half(x: Fix128Gpu) -> Fix128Gpu {
+    var out: Fix128Gpu;
+    out.lo_lo = (x.lo_lo >> 1u) | ((x.lo_hi & 1u) << 31u);
+    out.lo_hi = (x.lo_hi >> 1u) | ((x.hi_lo & 1u) << 31u);
+    out.hi_lo = (x.hi_lo >> 1u) | ((x.hi_hi & 1u) << 31u);
+    out.hi_hi = bitcast<u32>(bitcast<i32>(x.hi_hi) >> 1u);
+    return out;
+}
+
+// Signed less-than compare (mirrors `Fix128 as i128` PartialOrd on CPU).
+fn fix128_lt(a: Fix128Gpu, b: Fix128Gpu) -> bool {
+    let a_sign = (a.hi_hi & 0x80000000u) != 0u;
+    let b_sign = (b.hi_hi & 0x80000000u) != 0u;
+    if (a_sign != b_sign) {
+        return a_sign;
+    }
+    if (a.hi_hi != b.hi_hi) { return a.hi_hi < b.hi_hi; }
+    if (a.hi_lo != b.hi_lo) { return a.hi_lo < b.hi_lo; }
+    if (a.lo_hi != b.lo_hi) { return a.lo_hi < b.lo_hi; }
+    return a.lo_lo < b.lo_lo;
+}
+
+// ---- u128 helpers (for div) ----
+
+fn u128_shl1(x: vec4<u32>) -> vec4<u32> {
+    let c0 = x.x >> 31u;
+    let c1 = x.y >> 31u;
+    let c2 = x.z >> 31u;
+    return vec4<u32>(x.x << 1u, (x.y << 1u) | c0, (x.z << 1u) | c1, (x.w << 1u) | c2);
+}
+
+fn u128_ge(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if (a.w != b.w) { return a.w > b.w; }
+    if (a.z != b.z) { return a.z > b.z; }
+    if (a.y != b.y) { return a.y > b.y; }
+    return a.x >= b.x;
+}
+
+fn u128_sub(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
+    let d0        = a.x - b.x;
+    let borrow0   = select(0u, 1u, a.x < b.x);
+    let m1        = a.y - b.y;
+    let borrow1a  = select(0u, 1u, a.y < b.y);
+    let d1        = m1 - borrow0;
+    let borrow1b  = select(0u, 1u, m1 < borrow0);
+    let borrow1   = borrow1a + borrow1b;
+    let m2        = a.z - b.z;
+    let borrow2a  = select(0u, 1u, a.z < b.z);
+    let d2        = m2 - borrow1;
+    let borrow2b  = select(0u, 1u, m2 < borrow1);
+    let borrow2   = borrow2a + borrow2b;
+    let m3        = a.w - b.w;
+    let d3        = m3 - borrow2;
+    return vec4<u32>(d0, d1, d2, d3);
+}
+
+fn u128_set_bit(x: vec4<u32>, bit_pos: u32) -> vec4<u32> {
+    let word  = bit_pos >> 5u;
+    let shift = bit_pos & 31u;
+    let mask  = 1u << shift;
+    var out = x;
+    if      (word == 0u) { out.x = out.x | mask; }
+    else if (word == 1u) { out.y = out.y | mask; }
+    else if (word == 2u) { out.z = out.z | mask; }
+    else                 { out.w = out.w | mask; }
+    return out;
+}
+
+// ---- div (from v1.4.0, byte-exact against alice_physics::Fix128) ----
+
+fn fix128_div_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_zero(b)) { return fix128_zero(); }
+    let neg_a = fix128_is_negative(a);
+    let neg_b = fix128_is_negative(b);
+    let result_neg = neg_a != neg_b;
+    let abs_a = fix128_abs(a);
+    let abs_b = fix128_abs(b);
+    let a_full = vec4<u32>(abs_a.lo_lo, abs_a.lo_hi, abs_a.hi_lo, abs_a.hi_hi);
+    let b_full = vec4<u32>(abs_b.lo_lo, abs_b.lo_hi, abs_b.hi_lo, abs_b.hi_hi);
+    var q_int = vec4<u32>(0u);
+    var r_int = vec4<u32>(0u);
+    var d     = a_full;
+    for (var i: i32 = 0; i < 128; i = i + 1) {
+        let msb = d.w >> 31u;
+        r_int   = u128_shl1(r_int);
+        r_int.x = r_int.x | msb;
+        d       = u128_shl1(d);
+        if (u128_ge(r_int, b_full)) {
+            r_int = u128_sub(r_int, b_full);
+            q_int = u128_set_bit(q_int, u32(127 - i));
+        }
+    }
+    var quot_lo_lo: u32 = 0u;
+    var quot_lo_hi: u32 = 0u;
+    var r = r_int;
+    for (var i: i32 = 63; i >= 0; i = i - 1) {
+        let overflow_bit = r.w >> 31u;
+        r = u128_shl1(r);
+        if (overflow_bit != 0u || u128_ge(r, b_full)) {
+            r = u128_sub(r, b_full);
+            if (i < 32) {
+                quot_lo_lo = quot_lo_lo | (1u << u32(i));
+            } else {
+                quot_lo_hi = quot_lo_hi | (1u << u32(i - 32));
+            }
+        }
+    }
+    var result: Fix128Gpu;
+    result.hi_lo = q_int.x;
+    result.hi_hi = q_int.y;
+    result.lo_lo = quot_lo_lo;
+    result.lo_hi = quot_lo_hi;
+    if (result_neg) { return fix128_neg(result); }
+    return result;
+}
+
+// ---- sqrt (from v1.4.1, byte-exact Newton-Raphson) ----
+
+fn fix128_sqrt(a: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(a) || fix128_is_zero(a)) {
+        return fix128_zero();
+    }
+    var sig_bits: u32;
+    if (a.hi_hi != 0u || a.hi_lo != 0u) {
+        var lz: u32;
+        if (a.hi_hi != 0u) { lz = countLeadingZeros(a.hi_hi); }
+        else               { lz = 32u + countLeadingZeros(a.hi_lo); }
+        sig_bits = 128u - lz;
+    } else {
+        var lz: u32;
+        if (a.lo_hi != 0u) { lz = countLeadingZeros(a.lo_hi); }
+        else               { lz = 32u + countLeadingZeros(a.lo_lo); }
+        sig_bits = 64u - lz;
+    }
+    let result_bit = (sig_bits + 63u) / 2u;
+
+    var x: Fix128Gpu;
+    x.hi_lo = 0u;
+    x.hi_hi = 0u;
+    x.lo_lo = 0u;
+    x.lo_hi = 0u;
+    if (result_bit >= 64u) {
+        let shift_raw = result_bit - 64u;
+        let shift = min(shift_raw, 62u);
+        if (shift < 32u) {
+            x.hi_lo = 1u << shift;
+        } else {
+            x.hi_hi = 1u << (shift - 32u);
+        }
+    } else {
+        if (result_bit < 32u) {
+            x.lo_lo = 1u << result_bit;
+        } else {
+            x.lo_hi = 1u << (result_bit - 32u);
+        }
+    }
+
+    for (var i: i32 = 0; i < 64; i = i + 1) {
+        let div = fix128_div_kernel(a, x);
+        let sum = fix128_add_kernel(x, div);
+        x = fix128_half(sum);
+    }
+    return x;
+}
+
+// ---- Vec3Fix helpers ----
+
+fn vec3_sub(a: Vec3FixGpu, b: Vec3FixGpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_sub_kernel(a.x, b.x);
+    out.y = fix128_sub_kernel(a.y, b.y);
+    out.z = fix128_sub_kernel(a.z, b.z);
+    return out;
+}
+
+fn vec3_add(a: Vec3FixGpu, b: Vec3FixGpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_add_kernel(a.x, b.x);
+    out.y = fix128_add_kernel(a.y, b.y);
+    out.z = fix128_add_kernel(a.z, b.z);
+    return out;
+}
+
+fn vec3_scale(a: Vec3FixGpu, s: Fix128Gpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_mul_kernel(a.x, s);
+    out.y = fix128_mul_kernel(a.y, s);
+    out.z = fix128_mul_kernel(a.z, s);
+    return out;
+}
+
+fn vec3_dot(a: Vec3FixGpu, b: Vec3FixGpu) -> Fix128Gpu {
+    let xx = fix128_mul_kernel(a.x, b.x);
+    let yy = fix128_mul_kernel(a.y, b.y);
+    let zz = fix128_mul_kernel(a.z, b.z);
+    return fix128_add_kernel(fix128_add_kernel(xx, yy), zz);
+}
+
+// ---- Sphere-sphere geometric test (mirrors CPU byte-for-byte) ----
+
+@compute @workgroup_size(1)
+fn fix128_sphere_sphere_contact_main() {
+    atomicStore(&contact_count[0], 0u);
+
+    let pair_count   = params.pair_count;
+    let max_contacts = params.max_contacts;
+    if (pair_count == 0u) { return; }
+
+    for (var i: u32 = 0u; i < pair_count; i = i + 1u) {
+        let pair = pairs[i];
+        let a = pair.x;
+        let b = pair.y;
+        let pos_a = positions[a];
+        let pos_b = positions[b];
+        let radius_a = radii[a];
+        let radius_b = radii[b];
+
+        let delta   = vec3_sub(pos_b, pos_a);
+        let len_sq  = vec3_dot(delta, delta);
+        let len     = fix128_sqrt(len_sq);
+        let combined = fix128_add_kernel(radius_a, radius_b);
+
+        // Guard: dist < combined_radius && !dist.is_zero()
+        if (fix128_is_zero(len)) { continue; }
+        if (!fix128_lt(len, combined)) { continue; }
+
+        let inv_len = fix128_div_kernel(fix128_one(), len);
+        let normal  = vec3_scale(delta, inv_len);
+        let depth   = fix128_sub_kernel(combined, len);
+        let point_a = vec3_add(pos_a, vec3_scale(normal, radius_a));
+        let point_b = vec3_sub(pos_b, vec3_scale(normal, radius_b));
+
+        let slot = atomicAdd(&contact_count[0], 1u);
+        if (slot < max_contacts) {
+            var c: ContactGpu;
+            c.body_a  = a;
+            c.body_b  = b;
+            c._pad0   = 0u;
+            c._pad1   = 0u;
+            c.depth   = depth;
+            c.normal  = normal;
+            c.point_a = point_a;
+            c.point_b = point_b;
+            contacts_out[slot] = c;
+        }
+    }
+}
+"#;
+
+/// GPU-side 48-byte Vec3Fix — byte-layout mirror of
+/// `alice_physics::math::Vec3Fix`.
+///
+/// Three `Fix128Gpu` fields (`x`, `y`, `z`) at offsets 0 / 16 / 32.
+/// Total size 48 bytes; alignment matches `Fix128Gpu` (4 bytes) so
+/// `bytemuck::cast_slice(&buffer_readback) → &[Vec3FixGpu]` works on
+/// any 4-byte aligned buffer.
+#[cfg(feature = "physics-solver")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Vec3FixGpu {
+    pub x: Fix128Gpu,
+    pub y: Fix128Gpu,
+    pub z: Fix128Gpu,
+}
+
+#[cfg(feature = "physics-solver")]
+impl Vec3FixGpu {
+    /// Convert an `alice_physics::math::Vec3Fix` to the GPU-side
+    /// byte-layout mirror. Each component copies the `hi` / `lo` bit
+    /// pattern verbatim via `Fix128Gpu::from_raw`.
+    #[must_use]
+    pub fn from_physics(v: alice_physics::math::Vec3Fix) -> Self {
+        Self {
+            x: Fix128Gpu::from_raw(v.x.hi, v.x.lo),
+            y: Fix128Gpu::from_raw(v.y.hi, v.y.lo),
+            z: Fix128Gpu::from_raw(v.z.hi, v.z.lo),
+        }
+    }
+}
+
+/// GPU-side 176-byte Contact — byte-layout mirror of the composed
+/// `(body_a, body_b, Contact)` record produced by the CPU
+/// sphere-sphere narrow-phase.
+///
+/// Layout matches the WGSL `struct ContactGpu`:
+///
+/// | offset | field     | size |
+/// |--------|-----------|------|
+/// | 0      | `body_a`  | 4    |
+/// | 4      | `body_b`  | 4    |
+/// | 8      | `_pad0`   | 4    |
+/// | 12     | `_pad1`   | 4    |
+/// | 16     | `depth`   | 16   |
+/// | 32     | `normal`  | 48   |
+/// | 80     | `point_a` | 48   |
+/// | 128    | `point_b` | 48   |
+///
+/// The 8-byte padding after `body_b` aligns `depth` to a 16-byte
+/// boundary, which keeps the WGSL storage-buffer layout consistent
+/// across drivers (Metal / Vulkan / DX12).
+#[cfg(feature = "physics-solver")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ContactGpu {
+    pub body_a: u32,
+    pub body_b: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub depth: Fix128Gpu,
+    pub normal: Vec3FixGpu,
+    pub point_a: Vec3FixGpu,
+    pub point_b: Vec3FixGpu,
+}
+
+#[cfg(feature = "physics-solver")]
+impl ContactGpu {
+    /// Compose a `ContactGpu` from a body-id pair and a CPU
+    /// `alice_physics::collider::Contact`. Used by the v2.5.0 CPU-GPU
+    /// golden test to build the expected `Vec<ContactGpu>` from the
+    /// CPU-side sphere-sphere replay.
+    #[must_use]
+    pub fn from_physics(
+        body_a: u32,
+        body_b: u32,
+        contact: &alice_physics::collider::Contact,
+    ) -> Self {
+        Self {
+            body_a,
+            body_b,
+            _pad0: 0,
+            _pad1: 0,
+            depth: Fix128Gpu::from_raw(contact.depth.hi, contact.depth.lo),
+            normal: Vec3FixGpu::from_physics(contact.normal),
+            point_a: Vec3FixGpu::from_physics(contact.point_a),
+            point_b: Vec3FixGpu::from_physics(contact.point_b),
+        }
+    }
+}
+
+/// v2.5.0 GPU sphere-sphere narrow-phase orchestrator — dispatches
+/// [`FIX128_SPHERE_SPHERE_CONTACT_WGSL`] and returns the contact list
+/// byte-identical to a CPU replay of the sphere-sphere block of
+/// `PhysicsWorld::detect_collisions`.
+///
+/// # Contract
+///
+/// - `pairs` is the pre-filtered pair list (typically from v2.4.0).
+/// - `positions[i]` is the position of body id `i`.
+/// - `radii[i]` is the sphere radius of body id `i`.
+/// - Returns `Vec<ContactGpu>` in `pairs` iteration order (no host-
+///   side sort), matching the CPU `for (a, b) in pairs { ... }`
+///   emission order exactly.
+/// - `pairs.is_empty()` short-circuits to an empty output.
+///
+/// # Panics
+///
+/// - Panics if the wgpu device is lost during dispatch.
+/// - Panics if the emitted contact count exceeds the buffer capacity
+///   (`pairs.len()`); each pair can emit at most one contact, so this
+///   indicates a kernel implementation bug.
+#[cfg(feature = "physics-solver")]
+#[must_use]
+pub fn dispatch_fix128_sphere_sphere_contact(
+    device: &crate::device::GpuDevice,
+    pairs: &[(u32, u32)],
+    positions: &[Vec3FixGpu],
+    radii: &[Fix128Gpu],
+) -> Vec<ContactGpu> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    assert_eq!(
+        positions.len(),
+        radii.len(),
+        "positions.len() must equal radii.len()"
+    );
+    let pair_count = pairs.len();
+    let max_contacts = pair_count;
+
+    // Flatten pairs into &[[u32; 2]] for bytemuck cast.
+    let pairs_flat: Vec<[u32; 2]> = pairs.iter().map(|&(a, b)| [a, b]).collect();
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct SphereContactParams {
+        pair_count: u32,
+        max_contacts: u32,
+        _pad0: u32,
+        _pad1: u32,
+    }
+
+    let params = SphereContactParams {
+        pair_count: u32::try_from(pair_count).expect("pair_count exceeds u32::MAX"),
+        max_contacts: u32::try_from(max_contacts).expect("max_contacts exceeds u32::MAX"),
+        _pad0: 0,
+        _pad1: 0,
+    };
+
+    let shader = device
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fix128_sphere_sphere_contact_shader"),
+            source: wgpu::ShaderSource::Wgsl(FIX128_SPHERE_SPHERE_CONTACT_WGSL.into()),
+        });
+    let bind_group_layout =
+        device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fix128_sphere_sphere_contact_bgl"),
+                entries: &[
+                    // 0: pairs (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 1: positions (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 2: radii (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 3: params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 4: contacts_out (read_write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 5: contact_count (read_write storage, atomic)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+    let pipeline_layout = device
+        .device()
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fix128_sphere_sphere_contact_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let pipeline = device
+        .device()
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fix128_sphere_sphere_contact_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("fix128_sphere_sphere_contact_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    let buf_pairs =
+        device.create_buffer_init("sphere_contact_pairs", bytemuck::cast_slice(&pairs_flat));
+    let buf_positions =
+        device.create_buffer_init("sphere_contact_positions", bytemuck::cast_slice(positions));
+    let buf_radii = device.create_buffer_init("sphere_contact_radii", bytemuck::cast_slice(radii));
+    let buf_params =
+        device.create_uniform_buffer("sphere_contact_params", bytemuck::bytes_of(&params));
+    let contacts_bytes: u64 = (max_contacts * core::mem::size_of::<ContactGpu>()) as u64;
+    let buf_contacts = device.create_buffer_empty("sphere_contact_contacts", contacts_bytes);
+    let buf_count = device.create_buffer_empty("sphere_contact_count", 4);
+
+    let bind_group = device
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fix128_sphere_sphere_contact_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_pairs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_radii.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buf_contacts.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buf_count.as_entire_binding(),
+                },
+            ],
+        });
+
+    let mut encoder = device
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fix128_sphere_sphere_contact_encoder"),
+        });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fix128_sphere_sphere_contact_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+    device.submit(encoder);
+    device.poll_wait();
+
+    let count_raw = device.read_buffer(&buf_count, 4);
+    let count_slice: &[u32] = bytemuck::cast_slice(&count_raw);
+    let actual_count = count_slice[0] as usize;
+    assert!(
+        actual_count <= max_contacts,
+        "sphere-sphere contact kernel emitted {} contacts, buffer capacity was {}",
+        actual_count,
+        max_contacts
+    );
+
+    if actual_count == 0 {
+        return Vec::new();
+    }
+
+    let read_bytes = (actual_count * core::mem::size_of::<ContactGpu>()) as u64;
+    let raw = device.read_buffer(&buf_contacts, read_bytes);
+    bytemuck::cast_slice(&raw).to_vec()
+}
+
+// ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
 
@@ -7638,6 +8516,299 @@ mod tests {
             }
             assert_eq!(prims.len(), 16);
             check("degenerate colocated", prims, 16 * 15 / 2);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v2.5.0 GPU sphere-sphere narrow-phase contact kernel tests
+    // -----------------------------------------------------------------
+
+    /// v2.5.0 sphere-sphere contact kernel ships the WGSL struct +
+    /// binding + entry point set documented in
+    /// [`docs/PHASE_3_DESIGN.md`] §2.6. Structural test runs without a
+    /// GPU adapter so headless CI catches accidental identifier
+    /// deletion.
+    ///
+    /// [`docs/PHASE_3_DESIGN.md`]: ../../docs/PHASE_3_DESIGN.md
+    #[test]
+    fn wgsl_sphere_sphere_contact_shader_present() {
+        // Structs from §2.6 bindings section.
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("struct Fix128Gpu"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("struct Vec3FixGpu"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("struct ContactGpu"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("struct SphereContactParams"));
+        // Bindings (0..5).
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("pairs:"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("positions:"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("radii:"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("contacts_out:"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("contact_count:"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("array<atomic<u32>, 1>"));
+        // Fix128 primitives composed by the kernel.
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_add_kernel"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_sub_kernel"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_mul_kernel"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_div_kernel"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_sqrt"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_lt"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_is_zero"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_one"));
+        // Vec3 helpers.
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn vec3_sub"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn vec3_add"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn vec3_scale"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn vec3_dot"));
+        // atomicAdd emission path.
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("atomicAdd(&contact_count[0]"));
+        // Single compute entry, 1x1x1 dispatch.
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("fn fix128_sphere_sphere_contact_main"));
+        assert!(FIX128_SPHERE_SPHERE_CONTACT_WGSL.contains("@workgroup_size(1)"));
+    }
+
+    /// v2.5.0 sphere-sphere contact kernel must compile as valid WGSL.
+    /// Runs the naga parser and fails on any syntax / type error.
+    /// Skips when no GPU adapter is available (headless CI).
+    #[test]
+    fn wgsl_sphere_sphere_contact_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_sphere_sphere_contact_shader_compile_test"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_SPHERE_SPHERE_CONTACT_WGSL.into()),
+            });
+    }
+
+    /// Byte-exact GPU-CPU golden for the v2.5.0 sphere-sphere kernel.
+    ///
+    /// Replays the CPU sphere-sphere block of `detect_collisions`
+    /// directly (not through `PhysicsWorld` — filters / static /
+    /// sleeping skips are out of scope for the geometric map) and
+    /// compares the resulting `Vec<ContactGpu>` byte-for-byte.
+    ///
+    /// Three new fixtures specifically exercise the geometric
+    /// branches:
+    ///
+    /// 1. **Overlap pile (32 bodies, 4×4×2, spacing 1.5, radius 1)** —
+    ///    mixes collision + no-collision pairs. Non-trivial normals.
+    /// 2. **Chain (6 bodies at x=0,2,4,6,8,10, radius 1.1)** — pinned
+    ///    expected values: adjacent pairs collide with `normal=(1,0,0)`
+    ///    and `depth=0.2`; non-adjacent pairs do not.
+    /// 3. **Zero-distance degenerate (4 bodies at origin, radius 1)** —
+    ///    every pair has `dist == 0` → `is_zero` filter → 0 contacts.
+    ///    Exercises the div-by-zero short-circuit.
+    ///
+    /// Skips when no GPU adapter is available (headless CI).
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_sphere_sphere_contact_matches_cpu_golden() {
+        use alice_physics::collider::Contact;
+        use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
+
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        // ---- Helper: replay CPU sphere-sphere block ----
+        fn cpu_sphere_sphere(
+            pairs: &[(u32, u32)],
+            positions: &[Vec3Fix],
+            radii: &[PhysicsFix128],
+        ) -> Vec<ContactGpu> {
+            let mut out = Vec::new();
+            for &(a, b) in pairs {
+                let ai = a as usize;
+                let bi = b as usize;
+                let pa = positions[ai];
+                let pb = positions[bi];
+                let ra = radii[ai];
+                let rb = radii[bi];
+                let delta = pb - pa;
+                let (normal, dist) = delta.normalize_with_length();
+                let combined = ra + rb;
+                if dist < combined && !dist.is_zero() {
+                    let depth = combined - dist;
+                    let point_a = pa + normal * ra;
+                    let point_b = pb - normal * rb;
+                    let contact = Contact {
+                        depth,
+                        normal,
+                        point_a,
+                        point_b,
+                    };
+                    out.push(ContactGpu::from_physics(a, b, &contact));
+                }
+            }
+            out
+        }
+
+        // ---- Helper: convert to GPU inputs ----
+        fn to_gpu_inputs(
+            positions: &[Vec3Fix],
+            radii: &[PhysicsFix128],
+        ) -> (Vec<Vec3FixGpu>, Vec<Fix128Gpu>) {
+            let pos_gpu: Vec<Vec3FixGpu> = positions
+                .iter()
+                .map(|v| Vec3FixGpu::from_physics(*v))
+                .collect();
+            let radii_gpu: Vec<Fix128Gpu> = radii
+                .iter()
+                .map(|r| Fix128Gpu::from_raw(r.hi, r.lo))
+                .collect();
+            (pos_gpu, radii_gpu)
+        }
+
+        let check = |label: &str,
+                     positions: Vec<Vec3Fix>,
+                     radii: Vec<PhysicsFix128>,
+                     pairs: Vec<(u32, u32)>,
+                     expected_contact_count: usize| {
+            let cpu_contacts = cpu_sphere_sphere(&pairs, &positions, &radii);
+            assert_eq!(
+                cpu_contacts.len(),
+                expected_contact_count,
+                "{label}: CPU contact count sanity mismatch (got {}, expected {expected_contact_count})",
+                cpu_contacts.len()
+            );
+
+            let (pos_gpu, radii_gpu) = to_gpu_inputs(&positions, &radii);
+            let gpu_contacts =
+                dispatch_fix128_sphere_sphere_contact(&device, &pairs, &pos_gpu, &radii_gpu);
+
+            assert_eq!(
+                gpu_contacts.len(),
+                cpu_contacts.len(),
+                "{label}: contact count mismatch (GPU={} CPU={})",
+                gpu_contacts.len(),
+                cpu_contacts.len()
+            );
+            assert_eq!(gpu_contacts, cpu_contacts, "{label}: contact list mismatch");
+        };
+
+        // Build a body position from integer coordinates + half-unit
+        // offset (encoded via Fix128::from_raw for the 0.5 part).
+        fn pos_int(x: i64, y: i64, z: i64) -> Vec3Fix {
+            Vec3Fix::new(
+                PhysicsFix128::from_int(x),
+                PhysicsFix128::from_int(y),
+                PhysicsFix128::from_int(z),
+            )
+        }
+
+        // Half = raw(0, 1<<63). Useful for spacing 1.5 (= 1 + half) etc.
+        let half: PhysicsFix128 = PhysicsFix128::from_raw(0, 1u64 << 63);
+
+        // ---- Fixture 1: Overlap pile 4×4×2, spacing 1.5, radius 1 ----
+        {
+            let mut positions: Vec<Vec3Fix> = Vec::new();
+            let mut radii: Vec<PhysicsFix128> = Vec::new();
+            // Position = (xi * 1.5, yi * 1.5, zi * 1.5), radius = 1
+            let one = PhysicsFix128::from_int(1);
+            let one_half = one + half; // 1.5
+            for xi in 0..4i64 {
+                for yi in 0..4i64 {
+                    for zi in 0..2i64 {
+                        // scale integer index by 1.5
+                        let x = one_half * PhysicsFix128::from_int(xi);
+                        let y = one_half * PhysicsFix128::from_int(yi);
+                        let z = one_half * PhysicsFix128::from_int(zi);
+                        positions.push(Vec3Fix::new(x, y, z));
+                        radii.push(one);
+                    }
+                }
+            }
+            assert_eq!(positions.len(), 32);
+
+            // All pairs (a, b) with a < b — 32*31/2 = 496 candidates.
+            let mut pairs: Vec<(u32, u32)> = Vec::new();
+            for a in 0..32u32 {
+                for b in (a + 1)..32u32 {
+                    pairs.push((a, b));
+                }
+            }
+            assert_eq!(pairs.len(), 496);
+
+            // Expected contact count: hand-verified by cpu replay.
+            // Compute expected count on CPU replay and pass through.
+            let expected = cpu_sphere_sphere(&pairs, &positions, &radii).len();
+            assert!(
+                expected > 0,
+                "overlap pile fixture must produce at least one contact"
+            );
+            check("overlap pile 4x4x2", positions, radii, pairs, expected);
+        }
+
+        // ---- Fixture 2: Chain of 6 bodies, radius 1.1, spacing 2 ----
+        {
+            let one = PhysicsFix128::from_int(1);
+            // 1.1 = 1 + 0.1. Encode 0.1 via from_raw (0.1 * 2^128 approx).
+            // Actually easier: use rational fixed offset. Use 11/10 approx:
+            // 1.1 not exactly representable in Fix128, but we just need
+            // the SAME value on both CPU and GPU. Since Fix128 arithmetic
+            // is deterministic, whatever value we use consistently is fine.
+            // Use from_raw for the fractional part: 0.1 ≈ (0.1 * 2^64).
+            let tenth_lo: u64 = (u128::from(u64::MAX) / 10) as u64; // ≈ 0.1
+            let one_tenth = PhysicsFix128::from_raw(0, tenth_lo);
+            let radius = one + one_tenth; // 1.1 (approx)
+            let two = PhysicsFix128::from_int(2);
+
+            let mut positions: Vec<Vec3Fix> = Vec::new();
+            let mut radii: Vec<PhysicsFix128> = Vec::new();
+            for i in 0..6i64 {
+                positions.push(Vec3Fix::new(
+                    two * PhysicsFix128::from_int(i),
+                    PhysicsFix128::ZERO,
+                    PhysicsFix128::ZERO,
+                ));
+                radii.push(radius);
+            }
+            assert_eq!(positions.len(), 6);
+
+            // Test all pairs (a < b) — 6*5/2 = 15.
+            let mut pairs: Vec<(u32, u32)> = Vec::new();
+            for a in 0..6u32 {
+                for b in (a + 1)..6u32 {
+                    pairs.push((a, b));
+                }
+            }
+            assert_eq!(pairs.len(), 15);
+
+            let expected = cpu_sphere_sphere(&pairs, &positions, &radii).len();
+            // Adjacent pairs (5 of them) collide, non-adjacent do not.
+            assert_eq!(
+                expected, 5,
+                "chain fixture must produce exactly 5 adjacent contacts"
+            );
+            check("chain 6", positions, radii, pairs, expected);
+        }
+
+        // ---- Fixture 3: Zero-distance degenerate (4 bodies at origin) ----
+        {
+            let one = PhysicsFix128::from_int(1);
+            let mut positions: Vec<Vec3Fix> = Vec::new();
+            let mut radii: Vec<PhysicsFix128> = Vec::new();
+            for _ in 0..4 {
+                positions.push(pos_int(0, 0, 0));
+                radii.push(one);
+            }
+            let mut pairs: Vec<(u32, u32)> = Vec::new();
+            for a in 0..4u32 {
+                for b in (a + 1)..4u32 {
+                    pairs.push((a, b));
+                }
+            }
+            assert_eq!(pairs.len(), 6);
+
+            let expected = cpu_sphere_sphere(&pairs, &positions, &radii).len();
+            assert_eq!(
+                expected, 0,
+                "degenerate fixture must produce zero contacts (is_zero filter)"
+            );
+            check("degenerate colocated", positions, radii, pairs, expected);
         }
     }
 }

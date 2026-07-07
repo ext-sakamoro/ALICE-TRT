@@ -290,6 +290,99 @@ Under `#[cfg(debug_assertions)]`, the Rust adapter reads `counters[1]` and panic
 
 Any overflow means the tree has a backward or self-referential escape pointer that slipped through v2.3.0's `debug_verify_escape_forward` check — an escalated bug report, not a benign fixture.
 
+### 2.6 v2.5.0 scope (upcoming: sphere-sphere narrow-phase contact kernel)
+
+The v2.5.0 release ships the **GPU sphere-sphere narrow-phase contact kernel** — a pure geometric map from `(pairs, positions, radii)` to a `Vec<ContactGpu>` list, byte-identical to the corresponding stanza of `alice_physics::solver::PhysicsWorld::detect_collisions` (the sphere-sphere `delta.normalize_with_length()` → depth/normal/point_a/point_b block) on the CPU. This closes the broad-phase → narrow-phase pipeline; v2.6.0 will consume this contact list for the GPU PGS solve.
+
+#### Scope carve-out — geometric map only
+
+The CPU `detect_collisions` mixes several concerns:
+
+1. Filter check (`CollisionFilter::can_collide`) using per-body bit masks.
+2. Static-static skip (`bodies[a].is_static() && bodies[b].is_static()`).
+3. Both-sleeping skip (`islands.is_sleeping(a) && islands.is_sleeping(b)`).
+4. **Sphere-sphere geometric test** (delta, length, depth, normal, point_a, point_b).
+5. Event reporting, wake-on-contact, sensor branching, material-parameterised constraint construction.
+
+Only stage 4 is a pure `Vec3Fix` / `Fix128` numeric map that admits a clean GPU port. Stages 1-3 depend on per-body state (filter masks, motion type flags, island sleep bits) that lives on the CPU and would drag in a much wider bind-group surface; stage 5 is a CPU-orchestrated fanout of side effects (event bus, ledger, cache write). The v2.5.0 GPU kernel accepts a pre-filtered `pairs` list from the caller (typically the v2.4.0 output, possibly post-filtered on CPU) and emits contacts strictly for the geometric map. The caller re-applies stage 5 on the readback.
+
+This mirrors the same scope decision as the v1.6.0 batched rigid-rod projection: GPU handles the deterministic numeric hot path, CPU handles the state-dependent orchestration.
+
+#### Algorithm — CPU parity per-pair test
+
+Per pair `(a, b)` from the input list:
+
+```rust
+let delta = positions[b] - positions[a];                    // 3× Fix128 sub
+let (normal, dist) = delta.normalize_with_length();         // 3× mul + 2× add + 1× sqrt + 1× div + 3× mul
+let combined_radius = radii[a] + radii[b];                  // 1× add
+if dist < combined_radius && !dist.is_zero() {              // lt + is_zero
+    let depth = combined_radius - dist;                     // 1× sub
+    let point_a = positions[a] + normal * radii[a];         // 3× mul + 3× add
+    let point_b = positions[b] - normal * radii[b];         // 3× mul + 3× sub
+    emit Contact { body_a: a, body_b: b, depth, normal, point_a, point_b };
+}
+```
+
+`Vec3Fix::normalize_with_length` expands to `length_squared = dot(delta, delta); len = length_squared.sqrt(); inv_len = ONE / len; (delta * inv_len, len)`, which is what the WGSL port composes byte-for-byte from the certified v0.3.0 (add/sub/mul), v1.4.0 (div), and v1.4.1 (sqrt) primitives inlined per the house style. Total ~19 Fix128 ops per pair: 7 sub / 6 add / 12 mul / 1 div / 1 sqrt / 1 lt / 1 is_zero.
+
+#### Bindings (v2.5.0 layout — frozen at this release)
+
+- `@group(0) @binding(0) var<storage, read>       pairs:         array<vec2<u32>>` — pre-filtered pair list. Typically the v2.4.0 output, but the kernel treats each element as an independent geometric test — the caller is free to inject synthetic pairs (e.g., persistent-manifold hints from the contact cache).
+- `@group(0) @binding(1) var<storage, read>       positions:     array<Vec3FixGpu>` — per-body position. Element `i` corresponds to body id `i`; the pair `(a, b)` indexes this array directly.
+- `@group(0) @binding(2) var<storage, read>       radii:         array<Fix128Gpu>` — per-body sphere radius. Same indexing as `positions`.
+- `@group(0) @binding(3) var<uniform>             params:        SphereContactParams` — `{ pair_count: u32, max_contacts: u32, _pad0: u32, _pad1: u32 }` (16-byte aligned).
+- `@group(0) @binding(4) var<storage, read_write> contacts_out:  array<ContactGpu>` — output contacts. Element `i` = `{ body_a, body_b, depth, normal, point_a, point_b }`.
+- `@group(0) @binding(5) var<storage, read_write> contact_count: array<atomic<u32>, 1>` — emitted contact count, incremented by the single-thread dispatch via `atomicAdd` for buffer-layout consistency (see v2.4.0 §2.5 rationale).
+
+Where `Vec3FixGpu { x: Fix128Gpu, y: Fix128Gpu, z: Fix128Gpu }` (48 bytes) and `ContactGpu { body_a: u32, body_b: u32, _pad0: u32, _pad1: u32, depth: Fix128Gpu, normal: Vec3FixGpu, point_a: Vec3FixGpu, point_b: Vec3FixGpu }` (176 bytes, 16-byte aligned at the `depth` field).
+
+#### CPU golden strategy
+
+The v2.5.0 golden replays the CPU sphere-sphere block directly rather than driving `PhysicsWorld::detect_collisions` (which entangles the stage 1-3 filters). This isolates the geometric map for byte-exact comparison:
+
+```rust
+let mut cpu_contacts: Vec<ContactGpu> = Vec::new();
+for &(a, b) in &pairs {
+    let pa = positions_physics[a as usize];
+    let pb = positions_physics[b as usize];
+    let ra = radii_physics[a as usize];
+    let rb = radii_physics[b as usize];
+    let delta = pb - pa;
+    let (normal, dist) = delta.normalize_with_length();
+    let combined = ra + rb;
+    if dist < combined && !dist.is_zero() {
+        let depth = combined - dist;
+        let point_a = pa + normal * ra;
+        let point_b = pb - normal * rb;
+        cpu_contacts.push(ContactGpu {
+            body_a: a, body_b: b, _pad0: 0, _pad1: 0,
+            depth: depth.into(), normal: normal.into(),
+            point_a: point_a.into(), point_b: point_b.into(),
+        });
+    }
+}
+
+let gpu_contacts = dispatch_fix128_sphere_sphere_contact(&device, &pairs, &positions_gpu, &radii_gpu);
+assert_eq!(gpu_contacts, cpu_contacts);   // byte-exact
+```
+
+Both sides emit in `pairs` iteration order (no host-side sort), so the byte-exact assert covers ordering as well as per-field content.
+
+#### Edge cases covered by the v2.5.0 fixture
+
+Three new fixtures specifically exercise the geometric branches:
+
+1. **Overlap pile (32 bodies, 4×4×2 grid, spacing 1.5, radius 1)** — face-adjacent pairs at distance 1.5 collide (sum radius 2.0 > 1.5); face-diagonal pairs at distance ≈2.12 do not. Exercises both the collision and no-collision paths, plus non-trivial normal directions.
+2. **Chain (6 bodies at x = 0, 2, 4, 6, 8, 10, radius 1.1)** — adjacent pairs at distance 2 collide (sum 2.2 > 2); non-adjacent pairs do not. Every collision has `normal = (1, 0, 0)` and `depth = 0.2`, which pins the byte-exact expected values.
+3. **Zero-distance degenerate (4 bodies all at origin, radius 1)** — every pair has `dist == 0` and is filtered out by the `!dist.is_zero()` guard. Zero contacts emitted; exercises the `is_zero` short-circuit that would otherwise divide by zero in `inv_len = ONE / dist`.
+
+Every fixture asserts `assert_eq!(gpu_contacts, cpu_contacts)` on the full `Vec<ContactGpu>` (each 176 bytes) via `#[derive(PartialEq, Eq)]`.
+
+#### Kernel size + house style
+
+The v2.5.0 shader inlines every Fix128 primitive it needs — add / sub / mul / div / sqrt / lt / is_zero / half / neg / abs / u64 + u128 helpers — plus the `Vec3FixGpu` / `ContactGpu` structs plus the sphere-sphere composition. Estimated ~500 lines total, matching the Phase 2 batched rigid-rod kernel weight class. This is deliberate: the WGSL "no include" constraint means every shader is standalone, and copying certified primitives keeps each kernel independently auditable without cross-shader coupling.
+
 ## §3 Determinism Invariants
 
 Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogued in the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill:
