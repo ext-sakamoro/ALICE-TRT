@@ -587,6 +587,7 @@ alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
 | Fix128 GPU sphere-sphere contact (Phase 3 §5) | v2.5.0 | `FIX128_SPHERE_SPHERE_CONTACT_WGSL` + `dispatch_fix128_sphere_sphere_contact` |
 | Fix128 GPU PGS contact solve (Phase 3 §6) | v2.6.0 | `FIX128_PGS_CONTACT_SOLVE_WGSL` + `dispatch_fix128_pgs_contact_solve` + `TrtSolverAdapter::dispatch_contact_solve_iteration` |
 | GpuSolverBridge trait integration (Phase 3 §7) | v2.7.0 | `send_contact_constraints` / `send_body_state` / `dispatch_contact_solve_iteration` / `recv_contact_constraints` / `recv_body_positions` on `TrtSolverAdapter` (via alice-physics v0.9.0 `GpuSolverBridge` extension) |
+| PhysicsWorld helper API (Phase 3 §8) | v2.7.1 | `world.step_with_bridge(&mut adapter, dt)` / `substep_with_bridge` / `solve_contact_constraints_with_bridge` (via alice-physics v0.10.0 helper methods) — one-line GPU offload for `PhysicsWorld` step loops with byte-exact CPU parity |
 
 CPU-side `Fix128Gpu` also exposes `sqrt` (v1.0.1, delegates to `alice_physics::Fix128::sqrt`) and `div` (v1.0.6) for host precompute paths. The v1.1.0 single-constraint uniform variant (`FIX128_PGS_PROJECT_DISTANCE_WGSL`) was deprecated in v1.7.0 and removed in v2.0.0; external `Fix128GpuKernel` implementers should migrate to the rigid-rod or batched shader listed above.
 

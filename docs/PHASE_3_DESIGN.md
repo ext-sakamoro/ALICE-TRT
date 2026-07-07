@@ -630,6 +630,85 @@ Deeper wire-through — where `PhysicsWorld::solve_contact_constraints` on the C
 
 Each item is a scoped chunk on its own but the composition is a larger undertaking than the trait-extension-only v2.7.0. Scheduling the wire-through as v2.8.0 preserves the v2.7.0 release cadence and keeps the trait-object interface stable while the deeper integration is validated separately.
 
+### 2.9 v2.8.0 realisation — `PhysicsWorld` helper API via alice-physics v0.10.0 (alice-trt v2.7.1 patch)
+
+The v2.8.0 milestone — the promised `PhysicsWorld` wire-through — ships not as a further alice-trt kernel or type but as three new **public methods on `alice_physics::solver::PhysicsWorld`** in alice-physics v0.10.0, plus this alice-trt v2.7.1 patch release that documents the integration and picks up the new alice-physics version. No code changes on the alice-trt side; the existing v2.7.0 `TrtSolverAdapter` implements `GpuSolverBridge` byte-exactly, and the alice-physics helper methods accept any `&mut dyn GpuSolverBridge`, so the integration composes out-of-the-box.
+
+#### Design decision — helper method vs boxed field
+
+The v2.7.0 CHANGELOG "Next up" section originally floated the design of adding an `Option<Box<dyn GpuSolverBridge + Send + Sync>>` field on `PhysicsWorld` so `step(dt)` would auto-route contact solve through the GPU. The v2.8.0 investigation surfaced two blockers:
+
+1. **`TrtSolverAdapter<'a>` lifetime**: currently borrows `&'a GpuDevice`. Storing in `Box<dyn ... + 'static>` requires either (a) dropping the lifetime by owning `Arc<GpuDevice>` (breaking change → alice-trt v3.0.0) or (b) propagating the lifetime to `PhysicsWorld<'a>` (breaking change to every downstream `PhysicsWorld` consumer). Both are MAJOR-version-scale refactors.
+2. **`Send + Sync` bound analysis**: wgpu resources are `Send + Sync` from wgpu 0.7+, but confirming the bound is satisfied across the Metal / Vulkan / DX12 CI matrix requires additional infrastructure.
+
+The chosen alternative — a helper-method pattern where the bridge is passed by `&mut B` per call — sidesteps both blockers cleanly:
+
+- The borrow lives only for the method call duration, so no lifetime or `Send + Sync` bound needs to be imposed on `PhysicsWorld`.
+- `TrtSolverAdapter<'a>` stays exactly as it is in v2.7.0 (no breaking change).
+- Callers who want GPU-accelerated contact solve write a one-line change:
+  ```rust
+  // Before (CPU-only):
+  world.step(dt);
+  // After (bridge-routed):
+  world.step_with_bridge(&mut adapter, dt);
+  ```
+
+This trades "implicit auto-routing" for "explicit control", which matches the ALICE-* API design principle already established by `TrtSolverAdapter::set_parallel_dispatch(bool)` (opt-in toggle vs auto-detection). A future MAJOR release (alice-trt v3.0.0 candidate with `TrtSolverAdapter` refactored to own `Arc<GpuDevice>`) can revisit the field-based auto-routing.
+
+#### `PhysicsWorld` helper methods (alice-physics v0.10.0)
+
+Three additive methods, all cfg-gated `#[cfg(feature = "std")]`:
+
+- `solve_contact_constraints_with_bridge<B: GpuSolverBridge + ?Sized>(&mut self, bridge: &mut B)` — run one PGS contact-solve iteration through the bridge. Applies Stage A (sensor filter, pre-solve hooks, contact modifiers) on the CPU upfront to produce a filtered constraint list; uploads that list plus per-body positions + inverse masses via `bridge.send_contact_constraints` and `bridge.send_body_state`; dispatches via `bridge.dispatch_contact_solve_iteration`; reads back via `bridge.recv_contact_constraints` and `bridge.recv_body_positions`; writes updates into `self.contact_constraints[slot].cached_lambda` (via an index map) and `self.bodies[i].position`.
+- `substep_with_bridge<B: GpuSolverBridge + ?Sized>(&mut self, bridge: &mut B, dt: Fix128)` — one substep with bridge-routed contact solve. Integrate + distance + joint + velocity-update stay on the CPU; only the inner PGS contact-solve iterations use the bridge. Semantically equivalent to the private `substep(dt)` with `solve_contact_constraints(dt)` replaced.
+- `step_with_bridge<B: GpuSolverBridge + ?Sized>(&mut self, bridge: &mut B, dt: Fix128)` — full simulation step with bridge-routed contact solve. Mirrors `step(dt)` phase-for-phase (phase 0 event lifecycle + clear contacts, phase 0.5 island rebuild, phase 1 force fields, phase 2 collision detection, phase 3 substep loop via `substep_with_bridge`, phase 4 sleep update, phase 5 event end). Enables the shortest opt-in path — one line change from `step` to `step_with_bridge`.
+
+#### Byte-exact CPU parity
+
+Preserved by:
+
+1. **Stage A closures are pure functions of their inputs** — pre-solve hooks receive `(body_a_id, body_b_id, &contact)` and contact modifiers receive `(body_a_id, body_b_id, &mut contact, &mut friction, &mut restitution)`. Neither closure gets live body state that changes during the loop, so batched upfront application in `solve_contact_constraints_with_bridge` produces the same filter / mutation result as the CPU's per-constraint interleaved application inside `solve_contact_constraints`.
+2. **Stage B is routed through the bridge**, which every ALICE-TRT `TrtSolverAdapter` release since v2.6.0 asserts byte-exact vs CPU on the 3-platform CI matrix.
+
+The alice-trt v2.7.1 patch adds three tests at the `PhysicsWorld` level to confirm the CPU-parity contract end-to-end:
+
+- `physics_world_step_with_bridge_matches_cpu_step_byte_exact` — chain 6 fixture (6 bodies at x = 0, 2, 4, 6, 8, 10, radius 1.1, all dynamic), one 60Hz `step_with_bridge` vs one CPU `step(dt)`, asserts every body's position + velocity byte-exact + every constraint's `cached_lambda` byte-exact.
+- `physics_world_step_with_bridge_10_frames_matches_cpu_reference` — 10 consecutive frames, asserts byte-exact match every frame (validates that multi-frame state — body positions, cached_lambda warm-start accumulation, sleep state — stays lock-step with the CPU reference across the pipeline).
+- `physics_world_step_with_bridge_no_contacts_matches_cpu` — two bodies far apart, no collisions, verifies the `filtered.is_empty()` early-return path in `solve_contact_constraints_with_bridge` produces state byte-identical to the CPU pipeline's skip.
+
+#### alice-trt v2.7.1 patch scope
+
+alice-trt v2.7.1 is a documentation + version-bump patch release:
+
+- Bumps `Cargo.toml` version 2.7.0 → 2.7.1 to signal the alice-physics dependency upgrade to v0.10.0.
+- Documents the v2.8.0 realisation in `docs/PHASE_3_DESIGN.md` §2.9 (this section) and `CHANGELOG.md`.
+- No alice-trt code changes: the existing v2.7.0 `impl GpuSolverBridge for TrtSolverAdapter<'_>` is exactly what the alice-physics helper methods consume.
+- Adds three tests inside `physics_bridge.rs` `mod tests` that verify byte-exact CPU parity at the `PhysicsWorld` level via `step_with_bridge`.
+
+#### Phase 3 completion status (with v2.8.0)
+
+The Phase 3 GPU BVH → narrow-phase → PGS solve pipeline is now fully integrated end-to-end:
+
+```text
+Vec<BvhPrimitive>
+   ↓ (v2.2.0) dispatch_fix128_morton_sort
+sorted (codes, indices)
+   ↓ (v2.3.0) dispatch_fix128_bvh_build
+Vec<BvhNodeGpu>
+   ↓ (v2.4.0) dispatch_fix128_bvh_find_pairs
+Vec<(u32, u32)>
+   ↓ (v2.5.0) dispatch_fix128_sphere_sphere_contact
+Vec<ContactGpu>
+   ↓ (host: compose ContactConstraintGpu with friction/restitution/cached_lambda)
+Vec<ContactConstraintGpu>
+   ↓ (v2.6.0) dispatch_fix128_pgs_contact_solve
+updated body positions + cached_lambda warm-start state
+   ↑ (v2.7.0) exposed via `GpuSolverBridge` trait extension in alice-physics v0.9.0
+   ↑ (v2.8.0) routed through `PhysicsWorld::step_with_bridge` helper in alice-physics v0.10.0
+```
+
+Every stage passes a byte-exact CPU-GPU golden on Metal / Vulkan lavapipe / DX12 WARP (kernel-level tests, alice-trt CI matrix), and every stage passes a byte-exact CPU-parity test at the `PhysicsWorld` level (integration test, alice-trt physics-solver feature). Phase 3 GPU physics offload is complete.
+
 ## §3 Determinism Invariants
 
 Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogued in the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill:

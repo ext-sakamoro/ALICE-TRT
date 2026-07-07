@@ -2,6 +2,58 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.7.1] - 2026-07-07
+
+### Added — v2.8.0 milestone realisation via alice-physics v0.10.0 helper methods (Phase 3 §8)
+
+Documentation + version-bump patch release that picks up the alice-physics v0.10.0 dependency upgrade. **No alice-trt code changes** — the existing v2.7.0 `impl GpuSolverBridge for TrtSolverAdapter<'_>` is exactly what the new alice-physics `PhysicsWorld` helper methods consume out-of-the-box.
+
+alice-physics v0.10.0 ships three additive public methods on `PhysicsWorld`:
+
+- `PhysicsWorld::solve_contact_constraints_with_bridge<B: GpuSolverBridge + ?Sized>(&mut self, bridge: &mut B)` — one PGS contact-solve iteration via bridge.
+- `PhysicsWorld::substep_with_bridge<B: GpuSolverBridge + ?Sized>(&mut self, bridge: &mut B, dt: Fix128)` — one substep with bridge-routed contact solve.
+- `PhysicsWorld::step_with_bridge<B: GpuSolverBridge + ?Sized>(&mut self, bridge: &mut B, dt: Fix128)` — full simulation step with bridge-routed contact solve.
+
+Callers get GPU-accelerated contact solve with a one-line change:
+
+```rust
+// Before (v2.7.0 / CPU-only step):
+world.step(dt);
+
+// After (v2.7.1 with alice-physics v0.10.0):
+let mut adapter = TrtSolverAdapter::new(&device);
+world.step_with_bridge(&mut adapter, dt);
+```
+
+### Design realisation — helper method vs boxed field
+
+The v2.7.0 CHANGELOG "Next up" section originally floated storing an `Option<Box<dyn GpuSolverBridge + Send + Sync>>` field on `PhysicsWorld`. The v2.8.0 investigation surfaced two blockers that would have required a MAJOR version bump on alice-trt (`TrtSolverAdapter<'a>` lifetime propagation to owned `Arc<GpuDevice>`, plus `Send + Sync` bound analysis across the CI matrix). The helper-method pattern used in alice-physics v0.10.0 sidesteps both — the bridge is passed by `&mut B` per call, so the borrow lives only for the method duration and no lifetime/`Send + Sync` bound is imposed on `PhysicsWorld`. `TrtSolverAdapter<'a>` stays exactly as it is in v2.7.0 (no breaking change), and the alice-trt semver stability posture (v2.x-only, no v3.0.0) is preserved. See `docs/PHASE_3_DESIGN.md` §2.9 for the full design discussion.
+
+### Tests (v2.7.1 additions in alice-trt physics_bridge.rs)
+
+- `physics_world_step_with_bridge_matches_cpu_step_byte_exact` — **byte-exact CPU parity at the `PhysicsWorld` level** on a chain 6 fixture (6 bodies at x = 0, 2, 4, 6, 8, 10, radius 1.1, all dynamic). Runs one 60Hz `world.step_with_bridge(&mut adapter, dt)` on a bridge-routed world, one `world.step(dt)` on an identical CPU-only world, asserts every body's position + velocity + every constraint's `cached_lambda` byte-exact.
+- `physics_world_step_with_bridge_10_frames_matches_cpu_reference` — 10 consecutive frames, asserts byte-exact match every frame. Validates that multi-frame state (positions, cached_lambda warm-start accumulation, sleep state) stays lock-step with the CPU reference across the pipeline.
+- `physics_world_step_with_bridge_no_contacts_matches_cpu` — two bodies far apart, no collisions, verifies the `filtered.is_empty()` early-return in `solve_contact_constraints_with_bridge` produces state byte-identical to the CPU pipeline.
+
+Total 218 lib tests (previously 215), all pass on macOS Metal.
+
+### Design doc
+
+- **`docs/PHASE_3_DESIGN.md` §2.9** — full v2.8.0 realisation writeup: helper method vs boxed field design decision, `PhysicsWorld` helper method contracts, byte-exact CPU parity proof (Stage A closures are pure functions of inputs so batched upfront application is equivalent to interleaved), Phase 3 completion diagram showing the full pipeline exposed through `PhysicsWorld::step_with_bridge`.
+
+### Backwards compatibility
+
+Fully additive vs v2.7.0. No alice-trt API changes — the existing v2.7.0 public surface is unchanged. Callers who don't opt in to the new `PhysicsWorld::step_with_bridge` continue to work exactly as in v2.7.0. Alice-physics dependency is bumped to v0.10.0 (from v0.9.0) via the path-dep `Cargo.toml` declaration; the v0.10.0 release is source-compatible with v0.9.x (adds new methods without touching existing ones).
+
+### Phase 3 completion status
+
+With alice-physics v0.10.0 + alice-trt v2.7.1, the Phase 3 GPU BVH → narrow-phase → PGS solve pipeline is fully integrated end-to-end and callable via a single `PhysicsWorld::step_with_bridge` invocation. Every stage passes a byte-exact CPU-GPU golden on Metal / Vulkan lavapipe / DX12 WARP (kernel-level tests on the alice-trt CI matrix), and every stage passes a byte-exact CPU-parity test at the `PhysicsWorld` level (integration test, alice-trt physics-solver feature). **Phase 3 GPU physics offload is complete.**
+
+### Next up
+
+- **v3.0.0 candidate (breaking)** — refactor `TrtSolverAdapter<'a>` to own `Arc<GpuDevice>`. Enables an `Option<Box<dyn GpuSolverBridge + Send + Sync>>` field on `PhysicsWorld` (alice-physics future release) so `world.step(dt)` auto-routes when a bridge is attached. Removes the need for `step_with_bridge` in the common case. Not scheduled — the current explicit-control API pattern is sufficient for the ALICE-* use case and matches other opt-in toggles (`TrtSolverAdapter::set_parallel_dispatch(bool)`).
+- **v2.7.x candidate** — parallel Gauss-Seidel via graph colouring for the PGS contact solve (analog of v1.5.1's batched distance-constraint dispatch, adapted for contact solve). Requires fresh determinism analysis and a colour-aware CPU golden before shipping.
+
 ## [2.7.0] - 2026-07-07
 
 ### Added — `GpuSolverBridge` trait-object integration for the contact-solve pipeline (Phase 3 §7)
