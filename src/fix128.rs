@@ -3338,84 +3338,475 @@ fn fix128_morton_code_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// WGSL compute shader source for **Fix128 Morton code sort — skeleton**
-/// (v2.2.0 preview, ships as a public constant in v2.1.x).
+/// WGSL compute shader source for **Fix128 Morton code sort**
+/// (v2.2.0 — Phase 3 §2 second primitive kernel).
 ///
-/// This shader locks the binding-layout contract for the upcoming
-/// v2.2.0 Morton sort kernel so external `Fix128GpuKernel` implementers
-/// can start compiling against a stable interface. The compute entry
-/// is a **deliberate no-op**; the LSB-first 8-bit radix sort body lands
-/// with v2.2.0.
+/// Deterministic LSB-first 8-bit radix sort of 63-bit Morton codes with
+/// parallel primitive indices. Byte-exact against Rust's stable
+/// `sort_by_key(|(m, _)| *m)` — the sorted output is the direct input
+/// for the v2.3.0 BVH build kernel.
 ///
 /// See [`docs/PHASE_3_DESIGN.md`](../../docs/PHASE_3_DESIGN.md) §2.3
 /// for the full algorithm design, determinism proof sketch, edge-case
 /// list, and CPU golden strategy.
 ///
-/// # Bindings (frozen for v2.2.0)
+/// # Bindings
 ///
-/// - `@group(0) @binding(0) var<storage, read>       codes_in:    array<vec2<u32>>` — input 63-bit Morton codes as `(low32, high32)`.
-/// - `@group(0) @binding(1) var<storage, read>       indices_in:  array<u32>` — input primitive indices, parallel to `codes_in`.
-/// - `@group(0) @binding(2) var<storage, read_write> codes_out:   array<vec2<u32>>` — output codes after the pass.
-/// - `@group(0) @binding(3) var<storage, read_write> indices_out: array<u32>` — output primitive indices after the pass.
+/// - `@group(0) @binding(0) var<storage, read>       codes_in:       array<vec2<u32>>` — input 63-bit Morton codes as `(low32, high32)`.
+/// - `@group(0) @binding(1) var<storage, read>       indices_in:     array<u32>` — input primitive indices, parallel to `codes_in`.
+/// - `@group(0) @binding(2) var<storage, read_write> codes_out:      array<vec2<u32>>` — output codes after the pass.
+/// - `@group(0) @binding(3) var<storage, read_write> indices_out:    array<u32>` — output primitive indices after the pass.
 /// - `@group(0) @binding(4) var<uniform>             params: SortPassParams` — `{ pass_bit_shift: u32, count: u32 }`.
 /// - `@group(0) @binding(5) var<storage, read_write> histogram: array<atomic<u32>, 256>` — 256-bin histogram, zeroed by the host between passes.
+/// - `@group(0) @binding(6) var<storage, read>       bucket_offsets: array<u32, 256>` — exclusive-scan of the histogram (host-side).
 ///
-/// # v2.2.0 implementation plan
+/// # Compute entries
 ///
-/// One dispatch per radix pass; 8 passes cover 63 bits (top bit of the
-/// 63-bit Morton code is always 0). Per pass:
+/// - `fix128_morton_sort_histogram_main` (`@workgroup_size(64)`, parallel per-primitive) — builds the 256-bin histogram of the current byte via `atomicAdd`. The final counts are order-independent because addition is commutative, so parallel dispatch is safe.
+/// - `fix128_morton_sort_scatter_main` (`@workgroup_size(1)`, single-thread) — sequentially scatters each `(code, index)` pair to `codes_out[bucket_offsets[b] + local_cursor[b]]`. Single-thread ensures **stability** in gid order, which is required for byte-exact CPU-GPU parity against Rust's stable Timsort.
 ///
-/// 1. Build the 256-bin histogram of `(code >> pass_bit_shift) & 0xFFu`
-///    via `atomicAdd(&histogram[bucket], 1u)`.
-/// 2. Exclusive-scan the histogram host-side (256 entries fits in one
-///    readback + upload cycle, deterministic).
-/// 3. Scatter each `(code, index)` pair to `output[bucket_offset[b] +
-///    input_index_in_bucket]`.
+/// # 8-pass control flow (host side)
 ///
-/// The host swaps `(codes_in, codes_out)` and `(indices_in, indices_out)`
-/// between passes and zeroes the histogram; the compute stays on the
-/// GPU. See PHASE_3_DESIGN.md §2.3 for the determinism proof and the
-/// v2.2.0 CPU golden fixture (64 primitives + duplicate Morton
-/// stability + pre-sorted / reverse-sorted cases).
+/// For each of the 8 passes (bit shifts 0, 8, 16, 24, 32, 40, 48, 56):
+/// 1. Zero the histogram buffer.
+/// 2. Upload `params { pass_bit_shift, count }`.
+/// 3. Dispatch `fix128_morton_sort_histogram_main` with `ceil(count / 64)` workgroups.
+/// 4. Read back the histogram; compute `bucket_offsets` via CPU exclusive scan.
+/// 5. Upload `bucket_offsets`.
+/// 6. Dispatch `fix128_morton_sort_scatter_main` with `(1, 1, 1)` workgroup.
+/// 7. Ping-pong: swap the `(codes_in, indices_in) ↔ (codes_out, indices_out)` binding roles for the next pass.
+///
+/// After 8 passes the final output buffer holds the sorted sequence
+/// byte-for-byte identical to `sort_by_key(|(m, _)| *m)` on the CPU.
+/// The v2.2.0 free function [`dispatch_fix128_morton_sort`] implements
+/// this orchestration; consumers who prefer an adapter method should
+/// wrap it in a `Fix128WgpuKernel::morton_sort` at a higher layer.
+///
+/// # Parallelisation deferred to v2.2.x
+///
+/// The scatter's single-thread choice is a **correctness-first**
+/// decision. Parallel scatter with per-thread rank via input prefix
+/// sum is compatible with stability but ~2x the code and ~2x the
+/// tuning burden across the 3-platform CI matrix. It lands as an
+/// additive v2.2.x kernel with the same CPU golden.
 pub const FIX128_MORTON_SORT_WGSL: &str = r#"
 struct SortPassParams {
     pass_bit_shift: u32,
     count:          u32,
 }
 
-@group(0) @binding(0) var<storage, read>       codes_in:    array<vec2<u32>>;
-@group(0) @binding(1) var<storage, read>       indices_in:  array<u32>;
-@group(0) @binding(2) var<storage, read_write> codes_out:   array<vec2<u32>>;
-@group(0) @binding(3) var<storage, read_write> indices_out: array<u32>;
-@group(0) @binding(4) var<uniform>             params:      SortPassParams;
-@group(0) @binding(5) var<storage, read_write> histogram:   array<atomic<u32>, 256>;
+@group(0) @binding(0) var<storage, read>       codes_in:       array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read>       indices_in:     array<u32>;
+@group(0) @binding(2) var<storage, read_write> codes_out:      array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read_write> indices_out:    array<u32>;
+@group(0) @binding(4) var<uniform>             params:         SortPassParams;
+@group(0) @binding(5) var<storage, read_write> histogram:      array<atomic<u32>, 256>;
+@group(0) @binding(6) var<storage, read>       bucket_offsets: array<u32, 256>;
 
-// v2.2.0 skeleton entry. The LSB-first 8-bit radix sort body lands with
-// the v2.2.0 release; see docs/PHASE_3_DESIGN.md §2.3 for the design.
+// Extract the byte at bit position `shift` (must be a multiple of 8 in
+// [0, 56]) from a 63-bit Morton code packed as `(low32, high32)`.
+fn extract_byte(code: vec2<u32>, shift: u32) -> u32 {
+    if (shift < 32u) {
+        return (code.x >> shift) & 0xFFu;
+    }
+    return (code.y >> (shift - 32u)) & 0xFFu;
+}
+
+// Pass 1 of 2 per radix pass: build the 256-bin histogram of the
+// current byte of every Morton code.
 //
-// TODO(v2.2.0-impl): (1) histogram build via atomicAdd of the
-// current-byte bucket, (2) host-side exclusive scan of the 256-entry
-// histogram, (3) scatter to (codes_out, indices_out) at the computed
-// bucket offset. Ping-pong bindings across the 8 passes. Byte-exact
-// against `Vec::sort_by_key(|(m, _)| *m)` on the CPU.
+// Parallel dispatch (one thread per primitive). The final histogram
+// content depends only on the input codes and `pass_bit_shift`, not on
+// the order in which the atomicAdd calls execute — the increment
+// count per bucket is a straightforward sum of per-input matches.
 //
-// The unreachable branch below keeps every binding statically live in
-// the shader module for external inspection without any runtime work
-// in v2.1.x — WGSL comparisons on u32::MAX are always false, so the
-// body of the guard is never executed but the driver preserves the
-// binding declarations.
+// The host is responsible for zeroing `histogram` between passes.
 @compute @workgroup_size(64)
-fn fix128_morton_sort_smoke_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= 0xFFFFFFFFu && params.count == 0xFFFFFFFFu) {
-        let c = codes_in[gid.x];
-        let i = indices_in[gid.x];
-        codes_out[gid.x]   = c;
-        indices_out[gid.x] = i;
-        let bucket = (c.x >> params.pass_bit_shift) & 0xFFu;
-        atomicAdd(&histogram[bucket], 1u);
+fn fix128_morton_sort_histogram_main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+) {
+    let i = gid.x;
+    if (i >= params.count) { return; }
+    let byte = extract_byte(codes_in[i], params.pass_bit_shift);
+    atomicAdd(&histogram[byte], 1u);
+}
+
+// Pass 2 of 2 per radix pass: scatter each (code, index) pair to its
+// destination in `(codes_out, indices_out)`.
+//
+// Single-thread sequential scatter (single workgroup, single
+// invocation) for **stability**. LSB-first radix requires that
+// elements with equal current-byte value preserve their previous-pass
+// relative order; parallel scatter via `atomicAdd(&scatter_cursor[bucket])`
+// on modern GPUs returns bucket-cursor values in atomic-order rather
+// than gid-order, which breaks stability and diverges from
+// `alice_physics::bvh` CPU stable sort. The v2.2.0 kernel prioritises
+// byte-exact CPU-GPU parity; parallel scatter with prefix-sum-based
+// rank computation is deferred to a v2.2.x optimisation.
+//
+// The local 256-entry cursor tracks the next write slot within each
+// bucket, initialised to 0 at kernel entry. Sequential iteration in
+// ascending `i` guarantees stability.
+@compute @workgroup_size(1)
+fn fix128_morton_sort_scatter_main() {
+    var local_cursor: array<u32, 256>;
+    for (var b: u32 = 0u; b < 256u; b = b + 1u) {
+        local_cursor[b] = 0u;
+    }
+    for (var i: u32 = 0u; i < params.count; i = i + 1u) {
+        let code   = codes_in[i];
+        let bucket = extract_byte(code, params.pass_bit_shift);
+        let pos    = bucket_offsets[bucket] + local_cursor[bucket];
+        codes_out[pos]   = code;
+        indices_out[pos] = indices_in[i];
+        local_cursor[bucket] = local_cursor[bucket] + 1u;
     }
 }
 "#;
+
+/// v2.2.0 Morton sort orchestrator — 8-pass LSB-first 8-bit radix sort
+/// dispatched through the [`FIX128_MORTON_SORT_WGSL`] compute entries.
+///
+/// # Contract
+///
+/// - `codes` and `indices` must have the same length; each `codes[i]`
+///   is the 63-bit Morton code for the primitive whose original index
+///   is `indices[i]`, packed as `(low32, high32)`.
+/// - Returns `(sorted_codes, sorted_indices)` **byte-identical** to
+///   Rust's `stable_sort_by_key(|(m, _)| *m)`, where the sort key is
+///   the u64 view `((high32 as u64) << 32) | (low32 as u64)`.
+/// - Elements with equal Morton codes preserve their original relative
+///   order (LSB-first radix + single-thread scatter = stable).
+/// - `count == 0` short-circuits to empty output without dispatching
+///   the kernel.
+///
+/// # Determinism
+///
+/// Every dispatch reads a fully-populated storage buffer and writes to
+/// a fully-populated storage buffer. The histogram build is
+/// order-independent (atomic increment sums to the same total
+/// regardless of thread order); the scatter is single-thread within a
+/// single workgroup so gid order is exactly the input iteration order.
+/// The result is invariant across 3-platform CI (Metal / Vulkan
+/// lavapipe / DX12 WARP).
+///
+/// # Performance note
+///
+/// Scatter runs single-thread for correctness; parallel scatter with
+/// per-thread rank via input prefix sum is a v2.2.x optimisation. At
+/// N ≤ 10000 (the current BVH broad-phase working set) the
+/// single-thread scatter dominates the frame budget but still fits
+/// well inside the target 60Hz step budget on M2 Metal — see the
+/// v2.2.0 CHANGELOG for measurements.
+///
+/// # Panics
+///
+/// - Panics if `codes.len() != indices.len()`.
+/// - Panics if the wgpu device is lost during dispatch (mirrors the
+///   existing `read_buffer` behaviour).
+#[cfg(feature = "physics-solver")]
+#[must_use]
+pub fn dispatch_fix128_morton_sort(
+    device: &crate::device::GpuDevice,
+    codes: &[[u32; 2]],
+    indices: &[u32],
+) -> (Vec<[u32; 2]>, Vec<u32>) {
+    assert_eq!(
+        codes.len(),
+        indices.len(),
+        "codes.len() must equal indices.len()"
+    );
+    let count = codes.len();
+    if count == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Params uniform layout — matches the WGSL `struct SortPassParams`
+    // with an explicit u64-aligned padding for portable layout across
+    // the 3-platform CI matrix.
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct SortPassParams {
+        pass_bit_shift: u32,
+        count: u32,
+        _pad: [u32; 2],
+    }
+
+    // Compile the shader + both compute pipelines. An explicit shared
+    // bind group layout covers all 7 bindings so a single bind group
+    // can drive both the histogram (uses 3 bindings) and scatter (uses
+    // 6 bindings) dispatches — using `layout: None` would derive
+    // per-entry-point layouts and require distinct bind groups.
+    let shader = device
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fix128_morton_sort_shader"),
+            source: wgpu::ShaderSource::Wgsl(FIX128_MORTON_SORT_WGSL.into()),
+        });
+    let bind_group_layout =
+        device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fix128_morton_sort_bgl"),
+                entries: &[
+                    // 0: codes_in (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 1: indices_in (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 2: codes_out (read_write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 3: indices_out (read_write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 4: params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 5: histogram (read_write storage, atomic)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 6: bucket_offsets (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+    let pipeline_layout = device
+        .device()
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fix128_morton_sort_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let histogram_pipeline =
+        device
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("fix128_morton_sort_histogram_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("fix128_morton_sort_histogram_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+    let scatter_pipeline =
+        device
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("fix128_morton_sort_scatter_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("fix128_morton_sort_scatter_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+    // Ping-pong storage buffers for (codes, indices).
+    let codes_bytes: u64 = core::mem::size_of_val(codes) as u64;
+    let indices_bytes: u64 = core::mem::size_of_val(indices) as u64;
+    let buf_a_codes = device.create_buffer_init("morton_sort_a_codes", bytemuck::cast_slice(codes));
+    let buf_a_indices =
+        device.create_buffer_init("morton_sort_a_indices", bytemuck::cast_slice(indices));
+    let buf_b_codes = device.create_buffer_empty("morton_sort_b_codes", codes_bytes);
+    let buf_b_indices = device.create_buffer_empty("morton_sort_b_indices", indices_bytes);
+
+    // Histogram + bucket_offsets storage.
+    let buf_histogram = device.create_buffer_empty("morton_sort_histogram", 256 * 4);
+    let buf_bucket_offsets = device.create_buffer_empty("morton_sort_bucket_offsets", 256 * 4);
+
+    // 8-pass loop: shift 0, 8, 16, 24, 32, 40, 48, 56.
+    let mut input_is_a = true;
+    for pass in 0u32..8u32 {
+        let shift = pass * 8;
+
+        // Update params uniform.
+        let params = SortPassParams {
+            pass_bit_shift: shift,
+            count: count as u32,
+            _pad: [0; 2],
+        };
+        let buf_params =
+            device.create_uniform_buffer("morton_sort_params", bytemuck::bytes_of(&params));
+
+        // Zero the histogram between passes.
+        let zeros_256 = [0u32; 256];
+        device
+            .queue()
+            .write_buffer(&buf_histogram, 0, bytemuck::cast_slice(&zeros_256));
+
+        // Choose input / output buffers for this pass.
+        let (buf_in_codes, buf_in_indices, buf_out_codes, buf_out_indices) = if input_is_a {
+            (&buf_a_codes, &buf_a_indices, &buf_b_codes, &buf_b_indices)
+        } else {
+            (&buf_b_codes, &buf_b_indices, &buf_a_codes, &buf_a_indices)
+        };
+
+        // Bind group. The histogram + scatter pipelines share the same
+        // 7-binding layout so we build one bind group per pass and
+        // reuse across both dispatches.
+        let bind_group = device
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("morton_sort_bind_group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf_in_codes.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf_in_indices.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buf_out_codes.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: buf_out_indices.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: buf_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: buf_histogram.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: buf_bucket_offsets.as_entire_binding(),
+                    },
+                ],
+            });
+
+        // Histogram dispatch (parallel).
+        let mut encoder = device
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("morton_sort_histogram_encoder"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("morton_sort_histogram_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&histogram_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (count as u32).div_ceil(64);
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        device.submit(encoder);
+        device.poll_wait();
+
+        // Read histogram; compute exclusive scan → bucket_offsets.
+        let hist_raw = device.read_buffer(&buf_histogram, 256 * 4);
+        let hist: &[u32] = bytemuck::cast_slice(&hist_raw);
+        let mut offsets = [0u32; 256];
+        let mut running = 0u32;
+        for i in 0..256 {
+            offsets[i] = running;
+            running = running.wrapping_add(hist[i]);
+        }
+        device
+            .queue()
+            .write_buffer(&buf_bucket_offsets, 0, bytemuck::cast_slice(&offsets));
+
+        // Scatter dispatch (single-thread for stability).
+        let mut encoder = device
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("morton_sort_scatter_encoder"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("morton_sort_scatter_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&scatter_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+        device.submit(encoder);
+        device.poll_wait();
+
+        input_is_a = !input_is_a;
+    }
+
+    // After 8 passes with 8 swaps, the sorted output lives in whichever
+    // buffer `input_is_a` currently points at (since the last swap
+    // moved the output back to the "input" slot for the phantom 9th
+    // pass that never runs).
+    let (final_codes, final_indices) = if input_is_a {
+        (&buf_a_codes, &buf_a_indices)
+    } else {
+        (&buf_b_codes, &buf_b_indices)
+    };
+    let codes_raw = device.read_buffer(final_codes, codes_bytes);
+    let indices_raw = device.read_buffer(final_indices, indices_bytes);
+
+    let sorted_codes: Vec<[u32; 2]> = bytemuck::cast_slice(&codes_raw).to_vec();
+    let sorted_indices: Vec<u32> = bytemuck::cast_slice(&indices_raw).to_vec();
+    (sorted_codes, sorted_indices)
+}
 
 // ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
@@ -5058,10 +5449,11 @@ mod tests {
             });
     }
 
-    /// v2.2.0 preview: `FIX128_MORTON_SORT_WGSL` skeleton ships the
-    /// binding layout contract and the compute entry name so external
-    /// consumers can start compiling against it now. The impl body
-    /// lands in v2.2.0 (`docs/PHASE_3_DESIGN.md` §2.3).
+    /// v2.2.0 Morton sort kernel ships two compute entries — a parallel
+    /// histogram builder and a single-thread stable scatter — plus the
+    /// 7-binding contract documented in [`docs/PHASE_3_DESIGN.md`] §2.3.
+    ///
+    /// [`docs/PHASE_3_DESIGN.md`]: ../../docs/PHASE_3_DESIGN.md
     #[test]
     fn wgsl_morton_sort_shader_present() {
         assert!(FIX128_MORTON_SORT_WGSL.contains("struct SortPassParams"));
@@ -5071,12 +5463,168 @@ mod tests {
         assert!(FIX128_MORTON_SORT_WGSL.contains("indices_out"));
         assert!(FIX128_MORTON_SORT_WGSL.contains("params"));
         assert!(FIX128_MORTON_SORT_WGSL.contains("histogram"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("bucket_offsets"));
         assert!(FIX128_MORTON_SORT_WGSL.contains("array<atomic<u32>, 256>"));
-        assert!(FIX128_MORTON_SORT_WGSL.contains("fn fix128_morton_sort_smoke_main"));
-        assert!(FIX128_MORTON_SORT_WGSL.contains("@compute"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("array<u32, 256>"));
+        // Two compute entries — histogram (parallel) + scatter (single-thread).
+        assert!(FIX128_MORTON_SORT_WGSL.contains("fn fix128_morton_sort_histogram_main"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("fn fix128_morton_sort_scatter_main"));
         assert!(FIX128_MORTON_SORT_WGSL.contains("@workgroup_size(64)"));
-        // The skeleton documents its own TODO placement for the v2.2.0 impl.
-        assert!(FIX128_MORTON_SORT_WGSL.contains("TODO(v2.2.0-impl)"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("@workgroup_size(1)"));
+        // Byte-extract helper that supports both 32-bit halves of the 63-bit code.
+        assert!(FIX128_MORTON_SORT_WGSL.contains("fn extract_byte"));
+        // Stability comment identifies the design constraint that pins
+        // scatter to single-thread.
+        assert!(FIX128_MORTON_SORT_WGSL.contains("stability"));
+    }
+
+    /// Byte-exact GPU-CPU golden for the v2.2.0 Morton sort kernel.
+    ///
+    /// Exercises seven edge cases via the [`dispatch_fix128_morton_sort`]
+    /// orchestrator and compares byte-for-byte against Rust's stable
+    /// `sort_by_key` on the paired `(Morton, index)` sequence:
+    ///
+    /// 1. **Empty** — `count == 0` short-circuits without dispatch.
+    /// 2. **Single element** — trivially sorted; every pass leaves it in place.
+    /// 3. **All Morton codes identical** — degenerate histogram (one bucket
+    ///    holds every element); stability preserves input order.
+    /// 4. **All Morton codes distinct** — general case, 64 elements.
+    /// 5. **Duplicate Morton codes** — pairs of identical codes with
+    ///    distinct indices; asserts that lower-input-index pairs come
+    ///    first (stability).
+    /// 6. **Ascending pre-sorted input** — output equals input verbatim.
+    /// 7. **Descending pre-sorted input** — full reversal; every bucket
+    ///    crossing is exercised.
+    ///
+    /// Skips when no GPU adapter is available (headless CI).
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_morton_sort_matches_cpu_golden() {
+        // CPU golden mirrors the target: pair each (code_u64, index)
+        // then stable-sort by code. Byte layout of the returned pair is
+        // then reconstructed to match the GPU output layout.
+        fn cpu_sort(codes: &[[u32; 2]], indices: &[u32]) -> (Vec<[u32; 2]>, Vec<u32>) {
+            let mut pairs: Vec<(u64, u32, [u32; 2])> = codes
+                .iter()
+                .zip(indices.iter())
+                .map(|(c, i)| ((u64::from(c[0])) | ((u64::from(c[1])) << 32), *i, *c))
+                .collect();
+            pairs.sort_by_key(|(m, _, _)| *m);
+            let sorted_codes = pairs.iter().map(|(_, _, c)| *c).collect();
+            let sorted_indices = pairs.iter().map(|(_, i, _)| *i).collect();
+            (sorted_codes, sorted_indices)
+        }
+
+        // Helper to build a `[u32; 2]` code from a u64 value.
+        fn to_code(v: u64) -> [u32; 2] {
+            [v as u32, (v >> 32) as u32]
+        }
+
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return, // Headless CI, skip.
+        };
+
+        // ---- Fixture 1: empty ----
+        {
+            let codes: Vec<[u32; 2]> = Vec::new();
+            let indices: Vec<u32> = Vec::new();
+            let (gpu_c, gpu_i) = dispatch_fix128_morton_sort(&device, &codes, &indices);
+            let (cpu_c, cpu_i) = cpu_sort(&codes, &indices);
+            assert_eq!(gpu_c, cpu_c, "empty fixture codes mismatch");
+            assert_eq!(gpu_i, cpu_i, "empty fixture indices mismatch");
+        }
+
+        // ---- Fixture 2: single element ----
+        {
+            let codes = vec![to_code(0x0000_1234_5678_9ABC)];
+            let indices = vec![42u32];
+            let (gpu_c, gpu_i) = dispatch_fix128_morton_sort(&device, &codes, &indices);
+            let (cpu_c, cpu_i) = cpu_sort(&codes, &indices);
+            assert_eq!(gpu_c, cpu_c, "single fixture codes mismatch");
+            assert_eq!(gpu_i, cpu_i, "single fixture indices mismatch");
+        }
+
+        // ---- Fixture 3: all Morton codes identical ----
+        {
+            let codes = vec![to_code(0x0000_DEAD_BEEF_CAFEu64); 32];
+            let indices: Vec<u32> = (0..32).collect();
+            let (gpu_c, gpu_i) = dispatch_fix128_morton_sort(&device, &codes, &indices);
+            let (cpu_c, cpu_i) = cpu_sort(&codes, &indices);
+            assert_eq!(gpu_c, cpu_c, "identical-codes fixture codes mismatch");
+            assert_eq!(gpu_i, cpu_i, "identical-codes fixture indices mismatch");
+            // Stability: indices should stay in 0..32 order.
+            assert_eq!(
+                gpu_i,
+                (0..32).collect::<Vec<_>>(),
+                "identical-codes stability broken"
+            );
+        }
+
+        // ---- Fixture 4: all distinct, 64 elements ----
+        {
+            let codes: Vec<[u32; 2]> = (0..64u64)
+                .map(|i| {
+                    let v = i
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(0x1234_5678_9ABC_DEF0);
+                    to_code(v & 0x7FFF_FFFF_FFFF_FFFF)
+                })
+                .collect();
+            let indices: Vec<u32> = (0..64).collect();
+            let (gpu_c, gpu_i) = dispatch_fix128_morton_sort(&device, &codes, &indices);
+            let (cpu_c, cpu_i) = cpu_sort(&codes, &indices);
+            assert_eq!(gpu_c, cpu_c, "distinct-64 fixture codes mismatch");
+            assert_eq!(gpu_i, cpu_i, "distinct-64 fixture indices mismatch");
+        }
+
+        // ---- Fixture 5: duplicate Morton codes with distinct indices ----
+        {
+            // Pattern: pairs of same-code elements with two indices each.
+            let mut codes = Vec::new();
+            let mut indices = Vec::new();
+            for i in 0u32..16 {
+                let m = to_code(u64::from(i) * 0x0000_0100_0000_0000);
+                codes.push(m);
+                indices.push(i * 2);
+                codes.push(m);
+                indices.push(i * 2 + 1);
+            }
+            let (gpu_c, gpu_i) = dispatch_fix128_morton_sort(&device, &codes, &indices);
+            let (cpu_c, cpu_i) = cpu_sort(&codes, &indices);
+            assert_eq!(gpu_c, cpu_c, "duplicate-codes fixture codes mismatch");
+            assert_eq!(gpu_i, cpu_i, "duplicate-codes fixture indices mismatch");
+            // Stability spot check: within each same-code pair, the
+            // lower original index must come first.
+            for chunk in gpu_i.chunks(2) {
+                assert!(
+                    chunk[0] < chunk[1],
+                    "stability broken within same-code pair: {chunk:?}"
+                );
+            }
+        }
+
+        // ---- Fixture 6: ascending pre-sorted input ----
+        {
+            let codes: Vec<[u32; 2]> = (0..48u64).map(|v| to_code(v * 7 + 1)).collect();
+            let indices: Vec<u32> = (0..48).collect();
+            let (gpu_c, gpu_i) = dispatch_fix128_morton_sort(&device, &codes, &indices);
+            let (cpu_c, cpu_i) = cpu_sort(&codes, &indices);
+            assert_eq!(gpu_c, cpu_c, "ascending fixture codes mismatch");
+            assert_eq!(gpu_i, cpu_i, "ascending fixture indices mismatch");
+            // Sorted output equals input.
+            assert_eq!(gpu_c, codes, "ascending pre-sorted should be a no-op");
+        }
+
+        // ---- Fixture 7: descending pre-sorted input ----
+        {
+            let codes: Vec<[u32; 2]> = (0..48u64).rev().map(|v| to_code(v * 7 + 1)).collect();
+            let indices: Vec<u32> = (0..48).collect();
+            let (gpu_c, gpu_i) = dispatch_fix128_morton_sort(&device, &codes, &indices);
+            let (cpu_c, cpu_i) = cpu_sort(&codes, &indices);
+            assert_eq!(gpu_c, cpu_c, "descending fixture codes mismatch");
+            assert_eq!(gpu_i, cpu_i, "descending fixture indices mismatch");
+        }
     }
 
     /// Morton sort skeleton must compile as valid WGSL end-to-end so

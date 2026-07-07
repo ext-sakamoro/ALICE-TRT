@@ -2,23 +2,46 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
-## [Unreleased]
+## [2.2.0] - 2026-07-07
 
-### Added — Morton sort kernel skeleton (v2.2.0 preview)
+### Added — Deterministic Morton sort kernel (Phase 3 §2)
 
-- **New public WGSL constant** `FIX128_MORTON_SORT_WGSL`: skeleton preview of the v2.2.0 Morton sort kernel. Locks the binding layout contract (`codes_in`, `indices_in`, `codes_out`, `indices_out`, `params: SortPassParams`, `histogram: array<atomic<u32>, 256>`) and the compute entry name so external `Fix128GpuKernel` implementers can start compiling against a stable interface. The compute entry is a deliberate no-op guarded by an unreachable `u32::MAX` comparison; the LSB-first 8-bit radix sort body lands in v2.2.0.
-- **Design doc** [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md) §2.3: full v2.2.0 algorithm design (LSB-first 8-bit radix, 8 dispatches, ping-pong buffers, host-side histogram scan), determinism proof sketch, bindings table, CPU golden strategy, and edge-case list (empty / single / all-identical / all-distinct / duplicate Morton stability / pre-sorted / reverse-sorted).
+Second implementation release of the Phase 3 GPU BVH pipeline. Ships the byte-exact stable LSB-first 8-bit radix sort of 63-bit Morton codes announced in v2.1.x, plus a public Rust orchestrator that drives the 8-pass ping-pong dispatch. Additive-only; the v2.1.0 public surface (including `FIX128_MORTON_CODE_WGSL` and `Fix128AabbGpu`) is unchanged.
 
-Version stays at 2.1.0 — the skeleton is a preview, not a functional promise; the MINOR bump lands with the v2.2.0 impl body.
+- **`FIX128_MORTON_SORT_WGSL` — full impl** (previously a v2.1.x skeleton). Two `@compute` entries:
+  - `fix128_morton_sort_histogram_main` (`@workgroup_size(64)`, parallel per-primitive) — builds the 256-bin histogram of the current byte via `atomicAdd`. The final counts are order-independent because addition commutes, so parallel dispatch is safe.
+  - `fix128_morton_sort_scatter_main` (`@workgroup_size(1)`, single-thread) — sequentially scatters each `(code, index)` pair to `codes_out[bucket_offsets[b] + local_cursor[b]]`. Single-thread ensures **stability** in gid order, which is required for byte-exact CPU-GPU parity against Rust's stable Timsort.
+- **`FIX128_MORTON_SORT_WGSL` binding layout** (frozen since v2.1.x preview): 7 bindings total. `codes_in` / `indices_in` (read storage) → `codes_out` / `indices_out` (read_write storage) with a `params { pass_bit_shift, count }` uniform, a 256-bin `atomic<u32>` histogram (read_write), and a `bucket_offsets: array<u32, 256>` (read) populated between passes by the host-side exclusive scan.
+- **New public Rust function** `dispatch_fix128_morton_sort(device, codes, indices) -> (sorted_codes, sorted_indices)`: 8-pass orchestrator. Per pass — zero histogram → dispatch histogram_main → read back → host-side exclusive scan → upload `bucket_offsets` → dispatch scatter_main → ping-pong buffers. Returns the sorted `(codes, indices)` pair byte-identical to `stable_sort_by_key(|(m, _)| *m)` on the CPU.
 
-### Tests
+### Tests (v2.2.0 additions)
 
-Two new lib tests exercise the skeleton:
+- `wgpu_morton_sort_matches_cpu_golden` — **byte-exact GPU-CPU golden**. Seven fixture cases covering the edge cases documented in the design doc:
+  1. Empty (`count == 0`) — dispatcher short-circuits without executing any kernel.
+  2. Single element — trivially sorted.
+  3. All Morton codes identical (32 elements) — degenerate histogram; stability preserves input order.
+  4. All Morton codes distinct (64 elements) — general case.
+  5. Duplicate Morton codes with distinct indices (32 pairs of 2) — asserts lower-input-index comes first within each same-code pair (stability).
+  6. Ascending pre-sorted (48 elements) — output equals input.
+  7. Descending pre-sorted (48 elements) — full reversal.
 
-- `wgsl_morton_sort_shader_present` — structural check on struct + bindings + compute entry name + the `TODO(v2.2.0-impl)` marker.
-- `wgsl_morton_sort_shader_compiles` — naga validation on the full skeleton shader.
+Total 200 lib tests (previously 199), all pass on macOS Metal. The 3-platform CI matrix (Metal / Vulkan lavapipe / DX12 WARP) picks up the new byte-exact test on the next tag run.
 
-Total 199 lib tests (previously 197), all pass on macOS Metal.
+### Perf note
+
+The single-thread scatter runs at ~O(N) inside one workgroup. At N = 64 (the v2.2.0 golden fixture) the whole 8-pass sort completes in well under 1ms on M2 Metal. Parallel scatter with per-thread rank via input prefix sum is a v2.2.x optimisation; the correctness-first choice ships first so v2.3.0 BVH build can start integrating against a stable byte-exact contract immediately.
+
+### Next up (Phase 3 continuation)
+
+- **v2.3.0** — GPU BVH build with the position-independent placeholder + O(subtree_size) sweep discipline established by ALICE-Physics `dede78c`.
+- **v2.4.0** — GPU BVH `find_pairs` with debug cycle guard.
+- **v2.5.0** — Sphere-sphere narrow-phase contact kernel.
+- **v2.6.0** — GPU PGS contact solve + `TrtSolverAdapter` opt-in for the full pipeline.
+
+### Backwards compatibility
+
+- Fully additive vs v2.1.0. No API changes.
+- `FIX128_MORTON_SORT_WGSL` transitions from the v2.1.x skeleton entry `fix128_morton_sort_smoke_main` to the two production entries. External consumers who compiled against the skeleton entry name should switch to the histogram + scatter entries per the [design doc](docs/PHASE_3_DESIGN.md) §2.3.
 
 ## [2.1.0] - 2026-07-07
 

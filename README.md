@@ -581,6 +581,7 @@ alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
 | Fix128 GPU `sqrt` | v1.4.1 | `FIX128_SQRT_WGSL` |
 | Fix128 AABB helpers (Phase 3 §1) | v2.1.0 | `FIX128_AABB_HELPERS_WGSL` |
 | Fix128 Morton code (Phase 3 §1) | v2.1.0 | `FIX128_MORTON_CODE_WGSL` |
+| Fix128 Morton sort (Phase 3 §2) | v2.2.0 | `FIX128_MORTON_SORT_WGSL` + `dispatch_fix128_morton_sort` |
 
 CPU-side `Fix128Gpu` also exposes `sqrt` (v1.0.1, delegates to `alice_physics::Fix128::sqrt`) and `div` (v1.0.6) for host precompute paths. The v1.1.0 single-constraint uniform variant (`FIX128_PGS_PROJECT_DISTANCE_WGSL`) was deprecated in v1.7.0 and removed in v2.0.0; external `Fix128GpuKernel` implementers should migrate to the rigid-rod or batched shader listed above.
 
