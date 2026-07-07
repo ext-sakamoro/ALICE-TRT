@@ -2,6 +2,28 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.5.1] - 2026-07-07
+
+### Docs cleanup — stale skeleton docstrings from v0.3.0 / v0.7.1 / v2.2.0 era
+
+Cosmetic-only patch: no functional changes, no API surface changes, no behavioural changes. Refreshes eight stale docstrings and one shader debug label that still referred to code as "skeleton" or as "scheduled for a follow-up commit" even though the referenced implementations shipped between v0.5.0 and v2.5.0. Test count, build, and CI outputs are unchanged from v2.5.0.
+
+- **Module-level `//!` doc** — replace the "Fix128 GPU primitive skeleton" opener with a summary of the currently-shipped surface (add / sub / mul / div / sqrt / dot primitives plus the Phase 2 solver kernels and the Phase 3 broad-phase → narrow-phase pipeline). Refresh the determinism-contract paragraph to reflect the actual dispatch discipline (fixed workgroup order, single-workgroup single-thread dispatches for sequence-order-sensitive stages, `atomicAdd` for slot reservation only — not for reductions).
+- **`FIX128_MUL_WGSL` docstring** — replace "skeleton with the schoolbook helpers ready to be re-used ... in a follow-up" with an accurate entry-point catalog: `fix128_mul_main` (full signed 128×128→128 pipeline live-dispatched by [`Fix128WgpuKernel::mul`]) plus `fix128_mul_unsigned_lo_main` (retained testing entry point). Removes the "scheduled for v0.5.0" reference.
+- **`Fix128GpuKernel` trait doc** — replace the `# Skeleton` section (which claimed the bodies were stubbed with `todo!` and the WGSL arithmetic would land in a follow-up commit) with a `# Live implementation` section that enumerates the WGSL constants each trait method dispatches through [`Fix128WgpuKernel`].
+- **`wgsl_mul_shader_helpers_present` test doc** — refresh to mention both the unsigned-lo helper and the full signed `fix128_mul_main` entry point.
+- **`wgsl_mul_shader_compiles` test doc + shader debug label** — drop the "skeleton" wording; label changes from `fix128_mul_skeleton` to `fix128_mul_shader_compile_test` (wgpu debug-label only; no dispatch impact).
+- **`wgsl_dot_shader_helpers_present` test doc** — replace "dot skeleton shader" with "dot shader" and clarify that the two-stage partial + final reduction entries are what [`Fix128WgpuKernel::dot`] chains together.
+- **`wgsl_morton_sort_shader_compiles` test doc** — remove "ahead of the v2.2.0 impl body landing" (v2.2.0 shipped in the same day's release train and the shader is now the production impl, not a skeleton preview).
+
+### Verification
+
+- `cargo fmt --all -- --check` clean.
+- `cargo build --features physics-solver` — 0 warnings.
+- `cargo test --lib --features fix128-arithmetic fix128` — 52 tests pass (CI path).
+- `cargo test --lib --features physics-solver` — 209 tests pass (unchanged from v2.5.0).
+- `RUSTDOCFLAGS='-Dwarnings' cargo doc --lib --features physics-solver --no-deps` — 0 warnings.
+
 ## [2.5.0] - 2026-07-07
 
 ### Added — GPU sphere-sphere narrow-phase contact kernel (Phase 3 §5)

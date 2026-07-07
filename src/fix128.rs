@@ -1,12 +1,22 @@
-//! Fix128 GPU primitive skeleton (physics-solver support, opt-in).
+//! Fix128 GPU primitives (physics-solver support, opt-in).
 //!
-//! Provides [`Fix128Gpu`] (`int64x2` hi/lo representation) and the
-//! [`Fix128GpuKernel`] trait for compute-shader-level Fix128
-//! `add / sub / mul / dot` operations. The WGSL shader body and full
-//! arithmetic implementation are scheduled for follow-up commits; this
-//! skeleton pins the public API so downstream `physics_bridge` code
-//! and external `alice-physics` `GpuSolverBridge` integrations can
-//! compile against a stable surface.
+//! Provides [`Fix128Gpu`] (`int64x2` hi/lo representation) plus the
+//! [`Fix128GpuKernel`] trait and its live wgpu implementation
+//! [`Fix128WgpuKernel`] for compute-shader-level Fix128
+//! `add / sub / mul / div / sqrt / dot` operations. Every operation
+//! ships a certified byte-exact WGSL kernel (v0.3.0 add/sub/mul,
+//! v1.4.0 div, v1.4.1 sqrt, v0.7.1 + v0.8.1 dot two-stage reduce)
+//! that downstream `physics_bridge` code and external
+//! `alice-physics` `GpuSolverBridge` integrations compose into
+//! higher-level solvers.
+//!
+//! Phase 2 (v1.1-v1.9) added PGS integrate, floor projection, and
+//! batched rigid-rod distance projection. Phase 3 (v2.1-v2.5) adds
+//! the GPU BVH broad-phase → sphere-sphere narrow-phase pipeline:
+//! Fix128 AABB helpers, Morton code, Morton sort, BVH build,
+//! find_pairs, and sphere-sphere contact. See
+//! [`docs/PHASE_3_DESIGN.md`](../../docs/PHASE_3_DESIGN.md) for the
+//! release-by-release kernel plan.
 //!
 //! # Determinism contract
 //!
@@ -15,18 +25,25 @@
 //! - Backend (Metal / Vulkan / DX12)
 //! - Workgroup / dispatch sizes
 //!
-//! This requires strict `workgroupBarrier` synchronisation, index-
-//! ordered subgroup reductions, and forbidding any implicit `atomicAdd`
-//! path in the WGSL shader. See the private
+//! Kernels achieve this by fixing workgroup dispatch order to
+//! ascending `global_invocation_id`, using single-workgroup
+//! single-thread dispatches for sequence-order-sensitive stages
+//! (Morton scatter, BVH build / find_pairs, sphere-sphere contact),
+//! and using `atomicAdd` only for slot reservation into
+//! pre-allocated output buffers (not for reductions). See the
 //! [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md)
 //! skill §1 経路 3 (SIMD / subgroup reduce ordering) and §1 経路 5
 //! (thread traversal ordering) for the reference reasoning.
 //!
 //! # Feature
 //!
-//! Enable with `--features fix128-arithmetic`. The
-//! [`Fix128GpuKernel`] trait itself does not depend on any GPU
-//! backend so consumers can stub it out for testing.
+//! Enable the base primitives with `--features fix128-arithmetic`.
+//! Enable the Phase 2 + Phase 3 solver kernels with
+//! `--features physics-solver` (which activates
+//! `fix128-arithmetic` transitively). The [`Fix128GpuKernel`] trait
+//! does not depend on any GPU backend, so consumers can substitute a
+//! testing implementation while the live wgpu backend is
+//! [`Fix128WgpuKernel`].
 
 /// GPU-friendly Fix128 representation.
 ///
@@ -338,24 +355,28 @@ fn fix128_sub_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// WGSL compute shader source for `Fix128 mul` (skeleton with the
-/// `umul_wide` and `u64_mul_wide` schoolbook helpers ready to be
-/// re-used by the full signed 128×128 pipeline in a follow-up).
+/// WGSL compute shader source for `Fix128 mul` — full signed
+/// 128×128→128 pipeline plus the schoolbook wide-multiply helpers
+/// that Phase 2 / Phase 3 kernels re-use inline.
 ///
 /// The helpers exposed here — `umul_wide` (u32×u32→u64) and
 /// `u64_mul_wide` (u64×u64→u128) — are byte-exact re-productions of
 /// the operations that the CPU reference [`Fix128Gpu::mul`] performs
-/// internally on `i128`. Adding them separately keeps the follow-up
-/// commit focused on the sign-correction and truncation logic (the
-/// "middle 128 bits of the 256-bit signed product") rather than on
-/// wide integer arithmetic.
+/// internally on `i128`. The signed 128×128→256 schoolbook plus
+/// two's-complement sign correction (the "middle 128 bits of the
+/// 256-bit signed product") is materialised inside the
+/// [`Fix128WgpuKernel::mul`] pipeline path.
 ///
-/// The full end-to-end `fix128_mul_main` entry point is scheduled for
-/// v0.5.0; this constant currently ships the helpers plus a trivial
-/// `fix128_mul_unsigned_lo_main` entry point that returns the low
-/// 128 bits of the *unsigned* 128×128→256 product. That entry point
-/// is enough to validate the schoolbook helpers on a real GPU
-/// against a hand-computed golden.
+/// # Entry points
+///
+/// - `fix128_mul_main` — full signed 128×128→128 pipeline, live-
+///   dispatched by [`Fix128WgpuKernel::mul`]. Byte-exact against the
+///   CPU reference [`Fix128Gpu::mul`].
+/// - `fix128_mul_unsigned_lo_main` — testing entry point that
+///   returns the low 128 bits of the *unsigned* 128×128→256 product.
+///   Retained so external consumers can validate the schoolbook
+///   helpers on a real GPU against a hand-computed golden without
+///   going through the signed correction path.
 pub const FIX128_MUL_WGSL: &str = r#"
 struct Fix128Gpu {
     hi_lo: u32,
@@ -6614,12 +6635,16 @@ impl Fix128GpuKernel for Fix128WgpuKernel<'_> {
 /// - `dot`: `a.len() == b.len()`; the single-element accumulator is
 ///   summed in ascending index order.
 ///
-/// # Skeleton
+/// # Live implementation
 ///
-/// The trait is intentionally minimal for the initial rollout. The
-/// bodies are stubbed with `todo!` in the skeleton so implementers can
-/// wire the dispatch layer against a stable signature; the WGSL
-/// arithmetic will land in a follow-up commit.
+/// The reference wgpu backend [`Fix128WgpuKernel`] implements every
+/// method via a live compute pipeline compiled from the WGSL
+/// constants in this module (`FIX128_ADD_WGSL`, `FIX128_SUB_WGSL`,
+/// `FIX128_MUL_WGSL`, `FIX128_DIV_WGSL`, `FIX128_SQRT_WGSL`,
+/// `FIX128_DOT_WGSL` + `FIX128_DOT_FINAL_WGSL`). External backends
+/// (native CUDA, TensorRT plugin) can compose their own
+/// implementations against the same signature; the byte-exact
+/// contract vs the CPU reference must be preserved.
 pub trait Fix128GpuKernel {
     /// Element-wise addition: `out[i] = a[i] + b[i]`.
     fn add(&mut self, a: &[Fix128Gpu], b: &[Fix128Gpu], out: &mut [Fix128Gpu]);
@@ -6875,18 +6900,20 @@ mod tests {
         assert!(FIX128_SUB_WGSL.contains("u64_sub"));
     }
 
-    /// The Fix128 mul skeleton shader ships the schoolbook helpers
-    /// (`umul_wide` + `u64_mul_wide`) and the unsigned-lo entry point
-    /// that will be re-used by the full signed pipeline.
+    /// The Fix128 mul shader ships the schoolbook helpers
+    /// (`umul_wide` + `u64_mul_wide`) and both the unsigned-lo
+    /// testing entry point and the full signed `fix128_mul_main`
+    /// pipeline that [`Fix128WgpuKernel::mul`] dispatches.
     #[test]
     fn wgsl_mul_shader_helpers_present() {
         assert!(FIX128_MUL_WGSL.contains("umul_wide"));
         assert!(FIX128_MUL_WGSL.contains("u64_mul_wide"));
         assert!(FIX128_MUL_WGSL.contains("fix128_mul_unsigned_lo_main"));
+        assert!(FIX128_MUL_WGSL.contains("fix128_mul_main"));
         assert!(FIX128_MUL_WGSL.contains("@compute"));
     }
 
-    /// The mul skeleton must compile as valid WGSL. We ask the wgpu
+    /// The mul shader must compile as valid WGSL. We ask the wgpu
     /// naga parser (via `Device::create_shader_module`) to validate
     /// it and fail loudly on any syntax / type error.
     ///
@@ -6903,7 +6930,7 @@ mod tests {
         let _ = device
             .device()
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("fix128_mul_skeleton"),
+                label: Some("fix128_mul_shader_compile_test"),
                 source: wgpu::ShaderSource::Wgsl(FIX128_MUL_WGSL.into()),
             });
     }
@@ -7252,9 +7279,10 @@ mod tests {
         assert_eq!(via_inherent, via_trait);
     }
 
-    /// The Fix128 dot skeleton shader ships the schoolbook helpers,
-    /// the inline `fix128_add_kernel` / `fix128_mul_kernel`, and the
-    /// serial reduction entry point.
+    /// The Fix128 dot shader ships the schoolbook helpers, the
+    /// inline `fix128_add_kernel` / `fix128_mul_kernel`, and the
+    /// two-stage partial + final reduction entry points that
+    /// [`Fix128WgpuKernel::dot`] chains together.
     #[test]
     fn wgsl_dot_shader_helpers_present() {
         assert!(FIX128_DOT_WGSL.contains("umul_wide"));
@@ -7848,10 +7876,11 @@ mod tests {
         }
     }
 
-    /// Morton sort skeleton must compile as valid WGSL end-to-end so
-    /// external consumers who wire against the binding layout get
-    /// a working handshake ahead of the v2.2.0 impl body landing.
-    /// Skips when no GPU adapter is available (headless CI).
+    /// The Morton sort shader (histogram + scatter entries + 7 shared
+    /// bindings) must compile as valid WGSL end-to-end. Runs the naga
+    /// parser via `create_shader_module` and fails loudly on any
+    /// syntax / type error. Skips when no GPU adapter is available
+    /// (headless CI).
     #[test]
     fn wgsl_morton_sort_shader_compiles() {
         let device = match crate::device::GpuDevice::new() {
