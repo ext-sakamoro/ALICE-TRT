@@ -3338,6 +3338,85 @@ fn fix128_morton_code_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader source for **Fix128 Morton code sort — skeleton**
+/// (v2.2.0 preview, ships as a public constant in v2.1.x).
+///
+/// This shader locks the binding-layout contract for the upcoming
+/// v2.2.0 Morton sort kernel so external `Fix128GpuKernel` implementers
+/// can start compiling against a stable interface. The compute entry
+/// is a **deliberate no-op**; the LSB-first 8-bit radix sort body lands
+/// with v2.2.0.
+///
+/// See [`docs/PHASE_3_DESIGN.md`](../../docs/PHASE_3_DESIGN.md) §2.3
+/// for the full algorithm design, determinism proof sketch, edge-case
+/// list, and CPU golden strategy.
+///
+/// # Bindings (frozen for v2.2.0)
+///
+/// - `@group(0) @binding(0) var<storage, read>       codes_in:    array<vec2<u32>>` — input 63-bit Morton codes as `(low32, high32)`.
+/// - `@group(0) @binding(1) var<storage, read>       indices_in:  array<u32>` — input primitive indices, parallel to `codes_in`.
+/// - `@group(0) @binding(2) var<storage, read_write> codes_out:   array<vec2<u32>>` — output codes after the pass.
+/// - `@group(0) @binding(3) var<storage, read_write> indices_out: array<u32>` — output primitive indices after the pass.
+/// - `@group(0) @binding(4) var<uniform>             params: SortPassParams` — `{ pass_bit_shift: u32, count: u32 }`.
+/// - `@group(0) @binding(5) var<storage, read_write> histogram: array<atomic<u32>, 256>` — 256-bin histogram, zeroed by the host between passes.
+///
+/// # v2.2.0 implementation plan
+///
+/// One dispatch per radix pass; 8 passes cover 63 bits (top bit of the
+/// 63-bit Morton code is always 0). Per pass:
+///
+/// 1. Build the 256-bin histogram of `(code >> pass_bit_shift) & 0xFFu`
+///    via `atomicAdd(&histogram[bucket], 1u)`.
+/// 2. Exclusive-scan the histogram host-side (256 entries fits in one
+///    readback + upload cycle, deterministic).
+/// 3. Scatter each `(code, index)` pair to `output[bucket_offset[b] +
+///    input_index_in_bucket]`.
+///
+/// The host swaps `(codes_in, codes_out)` and `(indices_in, indices_out)`
+/// between passes and zeroes the histogram; the compute stays on the
+/// GPU. See PHASE_3_DESIGN.md §2.3 for the determinism proof and the
+/// v2.2.0 CPU golden fixture (64 primitives + duplicate Morton
+/// stability + pre-sorted / reverse-sorted cases).
+pub const FIX128_MORTON_SORT_WGSL: &str = r#"
+struct SortPassParams {
+    pass_bit_shift: u32,
+    count:          u32,
+}
+
+@group(0) @binding(0) var<storage, read>       codes_in:    array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read>       indices_in:  array<u32>;
+@group(0) @binding(2) var<storage, read_write> codes_out:   array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read_write> indices_out: array<u32>;
+@group(0) @binding(4) var<uniform>             params:      SortPassParams;
+@group(0) @binding(5) var<storage, read_write> histogram:   array<atomic<u32>, 256>;
+
+// v2.2.0 skeleton entry. The LSB-first 8-bit radix sort body lands with
+// the v2.2.0 release; see docs/PHASE_3_DESIGN.md §2.3 for the design.
+//
+// TODO(v2.2.0-impl): (1) histogram build via atomicAdd of the
+// current-byte bucket, (2) host-side exclusive scan of the 256-entry
+// histogram, (3) scatter to (codes_out, indices_out) at the computed
+// bucket offset. Ping-pong bindings across the 8 passes. Byte-exact
+// against `Vec::sort_by_key(|(m, _)| *m)` on the CPU.
+//
+// The unreachable branch below keeps every binding statically live in
+// the shader module for external inspection without any runtime work
+// in v2.1.x — WGSL comparisons on u32::MAX are always false, so the
+// body of the guard is never executed but the driver preserves the
+// binding declarations.
+@compute @workgroup_size(64)
+fn fix128_morton_sort_smoke_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= 0xFFFFFFFFu && params.count == 0xFFFFFFFFu) {
+        let c = codes_in[gid.x];
+        let i = indices_in[gid.x];
+        codes_out[gid.x]   = c;
+        indices_out[gid.x] = i;
+        let bucket = (c.x >> params.pass_bit_shift) & 0xFFu;
+        atomicAdd(&histogram[bucket], 1u);
+    }
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
@@ -4976,6 +5055,45 @@ mod tests {
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fix128_morton_code_shader_compile_test"),
                 source: wgpu::ShaderSource::Wgsl(FIX128_MORTON_CODE_WGSL.into()),
+            });
+    }
+
+    /// v2.2.0 preview: `FIX128_MORTON_SORT_WGSL` skeleton ships the
+    /// binding layout contract and the compute entry name so external
+    /// consumers can start compiling against it now. The impl body
+    /// lands in v2.2.0 (`docs/PHASE_3_DESIGN.md` §2.3).
+    #[test]
+    fn wgsl_morton_sort_shader_present() {
+        assert!(FIX128_MORTON_SORT_WGSL.contains("struct SortPassParams"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("codes_in"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("indices_in"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("codes_out"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("indices_out"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("params"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("histogram"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("array<atomic<u32>, 256>"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("fn fix128_morton_sort_smoke_main"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("@compute"));
+        assert!(FIX128_MORTON_SORT_WGSL.contains("@workgroup_size(64)"));
+        // The skeleton documents its own TODO placement for the v2.2.0 impl.
+        assert!(FIX128_MORTON_SORT_WGSL.contains("TODO(v2.2.0-impl)"));
+    }
+
+    /// Morton sort skeleton must compile as valid WGSL end-to-end so
+    /// external consumers who wire against the binding layout get
+    /// a working handshake ahead of the v2.2.0 impl body landing.
+    /// Skips when no GPU adapter is available (headless CI).
+    #[test]
+    fn wgsl_morton_sort_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_morton_sort_shader_compile_test"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_MORTON_SORT_WGSL.into()),
             });
     }
 

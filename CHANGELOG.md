@@ -2,6 +2,24 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [Unreleased]
+
+### Added — Morton sort kernel skeleton (v2.2.0 preview)
+
+- **New public WGSL constant** `FIX128_MORTON_SORT_WGSL`: skeleton preview of the v2.2.0 Morton sort kernel. Locks the binding layout contract (`codes_in`, `indices_in`, `codes_out`, `indices_out`, `params: SortPassParams`, `histogram: array<atomic<u32>, 256>`) and the compute entry name so external `Fix128GpuKernel` implementers can start compiling against a stable interface. The compute entry is a deliberate no-op guarded by an unreachable `u32::MAX` comparison; the LSB-first 8-bit radix sort body lands in v2.2.0.
+- **Design doc** [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md) §2.3: full v2.2.0 algorithm design (LSB-first 8-bit radix, 8 dispatches, ping-pong buffers, host-side histogram scan), determinism proof sketch, bindings table, CPU golden strategy, and edge-case list (empty / single / all-identical / all-distinct / duplicate Morton stability / pre-sorted / reverse-sorted).
+
+Version stays at 2.1.0 — the skeleton is a preview, not a functional promise; the MINOR bump lands with the v2.2.0 impl body.
+
+### Tests
+
+Two new lib tests exercise the skeleton:
+
+- `wgsl_morton_sort_shader_present` — structural check on struct + bindings + compute entry name + the `TODO(v2.2.0-impl)` marker.
+- `wgsl_morton_sort_shader_compiles` — naga validation on the full skeleton shader.
+
+Total 199 lib tests (previously 197), all pass on macOS Metal.
+
 ## [2.1.0] - 2026-07-07
 
 ### Added — Phase 3 first primitive kernels (Fix128 AABB helpers + Morton code)
