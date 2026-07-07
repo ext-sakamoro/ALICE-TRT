@@ -2,6 +2,64 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.7.0] - 2026-07-07
+
+### Added — `GpuSolverBridge` trait-object integration for the contact-solve pipeline (Phase 3 §7)
+
+Exposes the v2.6.0 GPU PGS contact solve pipeline through the `alice_physics::gpu_bridge::GpuSolverBridge` trait, so callers can drive the full v2.2 → v2.6 broad-phase → narrow-phase → solve pipeline via a single `&mut dyn GpuSolverBridge` handle instead of adapter-specific inherent methods. Realises the "v1.5.1 → v1.6.0 opt-in / default-flip cadence" referenced in the design doc §7: v2.6.0 shipped the standalone kernel plus an inherent adapter method; v2.7.0 flips the API from "adapter-specific" to "trait-generic" so callers compose the pipeline through the same interface they use for the integrate + distance pipeline stages. Additive-only; the v2.6.0 public surface remains stable.
+
+Requires **alice-physics v0.9.0**, which extends the `GpuSolverBridge` trait with the five new methods listed below. The path-dependency in `Cargo.toml` picks up alice-physics v0.9.0 automatically.
+
+- **Three new state fields on `TrtSolverAdapter<'a>`** (all initialised empty by `TrtSolverAdapter::new`):
+  - `contact_constraints_gpu: Vec<ContactConstraintGpu>` — last uploaded constraint list, in-place `cached_lambda` writes accumulate across successive `dispatch_contact_solve_iteration` calls.
+  - `body_positions_gpu: Vec<Vec3FixGpu>` — last uploaded body positions, updated in place by every dispatch.
+  - `body_inv_masses_gpu: Vec<Fix128Gpu>` — last uploaded per-body inverse masses (read-only during dispatch).
+- **Five new trait method implementations** on `impl GpuSolverBridge for TrtSolverAdapter<'_>`:
+  - `send_contact_constraints(&[ContactConstraint])` — populate `contact_constraints_gpu` via `ContactConstraintGpu::from_physics` on each element.
+  - `send_body_state(&[[Fix128; 3]], &[Fix128])` — populate `body_positions_gpu` and `body_inv_masses_gpu` via `Fix128Gpu::from_raw`.
+  - `dispatch_contact_solve_iteration(Fix128)` — call v2.6.0 `dispatch_fix128_pgs_contact_solve` with the adapter's cached device reference and the three state buffers; write the returned updated constraints and positions back into the state buffers.
+  - `recv_contact_constraints(&mut [ContactConstraint])` — copy the `cached_lambda` field only from `contact_constraints_gpu` into each caller slot (other constraint fields are inputs the kernel does not modify).
+  - `recv_body_positions(&mut [[Fix128; 3]])` — copy positions from `body_positions_gpu` into the caller slice.
+
+### Typical usage pattern
+
+```rust
+let mut adapter = TrtSolverAdapter::new(&device);
+let bridge: &mut dyn GpuSolverBridge = &mut adapter;
+bridge.send_contact_constraints(&constraints);
+bridge.send_body_state(&positions, &inv_masses);
+for _ in 0..config.iterations {
+    bridge.dispatch_contact_solve_iteration(config.warm_start_factor);
+}
+bridge.recv_contact_constraints(&mut constraints);
+bridge.recv_body_positions(&mut positions);
+```
+
+The uploaded state persists across `dispatch_contact_solve_iteration` calls — callers upload once at the start of a substep, dispatch for every PGS iteration, and read back once at the end. This mirrors the CPU `PhysicsWorld::substep` loop where positions and constraints live in `PhysicsWorld` fields that persist across the inner iteration loop.
+
+### Tests (v2.7.0 additions)
+
+- `gpu_solver_bridge_contact_solve_trait_object_matches_cpu_golden` — **byte-exact GPU-CPU golden** driven through `&mut dyn GpuSolverBridge`. Constructs `TrtSolverAdapter`, up-casts to the trait object, runs send-dispatch-recv for 4 sequential PGS iterations on the v2.6.0 chain 6 fixture, and asserts byte-exact match on both `cached_lambda` (constraints) and positions (bodies) against a CPU replay of the same Stage B block. Proves that the trait-object entry points route to the v2.6.0 kernel with byte-exact fidelity.
+- `gpu_solver_bridge_contact_solve_default_impl_panics` — `#[should_panic]` verification that the default panic! implementation on the v0.9.0 trait extension fires when a pre-v0.9 backend (`MinimalBridge` inline test type overriding only the v0.7 island methods) is asked to `dispatch_contact_solve_iteration`. Documents the fail-fast contract at test time.
+- `gpu_solver_bridge_contact_solve_multi_iteration_state_persists` — verifies that send-once + dispatch-3-times + recv-once produces byte-identical output to send-dispatch-recv 3 times separately. Proves the sequential `cached_lambda` accumulation semantics survive across dispatches without re-upload.
+
+Total 215 lib tests (previously 212), all pass on macOS Metal.
+
+### Design doc
+
+- **`docs/PHASE_3_DESIGN.md` §2.8** — full v2.7.0 scope: `GpuSolverBridge` trait extension rationale, `panic!` default vs silent no-op discussion (with the CLAUDE.md silent-Ok(()) prohibition rule as the tie-breaker), `TrtSolverAdapter` state fields, trait-object usage example, CPU golden strategy, and v2.8.0 `PhysicsWorld` wire-through deferral rationale (lifetime + `Send + Sync` bound analysis complications).
+
+### Backwards compatibility
+
+Fully additive vs v2.6.0. No API changes. The v2.6.0 `dispatch_fix128_pgs_contact_solve` standalone kernel, `dispatch_contact_solve_iteration` inherent adapter method, `ContactConstraintGpu`, `Vec3FixGpu`, and all Phase 3 §1-§6 kernels are unchanged. The v2.7.0 trait methods on `TrtSolverAdapter` are additive — callers who don't opt in continue to use the adapter exactly as in v2.6.0.
+
+Requires alice-physics v0.9.0 (extends the `GpuSolverBridge` trait). Existing alice-physics v0.8.x-only backends compile against v0.9.0 unchanged; only callers that opt in to the contact solve trait methods observe any difference.
+
+### Next up
+
+- **v2.8.0** — `PhysicsWorld` wire-through: extend `PhysicsWorld` in alice-physics with an `Option<Box<dyn GpuSolverBridge + Send + Sync>>` field, route `solve_contact_constraints` through the trait when Some. Requires lifetime propagation analysis on `TrtSolverAdapter<'a>` (currently borrows `&'a GpuDevice`) and `Send + Sync` bound verification against Metal / Vulkan / DX12 backends.
+- **v2.7.x candidate** — parallel Gauss-Seidel via graph colouring (analog of v1.5.1's batched distance-constraint dispatch, adapted for contact solve). Requires fresh determinism analysis and a colour-aware CPU golden before shipping.
+
 ## [2.6.0] - 2026-07-07
 
 ### Added — GPU PGS contact solve kernel + `TrtSolverAdapter` opt-in (Phase 3 §6 — Phase 3 completion)

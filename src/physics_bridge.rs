@@ -193,6 +193,7 @@ mod tests {
 mod solver_bridge {
     use alice_physics::gpu_bridge::{DiffFixture, GpuDivergence, GpuSolverBridge};
     use alice_physics::math::Fix128;
+    use alice_physics::solver::ContactConstraint;
 
     use crate::constraint_graph::ConstraintGraph;
     use crate::fix128::{
@@ -290,6 +291,27 @@ mod solver_bridge {
         /// the v1.4.2 byte-exact CPU-golden test no longer applies to
         /// the toggle-on path (a colored CPU golden lands in v1.5.2).
         parallel_dispatch: bool,
+        /// v2.7.0: uploaded contact-constraint list. Populated by
+        /// [`GpuSolverBridge::send_contact_constraints`] and consumed
+        /// by [`GpuSolverBridge::dispatch_contact_solve_iteration`].
+        /// In-place `cached_lambda` writes accumulate across
+        /// successive dispatches so multi-iteration warm-start
+        /// semantics survive.
+        contact_constraints_gpu: Vec<ContactConstraintGpu>,
+        /// v2.7.0: uploaded body position array (as `Vec3FixGpu` per
+        /// body). Populated by
+        /// [`GpuSolverBridge::send_body_state`] and consumed +
+        /// updated in place by
+        /// [`GpuSolverBridge::dispatch_contact_solve_iteration`]. The
+        /// caller retrieves the corrected positions via
+        /// [`GpuSolverBridge::recv_body_positions`].
+        body_positions_gpu: Vec<Vec3FixGpu>,
+        /// v2.7.0: uploaded per-body inverse mass array. Populated
+        /// by [`GpuSolverBridge::send_body_state`] and consumed
+        /// read-only by
+        /// [`GpuSolverBridge::dispatch_contact_solve_iteration`].
+        /// Element `i == Fix128Gpu::ZERO` marks body `i` as static.
+        body_inv_masses_gpu: Vec<Fix128Gpu>,
     }
 
     impl<'a> TrtSolverAdapter<'a> {
@@ -572,6 +594,12 @@ mod solver_bridge {
                 // starting this release. The sequential v1.4.2 path
                 // remains available via `set_parallel_dispatch(false)`.
                 parallel_dispatch: true,
+                // v2.7.0: contact-solve pipeline state. All empty at
+                // construction; populated by the `send_*` methods on
+                // the `GpuSolverBridge` trait impl below.
+                contact_constraints_gpu: Vec::new(),
+                body_positions_gpu: Vec::new(),
+                body_inv_masses_gpu: Vec::new(),
             }
         }
 
@@ -1192,6 +1220,91 @@ mod solver_bridge {
             // `trt_solver_adapter_10_iter_matches_cpu_reference` test
             // proves this at the bridge layer.
             Ok(())
+        }
+
+        // ---- v2.7.0: contact-solve pipeline (via GpuSolverBridge) ----
+
+        fn send_contact_constraints(&mut self, constraints: &[ContactConstraint]) {
+            self.contact_constraints_gpu = constraints
+                .iter()
+                .map(ContactConstraintGpu::from_physics)
+                .collect();
+        }
+
+        fn send_body_state(&mut self, positions: &[[Fix128; 3]], inv_masses: &[Fix128]) {
+            assert_eq!(
+                positions.len(),
+                inv_masses.len(),
+                "send_body_state: positions.len() must equal inv_masses.len()"
+            );
+            self.body_positions_gpu = positions
+                .iter()
+                .map(|p| Vec3FixGpu {
+                    x: Fix128Gpu::from_raw(p[0].hi, p[0].lo),
+                    y: Fix128Gpu::from_raw(p[1].hi, p[1].lo),
+                    z: Fix128Gpu::from_raw(p[2].hi, p[2].lo),
+                })
+                .collect();
+            self.body_inv_masses_gpu = inv_masses
+                .iter()
+                .map(|m| Fix128Gpu::from_raw(m.hi, m.lo))
+                .collect();
+        }
+
+        fn dispatch_contact_solve_iteration(&mut self, warm_start_factor: Fix128) {
+            let wsf_gpu = Fix128Gpu::from_raw(warm_start_factor.hi, warm_start_factor.lo);
+            let (updated_constraints, updated_positions) = dispatch_fix128_pgs_contact_solve(
+                self.device,
+                &self.contact_constraints_gpu,
+                &self.body_positions_gpu,
+                &self.body_inv_masses_gpu,
+                wsf_gpu,
+            );
+            self.contact_constraints_gpu = updated_constraints;
+            self.body_positions_gpu = updated_positions;
+        }
+
+        fn recv_contact_constraints(&self, constraints: &mut [ContactConstraint]) {
+            assert_eq!(
+                constraints.len(),
+                self.contact_constraints_gpu.len(),
+                "recv_contact_constraints: caller slice length must equal the uploaded constraint count"
+            );
+            // Only the `cached_lambda` field is updated by the kernel;
+            // other fields (body indices, contact geometry, friction,
+            // restitution) were caller inputs the kernel does not
+            // modify. Preserving them here matches the trait contract
+            // documented in alice_physics::gpu_bridge.
+            for (dst, src) in constraints.iter_mut().zip(&self.contact_constraints_gpu) {
+                dst.cached_lambda = Fix128 {
+                    hi: src.cached_lambda.hi,
+                    lo: src.cached_lambda.lo,
+                };
+            }
+        }
+
+        fn recv_body_positions(&self, positions: &mut [[Fix128; 3]]) {
+            assert_eq!(
+                positions.len(),
+                self.body_positions_gpu.len(),
+                "recv_body_positions: caller slice length must equal the uploaded position count"
+            );
+            for (dst, src) in positions.iter_mut().zip(&self.body_positions_gpu) {
+                *dst = [
+                    Fix128 {
+                        hi: src.x.hi,
+                        lo: src.x.lo,
+                    },
+                    Fix128 {
+                        hi: src.y.hi,
+                        lo: src.y.lo,
+                    },
+                    Fix128 {
+                        hi: src.z.hi,
+                        lo: src.z.lo,
+                    },
+                ];
+            }
         }
     }
 
@@ -1985,6 +2098,268 @@ mod solver_bridge {
                     "position hi drifted at slot {i} despite cleared constraints"
                 );
                 assert_eq!(gpu_p.lo, expected.lo);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // v2.7.0 GpuSolverBridge contact-solve trait-object tests
+        // -----------------------------------------------------------------
+
+        /// Byte-exact CPU-GPU golden for the v2.7.0 GpuSolverBridge
+        /// contact solve pipeline driven through a `&mut dyn
+        /// GpuSolverBridge` trait object. Constructs a
+        /// `TrtSolverAdapter`, up-casts it to the trait object,
+        /// runs send-dispatch-recv for 4 sequential PGS iterations
+        /// on the v2.6.0 chain 6 fixture (5 collision pairs, all
+        /// dynamic), and asserts byte-exact match against a CPU
+        /// replay of the same Stage B block. Verifies that the
+        /// trait-object entry points route to the v2.6.0
+        /// `dispatch_fix128_pgs_contact_solve` byte-for-byte.
+        #[cfg(feature = "physics-solver")]
+        #[test]
+        fn gpu_solver_bridge_contact_solve_trait_object_matches_cpu_golden() {
+            use alice_physics::collider::Contact;
+            use alice_physics::math::{Fix128, Vec3Fix};
+            use alice_physics::solver::ContactConstraint;
+
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return, // Headless CI, skip.
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+
+            let warm_start_factor = Fix128::from_ratio(85, 100);
+            let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
+
+            // Chain 6: 6 bodies at x = 0, 2, 4, 6, 8, 10; radius 1.1.
+            let positions: Vec<[Fix128; 3]> = (0..6i64)
+                .map(|i| [Fix128::from_int(i * 2), Fix128::ZERO, Fix128::ZERO])
+                .collect();
+            let inv_masses: Vec<Fix128> = (0..6).map(|_| Fix128::from_int(1)).collect();
+            let constraints: Vec<ContactConstraint> = (0..5usize)
+                .map(|i| ContactConstraint {
+                    body_a: i,
+                    body_b: i + 1,
+                    contact: Contact {
+                        depth: Fix128::from_ratio(2, 10),
+                        normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                        point_a: Vec3Fix::ZERO,
+                        point_b: Vec3Fix::ZERO,
+                    },
+                    friction: Fix128::from_ratio(3, 10),
+                    restitution: Fix128::from_ratio(2, 10),
+                    cached_lambda: Fix128::ZERO,
+                })
+                .collect();
+
+            // CPU replay of the Stage B block from
+            // solver::PhysicsWorld::solve_contact_constraints.
+            fn cpu_stage_b(
+                constraints: &mut [ContactConstraint],
+                positions: &mut [[Fix128; 3]],
+                inv_masses: &[Fix128],
+                warm_start_factor: Fix128,
+                w_sum_epsilon: Fix128,
+            ) {
+                for i in 0..constraints.len() {
+                    let c = constraints[i];
+                    if c.contact.depth <= Fix128::ZERO {
+                        continue;
+                    }
+                    let ma_inv = inv_masses[c.body_a];
+                    let mb_inv = inv_masses[c.body_b];
+                    let w_sum = ma_inv + mb_inv;
+                    if w_sum < w_sum_epsilon {
+                        continue;
+                    }
+                    let inv_w_sum = Fix128::ONE / w_sum;
+                    let biased = c.contact.depth - c.cached_lambda * warm_start_factor;
+                    let lambda = if biased > Fix128::ZERO {
+                        biased
+                    } else {
+                        Fix128::ZERO
+                    };
+                    constraints[i].cached_lambda = lambda;
+                    let correction = c.contact.normal * lambda;
+                    let ca = correction * (ma_inv * inv_w_sum);
+                    let cb = correction * (mb_inv * inv_w_sum);
+                    if !ma_inv.is_zero() {
+                        let p = &mut positions[c.body_a];
+                        let updated = Vec3Fix::new(p[0], p[1], p[2]) + ca;
+                        *p = [updated.x, updated.y, updated.z];
+                    }
+                    if !mb_inv.is_zero() {
+                        let p = &mut positions[c.body_b];
+                        let updated = Vec3Fix::new(p[0], p[1], p[2]) - cb;
+                        *p = [updated.x, updated.y, updated.z];
+                    }
+                }
+            }
+
+            // Drive the GPU through the trait-object entry points.
+            let mut gpu_c = constraints.clone();
+            let mut gpu_p = positions.clone();
+            {
+                let bridge: &mut dyn GpuSolverBridge = &mut adapter;
+                bridge.send_contact_constraints(&gpu_c);
+                bridge.send_body_state(&gpu_p, &inv_masses);
+                for _ in 0..4 {
+                    bridge.dispatch_contact_solve_iteration(warm_start_factor);
+                }
+                bridge.recv_contact_constraints(&mut gpu_c);
+                bridge.recv_body_positions(&mut gpu_p);
+            }
+
+            // CPU replay of the same 4 iterations.
+            let mut cpu_c = constraints.clone();
+            let mut cpu_p = positions.clone();
+            for _ in 0..4 {
+                cpu_stage_b(
+                    &mut cpu_c,
+                    &mut cpu_p,
+                    &inv_masses,
+                    warm_start_factor,
+                    w_sum_epsilon,
+                );
+            }
+
+            // Byte-exact match on cached_lambda (constraints) and
+            // positions (bodies).
+            for (i, (g, c)) in gpu_c.iter().zip(cpu_c.iter()).enumerate() {
+                assert_eq!(
+                    g.cached_lambda.hi, c.cached_lambda.hi,
+                    "cached_lambda hi mismatch at constraint {i}"
+                );
+                assert_eq!(
+                    g.cached_lambda.lo, c.cached_lambda.lo,
+                    "cached_lambda lo mismatch at constraint {i}"
+                );
+            }
+            for (i, (g, c)) in gpu_p.iter().zip(cpu_p.iter()).enumerate() {
+                for axis in 0..3 {
+                    assert_eq!(
+                        g[axis].hi, c[axis].hi,
+                        "position hi mismatch at body {i} axis {axis}"
+                    );
+                    assert_eq!(
+                        g[axis].lo, c[axis].lo,
+                        "position lo mismatch at body {i} axis {axis}"
+                    );
+                }
+            }
+        }
+
+        /// The `GpuSolverBridge` default implementations of the
+        /// contact-solve methods panic with a
+        /// "not implemented by this backend" message when a
+        /// pre-v0.9 backend (like `MinimalBridge` below, which
+        /// overrides only the v0.7 island methods) is asked to
+        /// dispatch contact solve. Verifies that the fail-fast
+        /// default surfaces the missing capability instead of
+        /// silently no-op-ping.
+        #[test]
+        #[should_panic(expected = "not implemented by this GpuSolverBridge backend")]
+        fn gpu_solver_bridge_contact_solve_default_impl_panics() {
+            struct MinimalBridge;
+            impl GpuSolverBridge for MinimalBridge {
+                fn send_island(&mut self, _p: &[[Fix128; 3]], _v: &[[Fix128; 3]]) {}
+                fn dispatch_iterations(&mut self, _iters: u32, _dt: Fix128) {}
+                fn recv_island(&self, _p: &mut [[Fix128; 3]], _v: &mut [[Fix128; 3]]) {}
+                fn assert_bit_exact_vs_cpu(
+                    &self,
+                    _fixture: &DiffFixture,
+                ) -> Result<(), GpuDivergence> {
+                    Ok(())
+                }
+            }
+            let mut bridge = MinimalBridge;
+            let bridge_dyn: &mut dyn GpuSolverBridge = &mut bridge;
+            bridge_dyn.dispatch_contact_solve_iteration(Fix128::from_ratio(85, 100));
+        }
+
+        /// Multi-iteration state persistence test: send-once,
+        /// dispatch-N-times, recv-once cycle preserves the
+        /// in-place `cached_lambda` accumulation across successive
+        /// dispatches. This is the byte-exact contract that lets
+        /// higher-level orchestrators call `send_contact_constraints`
+        /// + `send_body_state` once at the start of a substep and
+        /// then loop `dispatch_contact_solve_iteration` for
+        /// `config.iterations` iterations (mirroring the CPU
+        /// `substep` loop) without re-uploading between iterations.
+        #[cfg(feature = "physics-solver")]
+        #[test]
+        fn gpu_solver_bridge_contact_solve_multi_iteration_state_persists() {
+            use alice_physics::collider::Contact;
+            use alice_physics::math::{Fix128, Vec3Fix};
+            use alice_physics::solver::ContactConstraint;
+
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut adapter = TrtSolverAdapter::new(&device);
+            let mut adapter_batched = TrtSolverAdapter::new(&device);
+
+            let warm_start_factor = Fix128::from_ratio(85, 100);
+
+            // Two dynamic bodies overlapping along X: pos_a=(0,0,0),
+            // pos_b=(1,0,0), radius sum 1.5 → depth 0.5, normal (1,0,0).
+            let positions: Vec<[Fix128; 3]> = vec![
+                [Fix128::ZERO, Fix128::ZERO, Fix128::ZERO],
+                [Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO],
+            ];
+            let inv_masses: Vec<Fix128> = vec![Fix128::from_int(1), Fix128::from_int(1)];
+            let constraints: Vec<ContactConstraint> = vec![ContactConstraint {
+                body_a: 0,
+                body_b: 1,
+                contact: Contact {
+                    depth: Fix128::from_ratio(5, 10),
+                    normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                    point_a: Vec3Fix::ZERO,
+                    point_b: Vec3Fix::ZERO,
+                },
+                friction: Fix128::from_ratio(3, 10),
+                restitution: Fix128::from_ratio(2, 10),
+                cached_lambda: Fix128::ZERO,
+            }];
+
+            // Reference: send-dispatch-recv 3 separate times.
+            let mut ref_c = constraints.clone();
+            let mut ref_p = positions.clone();
+            for _ in 0..3 {
+                let bridge: &mut dyn GpuSolverBridge = &mut adapter;
+                bridge.send_contact_constraints(&ref_c);
+                bridge.send_body_state(&ref_p, &inv_masses);
+                bridge.dispatch_contact_solve_iteration(warm_start_factor);
+                bridge.recv_contact_constraints(&mut ref_c);
+                bridge.recv_body_positions(&mut ref_p);
+            }
+
+            // Batched: send-once, dispatch-3-times, recv-once.
+            let mut batched_c = constraints;
+            let mut batched_p = positions;
+            {
+                let bridge: &mut dyn GpuSolverBridge = &mut adapter_batched;
+                bridge.send_contact_constraints(&batched_c);
+                bridge.send_body_state(&batched_p, &inv_masses);
+                for _ in 0..3 {
+                    bridge.dispatch_contact_solve_iteration(warm_start_factor);
+                }
+                bridge.recv_contact_constraints(&mut batched_c);
+                bridge.recv_body_positions(&mut batched_p);
+            }
+
+            // Byte-exact match: state accumulation across dispatches
+            // is equivalent to re-sending every iteration.
+            for (r, b) in ref_c.iter().zip(batched_c.iter()) {
+                assert_eq!(r.cached_lambda.hi, b.cached_lambda.hi);
+                assert_eq!(r.cached_lambda.lo, b.cached_lambda.lo);
+            }
+            for (r, b) in ref_p.iter().zip(batched_p.iter()) {
+                for axis in 0..3 {
+                    assert_eq!(r[axis].hi, b[axis].hi);
+                    assert_eq!(r[axis].lo, b[axis].lo);
+                }
             }
         }
     }

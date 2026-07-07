@@ -569,6 +569,67 @@ updated body positions + cached_lambda warm-start state
 
 Every stage passes a byte-exact CPU-GPU golden on Metal / Vulkan lavapipe / DX12 WARP.
 
+### 2.8 v2.7.0 scope (upcoming: `GpuSolverBridge` trait extension + `TrtSolverAdapter` trait-object integration)
+
+The v2.7.0 release exposes the v2.6.0 GPU PGS contact solve pipeline through the `alice_physics::gpu_bridge::GpuSolverBridge` trait, so callers can drive the full v2.2 → v2.6 pipeline via a single `&mut dyn GpuSolverBridge` handle instead of adapter-specific inherent methods. This is the direct realisation of the "v1.5.1 → v1.6.0 opt-in / default-flip cadence" referenced in the design doc §7 — v2.6.0 shipped the standalone kernel plus an inherent adapter method; v2.7.0 flips the API from "adapter-specific" to "trait-generic" so callers can compose the pipeline through the same interface they use for the integrate + distance pipeline stages.
+
+#### `GpuSolverBridge` trait extension (alice-physics v0.9.0)
+
+The v0.9.0 release of `alice-physics` extends the `GpuSolverBridge` trait with five new methods for the Phase 3 contact solve pipeline stage:
+
+- `send_contact_constraints(&mut self, constraints: &[ContactConstraint])` — upload the constraint list into the GPU-side buffer.
+- `send_body_state(&mut self, positions: &[[Fix128; 3]], inv_masses: &[Fix128])` — upload the per-body state that contact solve reads.
+- `dispatch_contact_solve_iteration(&mut self, warm_start_factor: Fix128)` — run one sequential Gauss-Seidel PGS iteration.
+- `recv_contact_constraints(&self, constraints: &mut [ContactConstraint])` — read back the post-solve `cached_lambda` warm-start state.
+- `recv_body_positions(&self, positions: &mut [[Fix128; 3]])` — read back the post-solve body positions.
+
+Every new method ships with a `panic!("...not implemented by this GpuSolverBridge backend")` default implementation. Silent no-op defaults (e.g., `fn ... {}`) were considered and rejected — they violate the ALICE-* silent-Ok(()) prohibition rule that CLAUDE.md documents (fake-success masking), and they would silently drop contact solve work on pre-v0.9 backends that don't override, leaving the caller with unchanged state that looks like a "no contacts fired" case. `panic!` surfaces the missing capability as a fail-fast bug the moment a caller tries to route contact solve through a backend that doesn't support it.
+
+Backward compatibility is 100% source-compatible with v0.8.x: existing `GpuSolverBridge` implementations (including the `StubBridge` test type in alice-physics tests and any external backend) compile unchanged. The new methods only affect callers that opt in to the contact solve pipeline stage.
+
+#### `TrtSolverAdapter` trait-object integration (alice-trt v2.7.0)
+
+The `TrtSolverAdapter` in `alice-trt` gains three new state fields:
+
+- `contact_constraints_gpu: Vec<ContactConstraintGpu>` — last uploaded constraint list, in-place `cached_lambda` writes accumulate across successive `dispatch_contact_solve_iteration` calls.
+- `body_positions_gpu: Vec<Vec3FixGpu>` — last uploaded body positions, updated in place by every dispatch.
+- `body_inv_masses_gpu: Vec<Fix128Gpu>` — last uploaded per-body inverse masses (read-only during dispatch).
+
+All three are initialised empty in `TrtSolverAdapter::new` and populated by the corresponding `send_*` methods on the `GpuSolverBridge` trait impl. The five new trait methods on the `impl GpuSolverBridge for TrtSolverAdapter<'_>` block delegate to the v2.6.0 `dispatch_fix128_pgs_contact_solve` standalone kernel using these buffers.
+
+```rust
+// Typical caller pattern for one substep with N iterations.
+let bridge: &mut dyn GpuSolverBridge = &mut adapter;
+bridge.send_contact_constraints(&constraints);
+bridge.send_body_state(&positions, &inv_masses);
+for _ in 0..config.iterations {
+    bridge.dispatch_contact_solve_iteration(config.warm_start_factor);
+}
+bridge.recv_contact_constraints(&mut constraints);
+bridge.recv_body_positions(&mut positions);
+```
+
+The uploaded state persists across `dispatch_contact_solve_iteration` calls — callers upload once at the start of a substep, dispatch for every PGS iteration, and read back once at the end. This mirrors the CPU `PhysicsWorld::substep` loop where positions and constraints live in `PhysicsWorld` fields that persist across the inner iteration loop.
+
+#### CPU golden strategy
+
+The v2.7.0 golden test constructs a `TrtSolverAdapter`, up-casts it to `&mut dyn GpuSolverBridge`, and drives send-dispatch-recv for 4 sequential PGS iterations on the v2.6.0 chain 6 fixture. A CPU replay of the same Stage B block from `PhysicsWorld::solve_contact_constraints` runs alongside; both outputs are compared byte-for-byte on `cached_lambda` (constraints) and positions (bodies). This proves that the trait-object entry points route to the v2.6.0 kernel with byte-exact fidelity.
+
+A separate `should_panic` test verifies that the default panic! implementation on the v0.9.0 trait extension fires when a pre-v0.9 backend (a `MinimalBridge` inline test type that overrides only the four v0.7 island methods) is asked to `dispatch_contact_solve_iteration`. This documents the fail-fast contract at test time so future contributors don't accidentally break it.
+
+A third test verifies that the in-place state persistence contract holds: send-once + dispatch-N-times + recv-once produces byte-identical output to send-dispatch-recv N times separately (both preserve the sequential `cached_lambda` accumulation semantics).
+
+#### v2.8.0 — deferred: `PhysicsWorld` wire-through
+
+Deeper wire-through — where `PhysicsWorld::solve_contact_constraints` on the CPU automatically routes through an attached `GpuSolverBridge` implementation — requires:
+
+1. **Optional bridge field on `PhysicsWorld`**: `gpu_solver_bridge: Option<Box<dyn GpuSolverBridge + Send + Sync>>`.
+2. **Lifetime propagation**: `TrtSolverAdapter<'a>` currently holds `&'a GpuDevice`. To store it in a `Box<dyn ...>` field on `PhysicsWorld`, either (a) `PhysicsWorld` grows a lifetime parameter — a large API surface change touching every downstream consumer, or (b) `TrtSolverAdapter` moves to owning the `GpuDevice` (`Arc<GpuDevice>`), which requires a broader ownership refactor.
+3. **`Send + Sync` bounds analysis**: wgpu resources have specific `Send + Sync` requirements that vary by backend; a bound analysis needs to run against Metal / Vulkan / DX12 targets to confirm the trait-object is safely shareable.
+4. **CPU / GPU branching**: `PhysicsWorld::solve_contact_constraints` needs to branch on `self.gpu_solver_bridge.is_some()` and route through the trait, then read back into the CPU-side `contact_constraints` and `bodies` state.
+
+Each item is a scoped chunk on its own but the composition is a larger undertaking than the trait-extension-only v2.7.0. Scheduling the wire-through as v2.8.0 preserves the v2.7.0 release cadence and keeps the trait-object interface stable while the deeper integration is validated separately.
+
 ## §3 Determinism Invariants
 
 Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogued in the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill:
