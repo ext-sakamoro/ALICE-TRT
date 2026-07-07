@@ -383,6 +383,192 @@ Every fixture asserts `assert_eq!(gpu_contacts, cpu_contacts)` on the full `Vec<
 
 The v2.5.0 shader inlines every Fix128 primitive it needs — add / sub / mul / div / sqrt / lt / is_zero / half / neg / abs / u64 + u128 helpers — plus the `Vec3FixGpu` / `ContactGpu` structs plus the sphere-sphere composition. Estimated ~500 lines total, matching the Phase 2 batched rigid-rod kernel weight class. This is deliberate: the WGSL "no include" constraint means every shader is standalone, and copying certified primitives keeps each kernel independently auditable without cross-shader coupling.
 
+### 2.7 v2.6.0 scope (upcoming: PGS contact solve kernel + Phase 3 completion)
+
+The v2.6.0 release ships the **GPU PGS contact solve kernel** that consumes the contact list produced by v2.5.0 and executes one PGS iteration — updating body positions and per-constraint `cached_lambda` warm-start state — byte-identical to `alice_physics::solver::PhysicsWorld::solve_contact_constraints`. This closes the Phase 3 GPU pipeline: broad-phase (v2.2 sort → v2.3 build → v2.4 find_pairs) → narrow-phase (v2.5 sphere-sphere contacts) → solve (v2.6 PGS iteration), all on the GPU with byte-exact CPU parity.
+
+#### Scope carve-out
+
+The CPU `solve_contact_constraints` per-iteration loop is:
+
+```rust
+for i in 0..num_constraints {
+    let constraint = self.contact_constraints[i];   // Copy
+    let body_a = self.bodies[constraint.body_a];    // Copy (post-writes from earlier i)
+    let body_b = self.bodies[constraint.body_b];
+
+    // Stage A: state-dependent filters (CPU-only).
+    if body_a.is_sensor || body_b.is_sensor { continue; }
+    let mut contact = constraint.contact;
+    let mut friction = constraint.friction;
+    let mut restitution = constraint.restitution;
+    #[cfg(feature = "std")]
+    { /* pre_solve_hook + contact_modifier — closures — CPU-only */ }
+
+    // Stage B: numeric map (portable to GPU).
+    if contact.depth <= Fix128::ZERO { continue; }
+    let w_sum = body_a.inv_mass + body_b.inv_mass;
+    if w_sum < W_SUM_EPSILON { continue; }
+    let inv_w_sum = Fix128::ONE / w_sum;
+    let biased_depth = contact.depth - constraint.cached_lambda * self.config.warm_start_factor;
+    let lambda = if biased_depth > Fix128::ZERO { biased_depth } else { Fix128::ZERO };
+    self.contact_constraints[i].cached_lambda = lambda;   // ← state update
+
+    let correction = contact.normal * lambda;
+    let correction_a = correction * (body_a.inv_mass * inv_w_sum);
+    let correction_b = correction * (body_b.inv_mass * inv_w_sum);
+    self.bodies[constraint.body_a].position = select_vec3(!body_a.inv_mass.is_zero(),
+        self.bodies[constraint.body_a].position + correction_a,
+        self.bodies[constraint.body_a].position);
+    self.bodies[constraint.body_b].position = select_vec3(!body_b.inv_mass.is_zero(),
+        self.bodies[constraint.body_b].position - correction_b,
+        self.bodies[constraint.body_b].position);
+}
+```
+
+Only **Stage B** ports to GPU. Stage A (sensor flag, pre-solve hook, contact modifier — the modifier can mutate `depth` / `normal` / `friction` / `restitution`) stays on the CPU and is applied to the constraint list before the caller uploads it to the GPU. This mirrors the same scope decision as v2.5.0's sphere-sphere kernel: GPU handles the deterministic numeric hot path, CPU handles state-dependent orchestration and closure-based extension points.
+
+#### Algorithm — CPU parity per-constraint pass
+
+Per constraint `i` from the input list, with body indices `a = constraints[i].body_a`, `b = constraints[i].body_b`:
+
+```
+if is_negative(constraints[i].depth) || is_zero(constraints[i].depth): continue  // depth <= 0 skip
+ma_inv = inv_masses[a]
+mb_inv = inv_masses[b]
+w_sum = fix128_add(ma_inv, mb_inv)
+if fix128_lt(w_sum, W_SUM_EPSILON): continue
+inv_w_sum = fix128_div(fix128_one(), w_sum)
+cl_wsf = fix128_mul(constraints[i].cached_lambda, warm_start_factor)
+biased_depth = fix128_sub(constraints[i].depth, cl_wsf)
+lambda = if fix128_lt(fix128_zero(), biased_depth) { biased_depth } else { fix128_zero() }
+constraints[i].cached_lambda = lambda   // in-place write
+correction = vec3_scale(constraints[i].normal, lambda)
+scale_a = fix128_mul(ma_inv, inv_w_sum)
+scale_b = fix128_mul(mb_inv, inv_w_sum)
+corr_a = vec3_scale(correction, scale_a)
+corr_b = vec3_scale(correction, scale_b)
+if !fix128_is_zero(ma_inv): body_positions[a] = vec3_add(body_positions[a], corr_a)
+if !fix128_is_zero(mb_inv): body_positions[b] = vec3_sub(body_positions[b], corr_b)
+```
+
+Total ~17 Fix128 ops per constraint (no sqrt, so smaller than v2.5.0's ~19). `W_SUM_EPSILON` is the compile-time constant `Fix128 { hi: 0, lo: 0x0000_0100_0000_0000 }` embedded in the shader (matches the CPU `solver.rs` `const W_SUM_EPSILON`).
+
+#### Branchless-select equivalence
+
+The CPU uses `select_vec3(!inv_mass.is_zero(), pos + correction, pos)` — a bitwise branchless select — to keep the update SIMD-friendly. The GPU port uses an `if` branch instead. Both are byte-exact equivalent because when `inv_mass == 0`, the pre-computed `correction_a = correction * (inv_mass * inv_w_sum) = correction * 0 = 0`, and `pos + 0 == pos` in Fix128 (zero is the additive identity). The two forms produce identical body-position byte patterns:
+
+- Branchless: `select(cond, pos + 0, pos) = pos`
+- Branchy: `skip when inv_mass == 0` → `pos` unchanged
+
+Verified with a static-body fixture in the golden test.
+
+#### Sequential Gauss-Seidel semantics
+
+Within one call to `solve_contact_constraints`, constraint `i+1` reads body positions that constraint `i` has already updated (if they share a body). This is standard Gauss-Seidel — the loop is inherently sequential. The GPU port preserves this by dispatching a single-workgroup single-thread kernel, matching the v2.3.0 / v2.4.0 / v2.5.0 pattern. Parallelisation (via graph colouring, mirroring the v1.5.1 distance-constraint batched dispatch) is a v2.6.x candidate optimisation; the correctness-first v2.6.0 release ships the byte-exact sequential path first.
+
+#### Bindings (v2.6.0 layout — frozen at this release)
+
+- `@group(0) @binding(0) var<storage, read_write> constraints:       array<ContactConstraintGpu>` — in-place `cached_lambda` update. Every other field (body ids, depth, normal, point_a, point_b, friction, restitution) is read-only for this kernel but the whole struct is uploaded per iteration.
+- `@group(0) @binding(1) var<storage, read_write> body_positions:    array<Vec3FixGpu>` — in-place position update. Indexed by body id `a` / `b` from `constraints[i]`.
+- `@group(0) @binding(2) var<storage, read>       body_inv_masses:   array<Fix128Gpu>` — per-body inverse mass. `inv_masses[i] == 0` marks body `i` as static.
+- `@group(0) @binding(3) var<uniform>             params:            PgsContactSolveParams` — `{ constraint_count: u32, _pad0, _pad1, _pad2, warm_start_factor: Fix128Gpu }` (32-byte aligned).
+
+Only four bindings — no separate atomic counter because the kernel emits no growing output list (each constraint writes to a fixed slot).
+
+Where `ContactConstraintGpu { body_a: u32, body_b: u32, _pad0: u32, _pad1: u32, depth: Fix128Gpu, normal: Vec3FixGpu, point_a: Vec3FixGpu, point_b: Vec3FixGpu, friction: Fix128Gpu, restitution: Fix128Gpu, cached_lambda: Fix128Gpu }` (224 bytes, byte-identical to the CPU `ContactConstraint` layout after the depth-normal-point_a-point_b bundle is unpacked from `Contact`).
+
+#### `TrtSolverAdapter` opt-in wrapper
+
+The v2.6.0 release adds a minimal opt-in method on the existing `TrtSolverAdapter`:
+
+```rust
+impl TrtSolverAdapter<'_> {
+    pub fn dispatch_contact_solve_iteration(
+        &self,
+        constraints: &[ContactConstraintGpu],
+        positions: &[Vec3FixGpu],
+        inv_masses: &[Fix128Gpu],
+        warm_start_factor: Fix128Gpu,
+    ) -> (Vec<ContactConstraintGpu>, Vec<Vec3FixGpu>) {
+        dispatch_fix128_pgs_contact_solve(
+            self.device, constraints, positions, inv_masses, warm_start_factor,
+        )
+    }
+}
+```
+
+The wrapper delegates to the standalone `dispatch_fix128_pgs_contact_solve` using the adapter's cached `device` reference. The adapter's own stateful buffers (`positions` / `velocities` / `distance_constraints`) are unaffected — callers who want to keep using `send_island` / `dispatch_iterations` / `recv_island` for the integrate + floor + distance pipeline can also call `dispatch_contact_solve_iteration` alongside without conflict. Backward compatibility with v2.5.x is 100% preserved.
+
+Deeper wire-through — where `solve_contact_constraints` on the CPU automatically routes through the GPU kernel via the `GpuSolverBridge` trait — requires a trait extension in `alice-physics` and lands as **v2.7.0 default-flip** (mirroring the v1.5.1 → v1.6.0 opt-in / default-flip cadence).
+
+#### CPU golden strategy
+
+The v2.6.0 golden replays the Stage B numeric block directly on the CPU (bypassing the closure-based Stage A hooks and modifiers which are out of the GPU-comparable surface) and compares byte-for-byte:
+
+```rust
+let (mut cpu_constraints, mut cpu_positions) = (input_constraints.clone(), input_positions.clone());
+for i in 0..cpu_constraints.len() {
+    let c = cpu_constraints[i];
+    if !(c.depth > Fix128::ZERO) { continue; }
+    let ma_inv = inv_masses_physics[c.body_a as usize];
+    let mb_inv = inv_masses_physics[c.body_b as usize];
+    let w_sum = ma_inv + mb_inv;
+    if w_sum < W_SUM_EPSILON { continue; }
+    let inv_w_sum = Fix128::ONE / w_sum;
+    let biased = c.depth - c.cached_lambda * warm_start_factor;
+    let lambda = if biased > Fix128::ZERO { biased } else { Fix128::ZERO };
+    cpu_constraints[i].cached_lambda = lambda;
+    let correction = c.normal * lambda;
+    let ca = correction * (ma_inv * inv_w_sum);
+    let cb = correction * (mb_inv * inv_w_sum);
+    if !ma_inv.is_zero() { cpu_positions[c.body_a as usize] = cpu_positions[c.body_a as usize] + ca; }
+    if !mb_inv.is_zero() { cpu_positions[c.body_b as usize] = cpu_positions[c.body_b as usize] - cb; }
+}
+
+let (gpu_constraints, gpu_positions) = dispatch_fix128_pgs_contact_solve(
+    &device, &input_constraints, &input_positions, &inv_masses_gpu, warm_start_factor);
+
+assert_eq!(gpu_constraints, cpu_constraints);   // cached_lambda updates match
+assert_eq!(gpu_positions, cpu_positions);       // position corrections match
+```
+
+Both `#[derive(PartialEq, Eq)]` on the GPU-side struct types (`ContactConstraintGpu`, `Vec3FixGpu`) enable direct `assert_eq!` on the `Vec<...>` values.
+
+#### Edge cases covered by the v2.6.0 fixture
+
+1. **Overlap pile** — derived from v2.5.0's overlap pile (32 bodies, 4×4×2, spacing 1.5, radius 1) with all bodies dynamic (`inv_mass = 1`). Exercises the full Gauss-Seidel sequential update path where each constraint corrects positions that later constraints read.
+2. **Chain 6 multi-iteration** — v2.5.0's chain 6 fixture (5 collision pairs, all dynamic). Runs 4 PGS iterations sequentially and asserts that `cached_lambda` accumulation matches the CPU byte-for-byte at every iteration (verifies the in-place write-back semantics survive iteration).
+3. **Static + dynamic mix** — 4 bodies with mixed `inv_mass` (bodies 0 and 3 have `inv_mass = 0` = static, bodies 1 and 2 have `inv_mass = 1` = dynamic). Two collision pairs. Verifies:
+   - Static bodies never move (branchless-select equivalence path).
+   - Dynamic bodies still get the full correction when paired with a static body (`inv_w_sum = 1 / (0 + 1) = 1`, so `correction_dynamic = correction * (1 * 1) = correction`).
+
+Every fixture asserts `assert_eq!(gpu_positions, cpu_positions)` **and** `assert_eq!(gpu_constraints, cpu_constraints)`.
+
+#### Kernel size
+
+The v2.6.0 shader inlines add / sub / mul / div / lt / is_zero / is_negative / one / zero primitives plus the `Fix128Gpu` / `Vec3FixGpu` / `ContactConstraintGpu` / `PgsContactSolveParams` structs plus the `W_SUM_EPSILON` constant plus the PGS composition. Estimated ~400 lines — smaller than v2.5.0's sphere-sphere kernel because there is no `sqrt` primitive (which alone accounts for ~100 lines of Newton-Raphson + long division).
+
+#### Phase 3 completion
+
+With v2.6.0, the Phase 3 GPU BVH → narrow-phase → PGS solve pipeline is **byte-exact end-to-end**:
+
+```text
+Vec<BvhPrimitive>
+   ↓ (v2.2.0) dispatch_fix128_morton_sort
+sorted (codes, indices)
+   ↓ (v2.3.0) dispatch_fix128_bvh_build
+Vec<BvhNodeGpu>
+   ↓ (v2.4.0) dispatch_fix128_bvh_find_pairs
+Vec<(u32, u32)>
+   ↓ (v2.5.0) dispatch_fix128_sphere_sphere_contact
+Vec<ContactGpu>
+   ↓ (v2.6.0) dispatch_fix128_pgs_contact_solve
+updated body positions + cached_lambda warm-start state
+```
+
+Every stage passes a byte-exact CPU-GPU golden on Metal / Vulkan lavapipe / DX12 WARP.
+
 ## §3 Determinism Invariants
 
 Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogued in the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill:

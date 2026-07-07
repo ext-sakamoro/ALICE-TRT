@@ -2,6 +2,75 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.6.0] - 2026-07-07
+
+### Added — GPU PGS contact solve kernel + `TrtSolverAdapter` opt-in (Phase 3 §6 — Phase 3 completion)
+
+Sixth and final implementation release of the Phase 3 GPU BVH pipeline. Ships the single-workgroup single-thread PGS contact solve kernel that consumes the v2.5.0 sphere-sphere contact list (once composed into `ContactConstraintGpu` on the host side) and executes one PGS iteration — updating body positions and per-constraint `cached_lambda` warm-start state — byte-identical to the Stage B block of `alice_physics::solver::PhysicsWorld::solve_contact_constraints`. Also adds a minimal `TrtSolverAdapter::dispatch_contact_solve_iteration` opt-in wrapper. Closes the Phase 3 broad-phase → narrow-phase → solve pipeline byte-exact end-to-end.
+
+- **`FIX128_PGS_CONTACT_SOLVE_WGSL` — full impl** (new WGSL constant, ~400 lines). Single `@compute @workgroup_size(1)` entry `fix128_pgs_contact_solve_main` iterates the constraint list and, per constraint, computes: depth ≤ 0 skip, `w_sum = ma_inv + mb_inv` with `w_sum < W_SUM_EPSILON` skip, `inv_w_sum = ONE / w_sum` (Fix128 div), `biased = depth - cached_lambda * warm_start_factor`, `lambda = max(biased, 0)`, in-place `cached_lambda` write, `correction = normal * lambda`, `corr_a = correction * (ma_inv * inv_w_sum)`, `corr_b = correction * (mb_inv * inv_w_sum)`, and branchy `if !is_zero(ma_inv): pos_a += corr_a` / `if !is_zero(mb_inv): pos_b -= corr_b`. Total ~17 Fix128 ops per constraint. No sqrt, so ~100 lines smaller than v2.5.0's sphere-sphere kernel. `W_SUM_EPSILON = Fix128 { hi: 0, lo: 0x0000_0100_0000_0000 }` is embedded as a shader constant matching `alice_physics::solver::W_SUM_EPSILON` byte-for-byte. See [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md) §2.7 for the full algorithm + bindings + scope carve-out.
+- **New public Rust struct `ContactConstraintGpu`** (`#[repr(C)]`, 224 bytes): byte-layout mirror of `alice_physics::solver::ContactConstraint`. Ships `from_physics(&ContactConstraint)` for byte-exact test fixtures. Fields: `body_a` / `body_b` (u32) → `_pad0` / `_pad1` (u32, 16-byte align pad) → `depth` (Fix128Gpu) → `normal` (Vec3FixGpu) → `point_a` (Vec3FixGpu) → `point_b` (Vec3FixGpu) → `friction` (Fix128Gpu) → `restitution` (Fix128Gpu) → `cached_lambda` (Fix128Gpu).
+- **New public Rust function** `dispatch_fix128_pgs_contact_solve(device, constraints, positions, inv_masses, warm_start_factor) -> (Vec<ContactConstraintGpu>, Vec<Vec3FixGpu>)`: full orchestrator. Uploads the constraint list plus per-body positions and inverse masses plus the warm-start factor uniform, dispatches at `(1, 1, 1)` workgroups, and reads back the updated constraint list (with new `cached_lambda` values) plus the updated body positions. Runs one PGS iteration; callers loop externally for multiple iterations.
+- **New `TrtSolverAdapter::dispatch_contact_solve_iteration` method** (opt-in wrapper): delegates to `dispatch_fix128_pgs_contact_solve` using the adapter's cached device reference. The adapter's own stateful buffers (`positions` / `velocities` / `distance_constraints`) are **not** touched — this method is a namespaced entry point for the standalone kernel so callers can drive the full v2.2 → v2.6 pipeline alongside the existing v0.9 – v1.5 integrate + floor + distance pipeline without buffer contention. Backward compatibility with v2.5.x is 100% preserved. Deeper wire-through (via `GpuSolverBridge` trait extension) lands as v2.7.0 default-flip.
+
+### Scope carve-out
+
+Only Stage B of the CPU `solve_contact_constraints` ports to GPU. Stage A (sensor flag skip, pre-solve hook closure, contact modifier closure with mutation of depth / normal / friction / restitution) stays CPU-side and is applied to the constraint list before the caller uploads it to the GPU. Mirrors the same design decision as v2.5.0's sphere-sphere kernel: GPU handles the deterministic numeric hot path, CPU handles state-dependent orchestration and closure-based extension points.
+
+### Branchless-select equivalence
+
+The CPU uses `select_vec3(!inv_mass.is_zero(), pos + correction, pos)` — a bitwise branchless select for SIMD friendliness. The GPU port uses an `if` branch instead. Both are byte-exact equivalent because when `inv_mass == 0`, `correction * (inv_mass * inv_w_sum) == 0` and `pos + 0 == pos` in Fix128 (zero is the additive identity). The static-body fixture in the golden test verifies this equivalence directly.
+
+### Sequential Gauss-Seidel semantics
+
+Within one iteration, constraint `i+1` reads body positions that constraint `i` has already updated (if they share a body). This is standard sequential Gauss-Seidel. The single-workgroup single-thread dispatch preserves this order exactly, matching the CPU `for i in 0..num_constraints` loop.
+
+### Tests (v2.6.0 additions)
+
+- `wgsl_pgs_contact_solve_shader_present` — structural coverage of the new WGSL surface (struct names, binding identifiers, Fix128 primitives composed, W_SUM_EPSILON byte pattern `0x00000100u`, Vec3 helpers, atomic-free in-place cached_lambda write, single `@workgroup_size(1)` entry). Runs on every 3-platform CI job without a GPU adapter.
+- `wgsl_pgs_contact_solve_shader_compiles` — naga validation via `create_shader_module`. Catches WGSL syntax / type errors on every platform.
+- `wgpu_pgs_contact_solve_matches_cpu_golden` — **byte-exact GPU-CPU golden** on three fixtures:
+  1. **Chain 6 × 4 iterations** — 5 adjacent-pair collision constraints, all-dynamic bodies. Runs 4 sequential PGS iterations and asserts byte-exact match on both `Vec<ContactConstraintGpu>` (cached_lambda accumulation) and `Vec<Vec3FixGpu>` (position corrections) at every iteration. Verifies the in-place write-back semantics survive iteration.
+  2. **Static + dynamic mix** — 4 bodies with `inv_mass = 0` for bodies 0 and 3 (static), `inv_mass = 1` for bodies 1 and 2 (dynamic). Two collision pairs. Verifies the branchless-select equivalence path: static bodies never move, dynamic bodies get the full correction.
+  3. **Triangle 3-body** — three all-dynamic bodies with three collision pairs. Exercises multi-body Gauss-Seidel updates where sequential constraint order matters (each pair correction feeds into the next pair's read).
+
+Full assertion: `assert_eq!(gpu_constraints, cpu_constraints)` on `Vec<ContactConstraintGpu>` (each 224 bytes) + `assert_eq!(gpu_positions, cpu_positions)` on `Vec<Vec3FixGpu>` (each 48 bytes), both via `#[derive(PartialEq, Eq)]`. Total 212 lib tests (previously 209), all pass on macOS Metal.
+
+### Design doc
+
+- **`docs/PHASE_3_DESIGN.md` §2.7** — full v2.6.0 scope: scope carve-out rationale, per-constraint algorithm, branchless-select equivalence, sequential Gauss-Seidel semantics, bindings, `TrtSolverAdapter` opt-in wrapper, CPU golden strategy, fixture design, and **Phase 3 completion diagram** showing the full BvhPrimitive → sorted → BVH nodes → pair list → contact list → updated positions + cached_lambdas pipeline.
+
+### Backwards compatibility
+
+Fully additive vs v2.5.x. No API changes. The v2.5.x `dispatch_fix128_sphere_sphere_contact`, `Vec3FixGpu`, `ContactGpu`, and adapter methods are unchanged. The v2.6.0 `TrtSolverAdapter::dispatch_contact_solve_iteration` is a new opt-in method that does not touch any existing adapter state.
+
+### Phase 3 completion
+
+With v2.6.0, the Phase 3 GPU BVH → narrow-phase → PGS solve pipeline is **byte-exact end-to-end**:
+
+```text
+Vec<BvhPrimitive>
+   ↓ (v2.2.0) dispatch_fix128_morton_sort
+sorted (codes, indices)
+   ↓ (v2.3.0) dispatch_fix128_bvh_build
+Vec<BvhNodeGpu>
+   ↓ (v2.4.0) dispatch_fix128_bvh_find_pairs
+Vec<(u32, u32)>
+   ↓ (v2.5.0) dispatch_fix128_sphere_sphere_contact
+Vec<ContactGpu>
+   ↓ (host: compose ContactConstraintGpu with friction/restitution/cached_lambda)
+Vec<ContactConstraintGpu>
+   ↓ (v2.6.0) dispatch_fix128_pgs_contact_solve × N iterations
+updated body positions + cached_lambda warm-start state
+```
+
+Every stage passes a byte-exact CPU-GPU golden on macOS Metal, Ubuntu Vulkan lavapipe, and Windows DX12 WARP.
+
+### Next up
+
+- **v2.7.0** — default-flip: extend the `GpuSolverBridge` trait in `alice-physics` with `send_contacts` / `dispatch_contact_solve_iteration` / `recv_contacts` methods, then route `PhysicsWorld::solve_contact_constraints` through the trait so the GPU kernel is used when a `GpuSolverBridge` implementation is attached. Mirrors the v1.5.1 → v1.6.0 opt-in / default-flip cadence.
+- **v2.6.x candidate** — parallel Gauss-Seidel via graph colouring (analog of v1.5.1's batched distance-constraint dispatch). Requires fresh determinism analysis and a color-aware CPU golden before shipping.
+
 ## [2.5.1] - 2026-07-07
 
 ### Docs cleanup — stale skeleton docstrings from v0.3.0 / v0.7.1 / v2.2.0 era

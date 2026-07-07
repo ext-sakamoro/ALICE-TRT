@@ -196,7 +196,8 @@ mod solver_bridge {
 
     use crate::constraint_graph::ConstraintGraph;
     use crate::fix128::{
-        Fix128Gpu, FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL,
+        dispatch_fix128_pgs_contact_solve, ContactConstraintGpu, Fix128Gpu, Vec3FixGpu,
+        FIX128_PGS_INTEGRATE_WGSL, FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL,
         FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL, FIX128_PGS_PROJECT_FLOOR_WGSL,
     };
 
@@ -589,6 +590,52 @@ mod solver_bridge {
         #[must_use]
         pub const fn parallel_dispatch_enabled(&self) -> bool {
             self.parallel_dispatch
+        }
+
+        /// v2.6.0 opt-in: run one iteration of GPU PGS contact solve.
+        ///
+        /// Delegates to [`dispatch_fix128_pgs_contact_solve`] using
+        /// the adapter's cached device reference. The adapter's own
+        /// stateful buffers (`positions` / `velocities` /
+        /// `distance_constraints`) are **not** touched — this method
+        /// is a namespaced entry point for the standalone PGS
+        /// contact solve kernel, so callers who want to run the full
+        /// v2.2 → v2.6 broad-phase → narrow-phase → solve pipeline
+        /// can drive it alongside the existing v0.9-v1.5 integrate +
+        /// floor + distance pipeline without buffer contention.
+        ///
+        /// # Contract
+        ///
+        /// See [`dispatch_fix128_pgs_contact_solve`] for the full
+        /// per-constraint algorithm and byte-exact CPU parity
+        /// contract. This method runs **one** iteration; callers
+        /// loop externally for multiple iterations (mirroring the
+        /// CPU `for _ in 0..config.iterations` loop inside
+        /// `PhysicsWorld::substep`).
+        ///
+        /// # v2.7.0 default-flip preview
+        ///
+        /// Deeper wire-through — where `solve_contact_constraints`
+        /// on the CPU automatically routes through this kernel via
+        /// the `GpuSolverBridge` trait — requires a trait extension
+        /// in `alice-physics` and lands as **v2.7.0 default-flip**
+        /// (mirroring the v1.5.1 → v1.6.0 opt-in / default-flip
+        /// cadence).
+        #[must_use]
+        pub fn dispatch_contact_solve_iteration(
+            &self,
+            constraints: &[ContactConstraintGpu],
+            positions: &[Vec3FixGpu],
+            inv_masses: &[Fix128Gpu],
+            warm_start_factor: Fix128Gpu,
+        ) -> (Vec<ContactConstraintGpu>, Vec<Vec3FixGpu>) {
+            dispatch_fix128_pgs_contact_solve(
+                self.device,
+                constraints,
+                positions,
+                inv_masses,
+                warm_start_factor,
+            )
         }
 
         /// Set the per-axis gravity vector applied at every iteration

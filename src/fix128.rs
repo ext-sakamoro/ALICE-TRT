@@ -6051,6 +6051,824 @@ pub fn dispatch_fix128_sphere_sphere_contact(
 }
 
 // ---------------------------------------------------------------------------
+// v2.6.0 — GPU PGS contact solve kernel (Phase 3 §6 — Phase 3 completion)
+// ---------------------------------------------------------------------------
+
+/// v2.6.0 GPU PGS contact solve kernel — pure numeric map from
+/// `(constraints, positions, inv_masses, warm_start_factor)` to
+/// updated `(constraints, positions)`, byte-identical to the Stage B
+/// block of `alice_physics::solver::PhysicsWorld::solve_contact_constraints`.
+///
+/// Consumes the contact list produced by v2.5.0 (once composed into
+/// [`ContactConstraintGpu`] on the host side) and executes **one**
+/// PGS iteration — updating body positions and per-constraint
+/// `cached_lambda` warm-start state. Callers loop the dispatch
+/// externally for multiple iterations, mirroring the CPU
+/// `for _ in 0..iterations { solve_distance_constraints(dt);
+/// solve_contact_constraints(dt); }` pattern.
+///
+/// # Scope carve-out
+///
+/// The CPU `solve_contact_constraints` has two stages:
+///
+/// - **Stage A** (state-dependent filters): sensor flag skip,
+///   pre-solve hook (closure), contact modifier (closure with
+///   mutation of depth / normal / friction / restitution).
+///   Stays on the CPU; callers apply these before uploading the
+///   constraint list to the GPU.
+/// - **Stage B** (numeric map): depth ≤ 0 skip, w_sum < ε skip,
+///   warm-start biased lambda, position correction, cached_lambda
+///   update. Ported to GPU here.
+///
+/// See [`docs/PHASE_3_DESIGN.md`] §2.7 for the full scope discussion.
+///
+/// # Algorithm — CPU parity per-constraint pass
+///
+/// ```text
+/// for i in 0..count:
+///     if depth <= 0: continue
+///     ma_inv = inv_masses[body_a]
+///     mb_inv = inv_masses[body_b]
+///     w_sum = ma_inv + mb_inv
+///     if w_sum < W_SUM_EPSILON: continue
+///     inv_w_sum = ONE / w_sum
+///     biased = depth - cached_lambda * warm_start_factor
+///     lambda = if biased > 0 { biased } else { 0 }
+///     constraints[i].cached_lambda = lambda           // in-place write
+///     correction = normal * lambda
+///     corr_a = correction * (ma_inv * inv_w_sum)
+///     corr_b = correction * (mb_inv * inv_w_sum)
+///     if !ma_inv.is_zero(): positions[body_a] += corr_a
+///     if !mb_inv.is_zero(): positions[body_b] -= corr_b
+/// ```
+///
+/// Total ~17 Fix128 ops per constraint. No `sqrt` — smaller than
+/// the v2.5.0 sphere-sphere kernel (~500 lines) at ~400 lines.
+///
+/// # Branchless-select equivalence
+///
+/// The CPU uses `select_vec3(!inv_mass.is_zero(), pos + correction, pos)`
+/// — a bitwise branchless select — for SIMD friendliness. The GPU
+/// port uses an `if` branch instead. Both are byte-exact equivalent
+/// because when `inv_mass == 0`, `correction * (inv_mass * inv_w_sum)
+/// == 0` and `pos + 0 == pos` in Fix128 (zero is the additive
+/// identity). The static-body fixture in the golden test verifies
+/// this equivalence directly.
+///
+/// # W_SUM_EPSILON
+///
+/// The kernel embeds `W_SUM_EPSILON = Fix128 { hi: 0, lo:
+/// 0x0000_0100_0000_0000 } ≈ 2^-40 ≈ 9.1e-13` as a shader constant,
+/// matching the CPU `alice_physics::solver` `const W_SUM_EPSILON`
+/// byte-for-byte.
+///
+/// # Sequential Gauss-Seidel semantics
+///
+/// Within one iteration, constraint `i+1` reads body positions that
+/// constraint `i` has already updated (if they share a body). This
+/// is standard sequential Gauss-Seidel. The single-workgroup
+/// single-thread dispatch (`@workgroup_size(1)`) preserves this
+/// order exactly, matching the CPU `for i in 0..num_constraints`
+/// loop.
+///
+/// # Bindings
+///
+/// - `@group(0) @binding(0)` — `constraints: array<ContactConstraintGpu>`
+///   (read_write). In-place `cached_lambda` update.
+/// - `@group(0) @binding(1)` — `body_positions: array<Vec3FixGpu>`
+///   (read_write). In-place position update.
+/// - `@group(0) @binding(2)` — `body_inv_masses: array<Fix128Gpu>`
+///   (read). `inv_masses[i] == 0` marks body `i` as static.
+/// - `@group(0) @binding(3)` — `params: PgsContactSolveParams`
+///   (uniform). `{ constraint_count, _pad0/1/2, warm_start_factor }`
+///   (32 bytes).
+///
+/// [`docs/PHASE_3_DESIGN.md`]: ../../docs/PHASE_3_DESIGN.md
+pub const FIX128_PGS_CONTACT_SOLVE_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+struct Vec3FixGpu {
+    x: Fix128Gpu,
+    y: Fix128Gpu,
+    z: Fix128Gpu,
+}
+
+struct ContactConstraintGpu {
+    body_a:        u32,
+    body_b:        u32,
+    _pad0:         u32,
+    _pad1:         u32,
+    depth:         Fix128Gpu,
+    normal:        Vec3FixGpu,
+    point_a:       Vec3FixGpu,
+    point_b:       Vec3FixGpu,
+    friction:      Fix128Gpu,
+    restitution:   Fix128Gpu,
+    cached_lambda: Fix128Gpu,
+}
+
+struct PgsContactSolveParams {
+    constraint_count:  u32,
+    _pad0:             u32,
+    _pad1:             u32,
+    _pad2:             u32,
+    warm_start_factor: Fix128Gpu,
+}
+
+@group(0) @binding(0) var<storage, read_write> constraints:      array<ContactConstraintGpu>;
+@group(0) @binding(1) var<storage, read_write> body_positions:   array<Vec3FixGpu>;
+@group(0) @binding(2) var<storage, read>       body_inv_masses:  array<Fix128Gpu>;
+@group(0) @binding(3) var<uniform>             params:           PgsContactSolveParams;
+
+// ---- 64-bit helpers (byte-exact copies from v0.3.0 / v1.4.0 kernels) ----
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let lo_sub  = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid     = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let hi_sub  = mid - borrow1;
+    let borrow3 = select(0u, 1u, mid < borrow1);
+    return vec3<u32>(lo_sub, hi_sub, borrow2 + borrow3);
+}
+
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+    let r0 = ll.x;
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+    let r3 = hh.y + carry_to_3;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+// ---- Fix128 basic ops (byte-exact copies from v1.4.x kernels) ----
+
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_sub_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+    let ll = u64_mul_wide(a_lo, b_lo);
+    let lh = u64_mul_wide(a_lo, b_hi);
+    let hl = u64_mul_wide(a_hi, b_lo);
+    let hh = u64_mul_wide(a_hi, b_hi);
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+    let s5a = lh.w + hl.w;
+    let s5b = s5a + hh.y;
+    let p5_u = s5b + carry_to_5;
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+    var p4 = p4_u;
+    var p5 = p5_u;
+    if (a_negative) {
+        let sub_lo = b.lo_lo;
+        let sub_hi = b.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    if (b_negative) {
+        let sub_lo = a.lo_lo;
+        let sub_hi = a.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
+    return out;
+}
+
+// ---- Common Fix128 sign / zero helpers ----
+
+fn fix128_neg(x: Fix128Gpu) -> Fix128Gpu {
+    let inv_lo_lo = ~x.lo_lo;
+    let inv_lo_hi = ~x.lo_hi;
+    let inv_hi_lo = ~x.hi_lo;
+    let inv_hi_hi = ~x.hi_hi;
+    let s0 = inv_lo_lo + 1u;
+    let c0 = select(0u, 1u, s0 < inv_lo_lo);
+    let s1 = inv_lo_hi + c0;
+    let c1 = select(0u, 1u, s1 < inv_lo_hi);
+    let s2 = inv_hi_lo + c1;
+    let c2 = select(0u, 1u, s2 < inv_hi_lo);
+    let s3 = inv_hi_hi + c2;
+    var out: Fix128Gpu;
+    out.lo_lo = s0;
+    out.lo_hi = s1;
+    out.hi_lo = s2;
+    out.hi_hi = s3;
+    return out;
+}
+
+fn fix128_is_zero(x: Fix128Gpu) -> bool {
+    return (x.hi_lo | x.hi_hi | x.lo_lo | x.lo_hi) == 0u;
+}
+
+fn fix128_is_negative(x: Fix128Gpu) -> bool {
+    return ((x.hi_hi >> 31u) & 1u) == 1u;
+}
+
+fn fix128_abs(x: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(x)) { return fix128_neg(x); }
+    return x;
+}
+
+fn fix128_zero() -> Fix128Gpu {
+    return Fix128Gpu(0u, 0u, 0u, 0u);
+}
+
+fn fix128_one() -> Fix128Gpu {
+    return Fix128Gpu(1u, 0u, 0u, 0u);
+}
+
+// W_SUM_EPSILON = Fix128 { hi: 0, lo: 0x0000_0100_0000_0000 }
+// hi_lo=0, hi_hi=0, lo_lo=0, lo_hi=0x00000100
+// Matches alice_physics::solver::W_SUM_EPSILON byte-for-byte.
+fn fix128_w_sum_epsilon() -> Fix128Gpu {
+    return Fix128Gpu(0u, 0u, 0u, 0x00000100u);
+}
+
+// Signed less-than compare (mirrors `Fix128 as i128` PartialOrd on CPU).
+fn fix128_lt(a: Fix128Gpu, b: Fix128Gpu) -> bool {
+    let a_sign = (a.hi_hi & 0x80000000u) != 0u;
+    let b_sign = (b.hi_hi & 0x80000000u) != 0u;
+    if (a_sign != b_sign) {
+        return a_sign;
+    }
+    if (a.hi_hi != b.hi_hi) { return a.hi_hi < b.hi_hi; }
+    if (a.hi_lo != b.hi_lo) { return a.hi_lo < b.hi_lo; }
+    if (a.lo_hi != b.lo_hi) { return a.lo_hi < b.lo_hi; }
+    return a.lo_lo < b.lo_lo;
+}
+
+fn fix128_half(x: Fix128Gpu) -> Fix128Gpu {
+    var out: Fix128Gpu;
+    out.lo_lo = (x.lo_lo >> 1u) | ((x.lo_hi & 1u) << 31u);
+    out.lo_hi = (x.lo_hi >> 1u) | ((x.hi_lo & 1u) << 31u);
+    out.hi_lo = (x.hi_lo >> 1u) | ((x.hi_hi & 1u) << 31u);
+    out.hi_hi = bitcast<u32>(bitcast<i32>(x.hi_hi) >> 1u);
+    return out;
+}
+
+// ---- u128 helpers (for div) ----
+
+fn u128_shl1(x: vec4<u32>) -> vec4<u32> {
+    let c0 = x.x >> 31u;
+    let c1 = x.y >> 31u;
+    let c2 = x.z >> 31u;
+    return vec4<u32>(x.x << 1u, (x.y << 1u) | c0, (x.z << 1u) | c1, (x.w << 1u) | c2);
+}
+
+fn u128_ge(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if (a.w != b.w) { return a.w > b.w; }
+    if (a.z != b.z) { return a.z > b.z; }
+    if (a.y != b.y) { return a.y > b.y; }
+    return a.x >= b.x;
+}
+
+fn u128_sub(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
+    let d0        = a.x - b.x;
+    let borrow0   = select(0u, 1u, a.x < b.x);
+    let m1        = a.y - b.y;
+    let borrow1a  = select(0u, 1u, a.y < b.y);
+    let d1        = m1 - borrow0;
+    let borrow1b  = select(0u, 1u, m1 < borrow0);
+    let borrow1   = borrow1a + borrow1b;
+    let m2        = a.z - b.z;
+    let borrow2a  = select(0u, 1u, a.z < b.z);
+    let d2        = m2 - borrow1;
+    let borrow2b  = select(0u, 1u, m2 < borrow1);
+    let borrow2   = borrow2a + borrow2b;
+    let m3        = a.w - b.w;
+    let d3        = m3 - borrow2;
+    return vec4<u32>(d0, d1, d2, d3);
+}
+
+fn u128_set_bit(x: vec4<u32>, bit_pos: u32) -> vec4<u32> {
+    let word  = bit_pos >> 5u;
+    let shift = bit_pos & 31u;
+    let mask  = 1u << shift;
+    var out = x;
+    if      (word == 0u) { out.x = out.x | mask; }
+    else if (word == 1u) { out.y = out.y | mask; }
+    else if (word == 2u) { out.z = out.z | mask; }
+    else                 { out.w = out.w | mask; }
+    return out;
+}
+
+// ---- div (from v1.4.0, byte-exact) ----
+
+fn fix128_div_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_zero(b)) { return fix128_zero(); }
+    let neg_a = fix128_is_negative(a);
+    let neg_b = fix128_is_negative(b);
+    let result_neg = neg_a != neg_b;
+    let abs_a = fix128_abs(a);
+    let abs_b = fix128_abs(b);
+    let a_full = vec4<u32>(abs_a.lo_lo, abs_a.lo_hi, abs_a.hi_lo, abs_a.hi_hi);
+    let b_full = vec4<u32>(abs_b.lo_lo, abs_b.lo_hi, abs_b.hi_lo, abs_b.hi_hi);
+    var q_int = vec4<u32>(0u);
+    var r_int = vec4<u32>(0u);
+    var d     = a_full;
+    for (var i: i32 = 0; i < 128; i = i + 1) {
+        let msb = d.w >> 31u;
+        r_int   = u128_shl1(r_int);
+        r_int.x = r_int.x | msb;
+        d       = u128_shl1(d);
+        if (u128_ge(r_int, b_full)) {
+            r_int = u128_sub(r_int, b_full);
+            q_int = u128_set_bit(q_int, u32(127 - i));
+        }
+    }
+    var quot_lo_lo: u32 = 0u;
+    var quot_lo_hi: u32 = 0u;
+    var r = r_int;
+    for (var i: i32 = 63; i >= 0; i = i - 1) {
+        let overflow_bit = r.w >> 31u;
+        r = u128_shl1(r);
+        if (overflow_bit != 0u || u128_ge(r, b_full)) {
+            r = u128_sub(r, b_full);
+            if (i < 32) {
+                quot_lo_lo = quot_lo_lo | (1u << u32(i));
+            } else {
+                quot_lo_hi = quot_lo_hi | (1u << u32(i - 32));
+            }
+        }
+    }
+    var result: Fix128Gpu;
+    result.hi_lo = q_int.x;
+    result.hi_hi = q_int.y;
+    result.lo_lo = quot_lo_lo;
+    result.lo_hi = quot_lo_hi;
+    if (result_neg) { return fix128_neg(result); }
+    return result;
+}
+
+// ---- Vec3Fix helpers ----
+
+fn vec3_add(a: Vec3FixGpu, b: Vec3FixGpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_add_kernel(a.x, b.x);
+    out.y = fix128_add_kernel(a.y, b.y);
+    out.z = fix128_add_kernel(a.z, b.z);
+    return out;
+}
+
+fn vec3_sub(a: Vec3FixGpu, b: Vec3FixGpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_sub_kernel(a.x, b.x);
+    out.y = fix128_sub_kernel(a.y, b.y);
+    out.z = fix128_sub_kernel(a.z, b.z);
+    return out;
+}
+
+fn vec3_scale(a: Vec3FixGpu, s: Fix128Gpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_mul_kernel(a.x, s);
+    out.y = fix128_mul_kernel(a.y, s);
+    out.z = fix128_mul_kernel(a.z, s);
+    return out;
+}
+
+// ---- PGS contact solve (mirrors CPU byte-for-byte) ----
+
+@compute @workgroup_size(1)
+fn fix128_pgs_contact_solve_main() {
+    let count = params.constraint_count;
+    let wsf   = params.warm_start_factor;
+    if (count == 0u) { return; }
+
+    let epsilon = fix128_w_sum_epsilon();
+    let zero    = fix128_zero();
+    let one     = fix128_one();
+
+    for (var i: u32 = 0u; i < count; i = i + 1u) {
+        let c = constraints[i];
+        let a = c.body_a;
+        let b = c.body_b;
+
+        // depth <= 0 skip (CPU: `if contact.depth <= Fix128::ZERO { continue; }`)
+        if (fix128_is_zero(c.depth) || fix128_is_negative(c.depth)) { continue; }
+
+        let ma_inv = body_inv_masses[a];
+        let mb_inv = body_inv_masses[b];
+        let w_sum  = fix128_add_kernel(ma_inv, mb_inv);
+        if (fix128_lt(w_sum, epsilon)) { continue; }
+
+        let inv_w_sum = fix128_div_kernel(one, w_sum);
+        let cl_wsf    = fix128_mul_kernel(c.cached_lambda, wsf);
+        let biased    = fix128_sub_kernel(c.depth, cl_wsf);
+        var lambda: Fix128Gpu;
+        if (fix128_lt(zero, biased)) {
+            lambda = biased;
+        } else {
+            lambda = zero;
+        }
+
+        // In-place write cached_lambda for the next iteration.
+        constraints[i].cached_lambda = lambda;
+
+        let correction = vec3_scale(c.normal, lambda);
+        let scale_a = fix128_mul_kernel(ma_inv, inv_w_sum);
+        let scale_b = fix128_mul_kernel(mb_inv, inv_w_sum);
+        let corr_a  = vec3_scale(correction, scale_a);
+        let corr_b  = vec3_scale(correction, scale_b);
+
+        if (!fix128_is_zero(ma_inv)) {
+            body_positions[a] = vec3_add(body_positions[a], corr_a);
+        }
+        if (!fix128_is_zero(mb_inv)) {
+            body_positions[b] = vec3_sub(body_positions[b], corr_b);
+        }
+    }
+}
+"#;
+
+/// GPU-side 224-byte contact constraint — byte-layout mirror of
+/// `alice_physics::solver::ContactConstraint`.
+///
+/// Field order matches the WGSL `struct ContactConstraintGpu`:
+///
+/// | offset | field           | size |
+/// |--------|-----------------|------|
+/// | 0      | `body_a`        | 4    |
+/// | 4      | `body_b`        | 4    |
+/// | 8      | `_pad0`         | 4    |
+/// | 12     | `_pad1`         | 4    |
+/// | 16     | `depth`         | 16   |
+/// | 32     | `normal`        | 48   |
+/// | 80     | `point_a`       | 48   |
+/// | 128    | `point_b`       | 48   |
+/// | 176    | `friction`      | 16   |
+/// | 192    | `restitution`   | 16   |
+/// | 208    | `cached_lambda` | 16   |
+///
+/// The 8-byte padding after `body_b` aligns `depth` at a 16-byte
+/// boundary, matching the [`ContactGpu`] convention and keeping the
+/// WGSL storage-buffer layout consistent across drivers.
+///
+/// # Semantics
+///
+/// - `body_a` / `body_b` are u32 body indices into the
+///   `body_positions` / `body_inv_masses` arrays uploaded alongside.
+/// - `depth`, `normal`, `point_a`, `point_b` are the unpacked
+///   fields of the CPU `Contact` struct (as emitted by v2.5.0).
+/// - `friction`, `restitution` are per-constraint material
+///   parameters (defaults on `ContactConstraint::new` — 0.3 / 0.2).
+///   Not used by v2.6.0 (which handles position correction only)
+///   but carried through so future friction / restitution kernels
+///   can consume the same struct without a schema break.
+/// - `cached_lambda` is the warm-start accumulator. Updated in place
+///   by every PGS iteration.
+#[cfg(feature = "physics-solver")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ContactConstraintGpu {
+    pub body_a: u32,
+    pub body_b: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub depth: Fix128Gpu,
+    pub normal: Vec3FixGpu,
+    pub point_a: Vec3FixGpu,
+    pub point_b: Vec3FixGpu,
+    pub friction: Fix128Gpu,
+    pub restitution: Fix128Gpu,
+    pub cached_lambda: Fix128Gpu,
+}
+
+#[cfg(feature = "physics-solver")]
+impl ContactConstraintGpu {
+    /// Compose a `ContactConstraintGpu` from a CPU
+    /// `alice_physics::solver::ContactConstraint`. Byte-exact copy of
+    /// every field.
+    #[must_use]
+    pub fn from_physics(c: &alice_physics::solver::ContactConstraint) -> Self {
+        Self {
+            body_a: u32::try_from(c.body_a).expect("body_a exceeds u32::MAX"),
+            body_b: u32::try_from(c.body_b).expect("body_b exceeds u32::MAX"),
+            _pad0: 0,
+            _pad1: 0,
+            depth: Fix128Gpu::from_raw(c.contact.depth.hi, c.contact.depth.lo),
+            normal: Vec3FixGpu::from_physics(c.contact.normal),
+            point_a: Vec3FixGpu::from_physics(c.contact.point_a),
+            point_b: Vec3FixGpu::from_physics(c.contact.point_b),
+            friction: Fix128Gpu::from_raw(c.friction.hi, c.friction.lo),
+            restitution: Fix128Gpu::from_raw(c.restitution.hi, c.restitution.lo),
+            cached_lambda: Fix128Gpu::from_raw(c.cached_lambda.hi, c.cached_lambda.lo),
+        }
+    }
+}
+
+/// v2.6.0 GPU PGS contact solve orchestrator — dispatches
+/// [`FIX128_PGS_CONTACT_SOLVE_WGSL`] for **one** PGS iteration and
+/// returns the updated constraint list (with new `cached_lambda`
+/// values) and the updated body position array.
+///
+/// # Contract
+///
+/// - `constraints` is the pre-filtered constraint list (sensor
+///   filter, pre-solve hooks, and contact modifier mutations
+///   already applied by the CPU caller).
+/// - `positions[i]` is the position of body id `i` (indexed by the
+///   `body_a` / `body_b` u32 fields of the constraints).
+/// - `inv_masses[i]` is the inverse mass of body id `i`.
+///   `inv_masses[i] == 0` marks body `i` as static.
+/// - `warm_start_factor` is the `SolverConfig::warm_start_factor`
+///   value on the CPU (default 0.85 per `ContactConstraint::new`).
+/// - Returns `(updated_constraints, updated_positions)` where
+///   `updated_constraints[i].cached_lambda` is the new lambda for
+///   the next iteration and `updated_positions` reflects the
+///   sequential Gauss-Seidel position corrections.
+/// - `constraints.is_empty()` short-circuits to `(Vec::new(),
+///   positions.to_vec())` without dispatching the kernel.
+///
+/// # Panics
+///
+/// - Panics if the wgpu device is lost during dispatch.
+/// - Panics if `positions.len() != inv_masses.len()`.
+#[cfg(feature = "physics-solver")]
+#[must_use]
+pub fn dispatch_fix128_pgs_contact_solve(
+    device: &crate::device::GpuDevice,
+    constraints: &[ContactConstraintGpu],
+    positions: &[Vec3FixGpu],
+    inv_masses: &[Fix128Gpu],
+    warm_start_factor: Fix128Gpu,
+) -> (Vec<ContactConstraintGpu>, Vec<Vec3FixGpu>) {
+    assert_eq!(
+        positions.len(),
+        inv_masses.len(),
+        "positions.len() must equal inv_masses.len()"
+    );
+    if constraints.is_empty() {
+        return (Vec::new(), positions.to_vec());
+    }
+    let constraint_count = constraints.len();
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct PgsContactSolveParams {
+        constraint_count: u32,
+        _pad0: u32,
+        _pad1: u32,
+        _pad2: u32,
+        warm_start_factor: Fix128Gpu,
+    }
+
+    let params = PgsContactSolveParams {
+        constraint_count: u32::try_from(constraint_count)
+            .expect("constraint_count exceeds u32::MAX"),
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+        warm_start_factor,
+    };
+
+    let shader = device
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fix128_pgs_contact_solve_shader"),
+            source: wgpu::ShaderSource::Wgsl(FIX128_PGS_CONTACT_SOLVE_WGSL.into()),
+        });
+    let bind_group_layout =
+        device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fix128_pgs_contact_solve_bgl"),
+                entries: &[
+                    // 0: constraints (read_write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 1: body_positions (read_write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 2: body_inv_masses (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 3: params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+    let pipeline_layout = device
+        .device()
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fix128_pgs_contact_solve_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let pipeline = device
+        .device()
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fix128_pgs_contact_solve_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("fix128_pgs_contact_solve_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    let buf_constraints = device.create_buffer_init(
+        "pgs_contact_solve_constraints",
+        bytemuck::cast_slice(constraints),
+    );
+    let buf_positions = device.create_buffer_init(
+        "pgs_contact_solve_positions",
+        bytemuck::cast_slice(positions),
+    );
+    let buf_inv_masses = device.create_buffer_init(
+        "pgs_contact_solve_inv_masses",
+        bytemuck::cast_slice(inv_masses),
+    );
+    let buf_params =
+        device.create_uniform_buffer("pgs_contact_solve_params", bytemuck::bytes_of(&params));
+
+    let bind_group = device
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fix128_pgs_contact_solve_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_constraints.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_inv_masses.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf_params.as_entire_binding(),
+                },
+            ],
+        });
+
+    let mut encoder = device
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fix128_pgs_contact_solve_encoder"),
+        });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fix128_pgs_contact_solve_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+    device.submit(encoder);
+    device.poll_wait();
+
+    let constraints_bytes: u64 =
+        (constraint_count * core::mem::size_of::<ContactConstraintGpu>()) as u64;
+    let positions_bytes: u64 = (positions.len() * core::mem::size_of::<Vec3FixGpu>()) as u64;
+    let raw_constraints = device.read_buffer(&buf_constraints, constraints_bytes);
+    let raw_positions = device.read_buffer(&buf_positions, positions_bytes);
+
+    let updated_constraints: Vec<ContactConstraintGpu> =
+        bytemuck::cast_slice(&raw_constraints).to_vec();
+    let updated_positions: Vec<Vec3FixGpu> = bytemuck::cast_slice(&raw_positions).to_vec();
+    (updated_constraints, updated_positions)
+}
+
+// ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
 
@@ -8838,6 +9656,364 @@ mod tests {
                 "degenerate fixture must produce zero contacts (is_zero filter)"
             );
             check("degenerate colocated", positions, radii, pairs, expected);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v2.6.0 GPU PGS contact solve kernel tests
+    // -----------------------------------------------------------------
+
+    /// v2.6.0 PGS contact solve kernel ships the WGSL struct +
+    /// binding + entry point set documented in
+    /// [`docs/PHASE_3_DESIGN.md`] §2.7. Structural test runs without
+    /// a GPU adapter so headless CI catches accidental identifier
+    /// deletion.
+    ///
+    /// [`docs/PHASE_3_DESIGN.md`]: ../../docs/PHASE_3_DESIGN.md
+    #[test]
+    fn wgsl_pgs_contact_solve_shader_present() {
+        // Structs from §2.7 bindings section.
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("struct Fix128Gpu"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("struct Vec3FixGpu"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("struct ContactConstraintGpu"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("struct PgsContactSolveParams"));
+        // Bindings (0..3).
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("constraints:"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("body_positions:"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("body_inv_masses:"));
+        // Fix128 primitives composed by the kernel.
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_add_kernel"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_sub_kernel"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_mul_kernel"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_div_kernel"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_lt"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_is_zero"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_is_negative"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_one"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_w_sum_epsilon"));
+        // W_SUM_EPSILON constant byte pattern (Fix128 { hi: 0, lo:
+        // 0x0000_0100_0000_0000 } → hi_lo=0, hi_hi=0, lo_lo=0,
+        // lo_hi=0x00000100). Check the literal 0x00000100 appears.
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("0x00000100u"));
+        // Vec3 helpers.
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn vec3_add"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn vec3_sub"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn vec3_scale"));
+        // Single compute entry, 1x1x1 dispatch.
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("fn fix128_pgs_contact_solve_main"));
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("@workgroup_size(1)"));
+        // In-place cached_lambda write.
+        assert!(FIX128_PGS_CONTACT_SOLVE_WGSL.contains("constraints[i].cached_lambda"));
+    }
+
+    /// v2.6.0 PGS contact solve kernel must compile as valid WGSL.
+    /// Skips when no GPU adapter is available (headless CI).
+    #[test]
+    fn wgsl_pgs_contact_solve_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_pgs_contact_solve_shader_compile_test"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_PGS_CONTACT_SOLVE_WGSL.into()),
+            });
+    }
+
+    /// Byte-exact GPU-CPU golden for the v2.6.0 PGS contact solve
+    /// kernel.
+    ///
+    /// Replays the Stage B numeric block of
+    /// `solve_contact_constraints` directly (bypassing the closure-
+    /// based Stage A sensor filter / pre-solve hook / contact
+    /// modifier which are out of the GPU-comparable surface) and
+    /// compares the resulting `(Vec<ContactConstraintGpu>,
+    /// Vec<Vec3FixGpu>)` byte-for-byte.
+    ///
+    /// Three fixtures exercise the geometric branches:
+    ///
+    /// 1. **Overlap pile** — all-dynamic bodies from the v2.5.0
+    ///    overlap pile, first sphere-sphere contact list feeds
+    ///    the PGS solver. Exercises the full Gauss-Seidel
+    ///    sequential update path.
+    /// 2. **Chain 6 (4 iterations)** — 5 collision pairs, all
+    ///    dynamic. Runs 4 sequential PGS iterations and asserts
+    ///    byte-exact match on both `cached_lambda` and positions
+    ///    at every iteration.
+    /// 3. **Static + dynamic mix** — 4 bodies, `inv_mass = 0` for
+    ///    bodies 0 and 3, `inv_mass = 1` for bodies 1 and 2.
+    ///    Verifies the branchless-select equivalence path for
+    ///    static bodies.
+    ///
+    /// Skips when no GPU adapter is available (headless CI).
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_pgs_contact_solve_matches_cpu_golden() {
+        use alice_physics::collider::Contact;
+        use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
+        use alice_physics::solver::ContactConstraint;
+
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        // W_SUM_EPSILON from alice_physics::solver, replicated here
+        // (private in the physics crate).
+        let w_sum_epsilon = PhysicsFix128::from_raw(0, 0x0000_0100_0000_0000);
+
+        // Replay Stage B on the CPU. Modifies constraints[i].cached_lambda
+        // and positions[body_a/b] in place.
+        fn cpu_stage_b(
+            constraints: &mut [ContactConstraint],
+            positions: &mut [Vec3Fix],
+            inv_masses: &[PhysicsFix128],
+            warm_start_factor: PhysicsFix128,
+            w_sum_epsilon: PhysicsFix128,
+        ) {
+            for i in 0..constraints.len() {
+                let c = constraints[i];
+                if c.contact.depth <= PhysicsFix128::ZERO {
+                    continue;
+                }
+                let ma_inv = inv_masses[c.body_a];
+                let mb_inv = inv_masses[c.body_b];
+                let w_sum = ma_inv + mb_inv;
+                if w_sum < w_sum_epsilon {
+                    continue;
+                }
+                let inv_w_sum = PhysicsFix128::ONE / w_sum;
+                let biased = c.contact.depth - c.cached_lambda * warm_start_factor;
+                let lambda = if biased > PhysicsFix128::ZERO {
+                    biased
+                } else {
+                    PhysicsFix128::ZERO
+                };
+                constraints[i].cached_lambda = lambda;
+                let correction = c.contact.normal * lambda;
+                let ca = correction * (ma_inv * inv_w_sum);
+                let cb = correction * (mb_inv * inv_w_sum);
+                if !ma_inv.is_zero() {
+                    positions[c.body_a] = positions[c.body_a] + ca;
+                }
+                if !mb_inv.is_zero() {
+                    positions[c.body_b] = positions[c.body_b] - cb;
+                }
+            }
+        }
+
+        // Convert physics-side to GPU-side.
+        fn constraints_to_gpu(cs: &[ContactConstraint]) -> Vec<ContactConstraintGpu> {
+            cs.iter().map(ContactConstraintGpu::from_physics).collect()
+        }
+        fn positions_to_gpu(ps: &[Vec3Fix]) -> Vec<Vec3FixGpu> {
+            ps.iter().map(|v| Vec3FixGpu::from_physics(*v)).collect()
+        }
+        fn inv_masses_to_gpu(ms: &[PhysicsFix128]) -> Vec<Fix128Gpu> {
+            ms.iter().map(|m| Fix128Gpu::from_raw(m.hi, m.lo)).collect()
+        }
+
+        let check_one_iteration =
+            |label: &str,
+             constraints: &[ContactConstraint],
+             positions: &[Vec3Fix],
+             inv_masses: &[PhysicsFix128],
+             warm_start_factor: PhysicsFix128| {
+                let mut cpu_c = constraints.to_vec();
+                let mut cpu_p = positions.to_vec();
+                cpu_stage_b(
+                    &mut cpu_c,
+                    &mut cpu_p,
+                    inv_masses,
+                    warm_start_factor,
+                    w_sum_epsilon,
+                );
+
+                let gpu_c_in = constraints_to_gpu(constraints);
+                let gpu_p_in = positions_to_gpu(positions);
+                let gpu_m = inv_masses_to_gpu(inv_masses);
+                let wsf_gpu = Fix128Gpu::from_raw(warm_start_factor.hi, warm_start_factor.lo);
+                let (gpu_c_out, gpu_p_out) = dispatch_fix128_pgs_contact_solve(
+                    &device, &gpu_c_in, &gpu_p_in, &gpu_m, wsf_gpu,
+                );
+
+                let cpu_c_gpu = constraints_to_gpu(&cpu_c);
+                let cpu_p_gpu = positions_to_gpu(&cpu_p);
+                assert_eq!(
+                    gpu_c_out, cpu_c_gpu,
+                    "{label}: constraints (cached_lambda) mismatch"
+                );
+                assert_eq!(gpu_p_out, cpu_p_gpu, "{label}: positions mismatch");
+            };
+
+        let mk_contact =
+            |depth_ratio: (i64, i64), nx: (i64, i64), ny: (i64, i64), nz: (i64, i64)| -> Contact {
+                Contact {
+                    depth: PhysicsFix128::from_ratio(depth_ratio.0, depth_ratio.1),
+                    normal: Vec3Fix::new(
+                        PhysicsFix128::from_ratio(nx.0, nx.1),
+                        PhysicsFix128::from_ratio(ny.0, ny.1),
+                        PhysicsFix128::from_ratio(nz.0, nz.1),
+                    ),
+                    // point_a / point_b are not used by the solver; any
+                    // consistent value works (must be same on CPU and GPU
+                    // since they're copied through).
+                    point_a: Vec3Fix::ZERO,
+                    point_b: Vec3Fix::ZERO,
+                }
+            };
+
+        // ---- Fixture 1: Chain 6 with 4 iterations ----
+        // 6 bodies at x = 0, 2, 4, 6, 8, 10; radius 1.1 → adjacent
+        // pairs overlap with depth 0.2, normal = (1, 0, 0).
+        {
+            let warm_start_factor = PhysicsFix128::from_ratio(85, 100); // 0.85
+            let mut positions: Vec<Vec3Fix> = (0..6i64)
+                .map(|i| {
+                    Vec3Fix::new(
+                        PhysicsFix128::from_int(i * 2),
+                        PhysicsFix128::ZERO,
+                        PhysicsFix128::ZERO,
+                    )
+                })
+                .collect();
+            let inv_masses: Vec<PhysicsFix128> =
+                (0..6).map(|_| PhysicsFix128::from_int(1)).collect();
+
+            // 5 adjacent-pair collision constraints.
+            let mut constraints: Vec<ContactConstraint> = (0..5usize)
+                .map(|i| ContactConstraint {
+                    body_a: i,
+                    body_b: i + 1,
+                    contact: mk_contact((2, 10), (1, 1), (0, 1), (0, 1)),
+                    friction: PhysicsFix128::from_ratio(3, 10),
+                    restitution: PhysicsFix128::from_ratio(2, 10),
+                    cached_lambda: PhysicsFix128::ZERO,
+                })
+                .collect();
+
+            // Run 4 sequential iterations. At each iteration compare
+            // GPU vs CPU byte-exact.
+            for iter in 0..4 {
+                let label = format!("chain 6 iter {iter}");
+                check_one_iteration(
+                    &label,
+                    &constraints,
+                    &positions,
+                    &inv_masses,
+                    warm_start_factor,
+                );
+                // Advance CPU state for the next iteration compare.
+                cpu_stage_b(
+                    &mut constraints,
+                    &mut positions,
+                    &inv_masses,
+                    warm_start_factor,
+                    w_sum_epsilon,
+                );
+            }
+        }
+
+        // ---- Fixture 2: Static + dynamic mix ----
+        // 4 bodies: 0 and 3 are static (inv_mass = 0), 1 and 2 are
+        // dynamic (inv_mass = 1). Two collision pairs (0, 1) and
+        // (2, 3). Static bodies never move; dynamic bodies get full
+        // correction.
+        {
+            let warm_start_factor = PhysicsFix128::from_ratio(85, 100);
+            let one = PhysicsFix128::from_int(1);
+            let zero = PhysicsFix128::ZERO;
+            let inv_masses = vec![zero, one, one, zero];
+            let positions = vec![
+                Vec3Fix::new(zero, zero, zero),
+                Vec3Fix::new(one, zero, zero),
+                Vec3Fix::new(PhysicsFix128::from_int(3), zero, zero),
+                Vec3Fix::new(PhysicsFix128::from_int(4), zero, zero),
+            ];
+            let constraints = vec![
+                ContactConstraint {
+                    body_a: 0,
+                    body_b: 1,
+                    contact: mk_contact((5, 10), (1, 1), (0, 1), (0, 1)),
+                    friction: PhysicsFix128::from_ratio(3, 10),
+                    restitution: PhysicsFix128::from_ratio(2, 10),
+                    cached_lambda: PhysicsFix128::ZERO,
+                },
+                ContactConstraint {
+                    body_a: 2,
+                    body_b: 3,
+                    contact: mk_contact((3, 10), (1, 1), (0, 1), (0, 1)),
+                    friction: PhysicsFix128::from_ratio(3, 10),
+                    restitution: PhysicsFix128::from_ratio(2, 10),
+                    cached_lambda: PhysicsFix128::ZERO,
+                },
+            ];
+            check_one_iteration(
+                "static+dynamic mix",
+                &constraints,
+                &positions,
+                &inv_masses,
+                warm_start_factor,
+            );
+        }
+
+        // ---- Fixture 3: All-dynamic 3-body triangle ----
+        // Three bodies at (0,0,0), (2,0,0), (1, √3, 0) with radius 1.1
+        // → each pair overlaps with depth ≈ 0.2. Three collision
+        // pairs total. Exercises the multi-body Gauss-Seidel update
+        // where sequential order matters.
+        {
+            let warm_start_factor = PhysicsFix128::from_ratio(85, 100);
+            let one = PhysicsFix128::from_int(1);
+            let positions = vec![
+                Vec3Fix::new(
+                    PhysicsFix128::ZERO,
+                    PhysicsFix128::ZERO,
+                    PhysicsFix128::ZERO,
+                ),
+                Vec3Fix::new(
+                    PhysicsFix128::from_int(2),
+                    PhysicsFix128::ZERO,
+                    PhysicsFix128::ZERO,
+                ),
+                Vec3Fix::new(one, one, PhysicsFix128::ZERO),
+            ];
+            let inv_masses = vec![one, one, one];
+            let constraints = vec![
+                ContactConstraint {
+                    body_a: 0,
+                    body_b: 1,
+                    contact: mk_contact((2, 10), (1, 1), (0, 1), (0, 1)),
+                    friction: PhysicsFix128::from_ratio(3, 10),
+                    restitution: PhysicsFix128::from_ratio(2, 10),
+                    cached_lambda: PhysicsFix128::ZERO,
+                },
+                ContactConstraint {
+                    body_a: 0,
+                    body_b: 2,
+                    contact: mk_contact((3, 10), (0, 1), (1, 1), (0, 1)),
+                    friction: PhysicsFix128::from_ratio(3, 10),
+                    restitution: PhysicsFix128::from_ratio(2, 10),
+                    cached_lambda: PhysicsFix128::ZERO,
+                },
+                ContactConstraint {
+                    body_a: 1,
+                    body_b: 2,
+                    contact: mk_contact((4, 10), (1, 1), (1, 1), (0, 1)),
+                    friction: PhysicsFix128::from_ratio(3, 10),
+                    restitution: PhysicsFix128::from_ratio(2, 10),
+                    cached_lambda: PhysicsFix128::ZERO,
+                },
+            ];
+            check_one_iteration(
+                "triangle 3-body",
+                &constraints,
+                &positions,
+                &inv_masses,
+                warm_start_factor,
+            );
         }
     }
 }

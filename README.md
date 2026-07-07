@@ -585,6 +585,7 @@ alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
 | Fix128 GPU BVH build (Phase 3 §3) | v2.3.0 | `FIX128_BVH_BUILD_WGSL` + `dispatch_fix128_bvh_build` |
 | Fix128 GPU BVH find_pairs (Phase 3 §4) | v2.4.0 | `FIX128_BVH_FIND_PAIRS_WGSL` + `dispatch_fix128_bvh_find_pairs` |
 | Fix128 GPU sphere-sphere contact (Phase 3 §5) | v2.5.0 | `FIX128_SPHERE_SPHERE_CONTACT_WGSL` + `dispatch_fix128_sphere_sphere_contact` |
+| Fix128 GPU PGS contact solve (Phase 3 §6) | v2.6.0 | `FIX128_PGS_CONTACT_SOLVE_WGSL` + `dispatch_fix128_pgs_contact_solve` + `TrtSolverAdapter::dispatch_contact_solve_iteration` |
 
 CPU-side `Fix128Gpu` also exposes `sqrt` (v1.0.1, delegates to `alice_physics::Fix128::sqrt`) and `div` (v1.0.6) for host precompute paths. The v1.1.0 single-constraint uniform variant (`FIX128_PGS_PROJECT_DISTANCE_WGSL`) was deprecated in v1.7.0 and removed in v2.0.0; external `Fix128GpuKernel` implementers should migrate to the rigid-rod or batched shader listed above.
 
