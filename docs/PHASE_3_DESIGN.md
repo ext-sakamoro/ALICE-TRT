@@ -128,6 +128,93 @@ The `FIX128_MORTON_SORT_WGSL` constant lands in this session as a **skeleton pre
 
 The version stays at 2.1.0 — a skeleton is not a functional promise, so no MINOR bump. The `Unreleased` section of `CHANGELOG.md` documents the skeleton so the v2.2.0 release notes can pick up the diff cleanly.
 
+### 2.4 v2.3.0 scope (upcoming: GPU BVH build kernel)
+
+The v2.3.0 release ships the **GPU LinearBvh build kernel** that consumes the v2.2.0 sorted `(codes, indices)` output plus a parallel array of pre-quantised i32 primitive AABBs, and produces a `nodes: Vec<BvhNodeGpu>` sequence **byte-identical** to `ALICE-Physics::bvh::LinearBvh::build(primitives).nodes` on the CPU. This is the heaviest kernel in the Phase 3 series: it ports the recursive `build_recursive` from `ALICE-Physics/src/bvh.rs` verbatim while preserving the §3.1 escape-pointer discipline established by ALICE-Physics `dede78c`.
+
+#### Algorithm choice — single-workgroup single-thread iterative build_recursive port
+
+The CPU `build_recursive` is a recursive function that produces a depth-first pre-order tree with escape pointers. On the GPU we prioritise **byte-exact CPU-GPU parity** over throughput, and port the algorithm as a **single-workgroup single-thread iterative build** using an explicit continuation-passing-style stack:
+
+- **Single workgroup, single thread** (`@workgroup_size(1)`, dispatched with `dispatch_workgroups(1, 1, 1)`) — the entire build runs sequentially in one invocation. This eliminates every cross-thread ordering hazard that could break byte-exact parity: no `atomicAdd` for node insertion, no cross-workgroup scan for subtree sizes, no thread-local speculative construction. The node buffer's write order is exactly the CPU's `nodes.push()` order.
+- **Explicit stack in `var<function>` array** — WGSL has no recursion; we simulate `build_recursive` with a `Frame` struct that records `{ start, end, escape_idx, phase, node_idx, mid, left_idx, left_size }` and a fixed-size stack (`MAX_STACK_DEPTH = 128`). Each frame has three phases: (0) initial visit (compute AABB, possibly push leaf and return), (1) after left child returns (save `left_size`, push right child frame), (2) after right child returns (write parent's `first_child_or_prim`, sweep left subtree for placeholder backfill, pop frame). Return values propagate via a single u32 "return register" written by the popping frame and read by the parent frame in phase 1 or 2.
+- **`LEFT_ESCAPE_PLACEHOLDER = 0u`** — identical to the CPU convention. Index 0 is always the tree root; escape pointers strictly move forward; no legitimate escape target is ever 0. The GPU port MUST NOT use a position-dependent placeholder like `left_idx + 1` (see §3.1 and skill §11.4).
+- **Subtree-size return + linear sweep** — the popping frame writes `1 + left_size + right_size` (internal) or `1` (leaf) into the return register. When phase 2 completes, the caller sweeps `nodes[left_idx..left_idx + left_size]` in a single `for` loop, replacing every `escape_idx() == LEFT_ESCAPE_PLACEHOLDER` node with the real `right_idx = left_idx + left_size`. No leftmost-spine recursion; no `old_escape == root + 1` matching.
+
+The alternative (parallel top-down BVH construction via Karras-style hierarchical linear BVH with atomic index generation) is 10-100x faster on large inputs but requires fresh determinism analysis and would ship as v2.3.x optimisation. The v2.3.0 correctness-first choice lets v2.4.0 (find_pairs) integrate against a stable byte-exact contract from day one.
+
+#### Determinism proof sketch
+
+Each step of the iterative build is deterministic because:
+
+1. **AABB union in i32 domain** — the AABB for `primitives[start..end]` is the componentwise `min` / `max` of pre-quantised i32 values. i32 min/max is commutative and associative in the total order, so the linear-scan order matches the CPU `aabb.union(&prim.aabb)` fold order exactly. **Byte-exact by construction.** (The CPU version does the union in Fix128 space then quantises to i32 via floor/ceil; because floor and ceil are monotonic — `min(floor(a), floor(b)) = floor(min(a, b))` — pre-quantising on the CPU host side and doing i32 min/max on the GPU is byte-exact equivalent to the CPU fold. See §5 CPU golden fixture note.)
+2. **Split search on Morton codes** — `find_split` scans `first_code`, `last_code`, computes the highest differing bit via `clz` (WGSL `countLeadingZeros`), and binary-searches for the split. All operations are on 64-bit integers emulated as `vec2<u32>`; the CPU golden uses u64 native arithmetic; the byte pattern of the result index is identical.
+3. **Node push order** — single-thread iterative build visits frames in the same order the CPU recursion does: parent, left subtree (fully), right subtree (fully). The `nodes_out` write index matches the CPU `nodes.push()` sequence one-for-one.
+4. **Placeholder backfill sweep** — after the left subtree completes, the sweep visits `nodes_out[left_idx..left_idx + left_size]` in strict ascending index order. Only `escape_idx() == LEFT_ESCAPE_PLACEHOLDER` nodes are touched. This mirrors the CPU sweep exactly.
+
+Together with the single-thread dispatch, every write to `nodes_out` occurs in the same order and with the same byte content as the CPU `Vec<BvhNode>`. The final `nodes_out[0..node_count]` slice is byte-identical to the CPU `LinearBvh::build(primitives).nodes` sequence.
+
+#### Bindings (v2.3.0 layout — frozen at this release)
+
+- `@group(0) @binding(0) var<storage, read>       sorted_codes:   array<vec2<u32>>` — 63-bit Morton codes in sorted order from v2.2.0, packed as `(low32, high32)`. Used only by `find_split` to locate the highest differing bit.
+- `@group(0) @binding(1) var<storage, read>       sorted_indices: array<u32>` — parallel primitive indices in sorted order. Copied verbatim into `BvhNodeGpu::first_child_or_prim` for leaves. Also passed back to the caller as the resulting `primitives` field of `LinearBvh` (via the sorted_indices input buffer being reused for the caller's `LinearBvh::primitives` Vec).
+- `@group(0) @binding(2) var<storage, read>       sorted_aabbs:   array<AabbI32>` — pre-quantised i32 primitive AABBs in sorted order. The Rust adapter derives these from `BvhPrimitive.aabb` via `aabb_to_i32_min` / `aabb_to_i32_max` before dispatch.
+- `@group(0) @binding(3) var<uniform>             params:         BuildParams` — `{ count: u32, leaf_max: u32 }`. `leaf_max` is fixed to 4 (matches CPU `if count <= 4`). Reserved for a future dispatch-time tuning knob without changing the bind group layout.
+- `@group(0) @binding(4) var<storage, read_write> nodes_out:      array<BvhNodeGpu>` — output tree nodes. Capacity MUST be at least `2 * count` (worst-case for the recursion + leaf_max=4 gives fewer than 2N nodes for N ≥ 4).
+- `@group(0) @binding(5) var<storage, read_write> node_count_out: array<atomic<u32>, 1>` — atomic counter written once with the total node count. Read back by the Rust adapter to trim `nodes_out` to the actual size. `atomic<u32>` is used for buffer-layout consistency with other Phase 3 kernels; only a single write happens.
+
+Where `AabbI32 { min_x: i32, min_y: i32, min_z: i32, max_x: i32, max_y: i32, max_z: i32 }` (24 bytes, matches the Rust `[i32; 3]` + `[i32; 3]` layout) and `BvhNodeGpu { aabb_min_{x,y,z}: i32, first_child_or_prim: u32, aabb_max_{x,y,z}: i32, prim_count_escape: u32 }` (32 bytes, byte-identical to CPU `BvhNode`).
+
+#### CPU golden strategy
+
+The v2.3.0 CPU golden constructs the tree end-to-end via the ALICE-Physics reference implementation:
+
+```rust
+use alice_physics::bvh::{BvhPrimitive, LinearBvh, BvhNode};
+use alice_physics::collider::AABB;
+use alice_physics::math::{Fix128, Vec3Fix};
+
+let primitives: Vec<BvhPrimitive> = /* fixture */;
+let cpu_bvh = LinearBvh::build(primitives);   // canonical byte-exact reference
+
+// GPU dispatch: pass sorted (codes, indices, aabbs) derived from the
+// same fixture (sorting via the v2.2.0 dispatch or the CPU
+// stable_sort_by_key for the fixture's Morton codes — both produce
+// identical inputs).
+let gpu_nodes = dispatch_fix128_bvh_build(&device, /* ... */);
+
+assert_eq!(bytemuck::bytes_of(cpu_bvh.nodes.as_slice()),
+           bytemuck::bytes_of(gpu_nodes.as_slice()));   // byte-exact
+```
+
+The byte-exact assert compares the raw byte slices via `bytemuck::cast_slice`. No epsilon, no field-by-field compare — the byte patterns must match exactly.
+
+#### Edge cases covered by the v2.3.0 fixture
+
+- **Pile** (32 primitives): tightly packed spheres at slightly offset positions in a 4×4×2 pile. Exercises balanced Morton splits + escape pointer chaining through several levels. Mirrors the `stage_breakdown_collider` bench fixture that surfaced the `dede78c` correctness fix.
+- **Uniform grid** (27 primitives): 3×3×3 lattice on integer coordinates. Exercises the "highest differing bit" split path across three cardinal axes and forces balanced tree depth.
+- **Degenerate all-colocated** (16 primitives): all AABBs at the origin. Exercises the `first_code == last_code` branch of `find_split` (falls back to `(start + end) / 2`) plus the AABB-union no-op path. This is the same degenerate configuration that stress-tests the CPU recursion for placeholder collision (skill §11.4).
+
+Fixture sizes ≤ 32 are chosen so the whole tree fits comfortably inside the stack depth budget (max recursion depth ≈ 5 for balanced N=32) and the byte-exact readback stays well under the 200KB / dispatch limit imposed by lavapipe.
+
+#### Post-build debug invariant (Rust adapter)
+
+Under `#[cfg(debug_assertions)]`, the Rust adapter runs the same `debug_verify_escape_forward` check as the CPU after readback:
+
+```rust
+#[cfg(debug_assertions)]
+fn debug_verify_escape_forward(nodes: &[BvhNodeGpu]) -> bool {
+    for (i, node) in nodes.iter().enumerate() {
+        let esc = node.escape_idx();
+        if esc == ESCAPE_NONE { continue; }
+        if (esc as usize) <= i { return false; }   // backward or self = illegal
+    }
+    true
+}
+```
+
+Any backward escape pointer indicates a bug in the port — either a placeholder was not backfilled, or the sweep visited the wrong range. The check is O(N) and runs only in debug builds.
+
 ## §3 Determinism Invariants
 
 Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogued in the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill:

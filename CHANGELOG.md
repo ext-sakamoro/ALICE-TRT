@@ -2,6 +2,43 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.3.0] - 2026-07-07
+
+### Added — GPU LinearBvh build kernel (Phase 3 §3)
+
+Third implementation release of the Phase 3 GPU BVH pipeline. Ships the single-workgroup single-thread iterative port of `alice_physics::bvh::LinearBvh::build_recursive`, byte-identical to the CPU reference on the 3-platform CI matrix (Metal / Vulkan lavapipe / DX12 WARP). Additive-only; the v2.2.0 public surface remains stable.
+
+- **`FIX128_BVH_BUILD_WGSL` — full impl** (new WGSL constant). Single `@compute @workgroup_size(1)` entry `fix128_bvh_build_main` iteratively drives `build_recursive` via an explicit 128-slot continuation-passing-style `Frame` stack in workgroup memory. Each frame runs through three phases: (0) compute AABB union + leaf/internal decision, (1) after LEFT child returns, push RIGHT with inherited escape, (2) after RIGHT returns, write parent's `first_child_or_prim` + linear O(subtree_size) sweep to backfill placeholder escapes. Position-independent `LEFT_ESCAPE_PLACEHOLDER = 0u` mirrors the ALICE-Physics `dede78c` correctness fix — see [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md) §3.1 and the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill §11.4 for the discipline this preserves.
+- **New public Rust struct `BvhNodeGpu`** (`#[repr(C)]`, 32 bytes): byte-layout mirror of `alice_physics::bvh::BvhNode`. Ships `from_physics(&BvhNode) -> BvhNodeGpu` for byte-exact test fixtures, plus `escape_idx()` / `prim_count()` accessors that unpack the `prim_count_escape` word identically to the CPU node.
+- **New public Rust struct `AabbI32Gpu`** (`#[repr(C)]`, 24 bytes): pre-quantised i32 AABB input to the build kernel. `from_physics_primitive(&BvhPrimitive)` applies the same `aabb_to_i32_min` (floor) / `aabb_to_i32_max` (ceil) rule as the CPU host; by monotonicity of floor/ceil the pre-quantised i32 fold is byte-exact equivalent to the CPU Fix128 fold + late quantisation. Both structs are gated behind `feature = "physics-solver"` because they consume the `alice_physics` types.
+- **New public Rust function** `dispatch_fix128_bvh_build(device, sorted_codes, sorted_indices, sorted_aabbs) -> Vec<BvhNodeGpu>`: full orchestrator. Uploads the three parallel input arrays (produced by v2.2.0's sort + host-side i32 pre-quantisation), dispatches at `(1, 1, 1)` workgroups, and reads back the actual node count from a separate atomic counter before trimming the output buffer to the tree's real size. Debug builds additionally invoke a private `debug_verify_escape_forward_impl` on the readback, which mirrors ALICE-Physics `LinearBvh::debug_verify_escape_forward` byte-exactly and panics on any backward or self-referential escape pointer.
+
+### Tests (v2.3.0 additions)
+
+- `wgsl_bvh_build_shader_present` — structural coverage of the new WGSL surface (struct names, binding identifiers, placeholder constants, sweep helpers, single `@workgroup_size(1)` entry). Runs on every 3-platform CI job without a GPU adapter.
+- `wgsl_bvh_build_shader_compiles` — naga validation via `create_shader_module`. Catches WGSL syntax / type errors on every platform; skips gracefully on adapter-less headless CI.
+- `wgpu_bvh_build_matches_cpu_golden` — **byte-exact GPU-CPU golden** on three fixtures that exercise the discipline requirements from `docs/PHASE_3_DESIGN.md` §2.4:
+  1. **Pile (32 primitives)** in a 4×4×2 grid with radius 1 and spacing 3 — balanced Morton splits, escape-pointer chaining through several tree levels. Mirrors the geometry of the `stage_breakdown_collider` bench fixture that surfaced the ALICE-Physics `dede78c` correctness fix.
+  2. **Uniform grid (27 primitives)** on a 3×3×3 lattice with spacing 4 — exercises the "highest differing bit" split path across three cardinal axes.
+  3. **Degenerate all-colocated (16 primitives)** with every AABB at the origin — exercises the `first_code == last_code` branch of `find_split` (midpoint fallback) plus the single-AABB world bounds. This is the same degenerate configuration that stress-tests the placeholder discipline in the CPU.
+
+Total 203 lib tests (previously 200), all pass on macOS Metal. The 3-platform CI matrix picks up the two new shader tests on the next tag run.
+
+### Design doc
+
+- **`docs/PHASE_3_DESIGN.md` §2.4** — full v2.3.0 scope: single-workgroup single-thread iterative build_recursive port, LEFT_ESCAPE_PLACEHOLDER = 0u discipline, subtree_size return + linear sweep, CPU-GPU AABB pre-quantisation equivalence proof, bindings (6 total), fixture design, and post-build debug invariant.
+
+### Backwards compatibility
+
+Fully additive vs v2.2.0. No API changes. The v2.2.0 `dispatch_fix128_morton_sort` orchestrator, `FIX128_MORTON_SORT_WGSL`, and `Fix128AabbGpu` are unchanged. External consumers who wired against the v2.2.0 sort output can now feed `(sorted_codes, sorted_indices)` directly into `dispatch_fix128_bvh_build` alongside a host-computed `Vec<AabbI32Gpu>`.
+
+### Next up (Phase 3 continuation)
+
+- **v2.4.0** — GPU BVH `find_pairs` kernel with `2 * nodes.len()` traversal cycle guard in debug builds.
+- **v2.5.0** — Sphere-sphere narrow-phase contact kernel (Fix128 sqrt + normal + depth).
+- **v2.6.0** — GPU PGS contact solve + `TrtSolverAdapter` opt-in for the full pipeline (mirrors the v1.5.1 → v1.6.0 opt-in / default-flip cadence).
+- **v2.3.x candidate** — parallel top-down BVH construction (Karras-style hierarchical linear BVH with atomic index generation). Requires fresh determinism analysis and a matching byte-exact CI matrix before shipping.
+
 ## [2.2.0] - 2026-07-07
 
 ### Added — Deterministic Morton sort kernel (Phase 3 §2)

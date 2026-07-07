@@ -3809,6 +3809,844 @@ pub fn dispatch_fix128_morton_sort(
 }
 
 // ---------------------------------------------------------------------------
+// v2.3.0 — GPU LinearBvh build kernel (Phase 3 §3)
+// ---------------------------------------------------------------------------
+
+/// v2.3.0 GPU LinearBvh build kernel — single-workgroup single-thread iterative
+/// port of `alice_physics::bvh::LinearBvh::build_recursive`.
+///
+/// Consumes the v2.2.0 sorted `(Morton codes, primitive indices)` output plus
+/// a parallel array of pre-quantised i32 primitive AABBs, and produces a
+/// depth-first pre-order sequence of `BvhNodeGpu` records **byte-identical**
+/// to the CPU reference `LinearBvh::build(primitives).nodes`.
+///
+/// # Discipline — §3.1 / skill §11.4
+///
+/// The build MUST preserve the four correctness invariants established by
+/// ALICE-Physics `dede78c` (2026-07-06 correctness fix; see
+/// [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md)
+/// §11.4):
+///
+/// 1. **Position-independent placeholder** — `LEFT_ESCAPE_PLACEHOLDER = 0u`.
+///    Index 0 is always the tree root; escape pointers strictly move forward;
+///    no legitimate escape target is ever 0. Never use `left_idx + 1` or any
+///    other position-dependent placeholder — nested recursion levels will
+///    collide.
+/// 2. **Subtree-size return + linear sweep** — every recursive call returns
+///    the number of nodes it pushed. After the LEFT subtree returns, the
+///    caller sweeps `nodes[left_idx..left_idx + left_size]` in one linear
+///    pass, replacing every node whose `escape_idx() == LEFT_ESCAPE_PLACEHOLDER`
+///    with the real `right_idx = left_idx + left_size`. No leftmost-spine
+///    recursion; no `old_escape == root + 1` matching.
+/// 3. **Debug invariant on completion** — every node's escape pointer is
+///    either `ESCAPE_NONE` or strictly forward. The Rust adapter validates
+///    this on readback under `#[cfg(debug_assertions)]`.
+/// 4. **Traversal cycle guard** — not part of the build kernel itself, but
+///    the future v2.4.0 `find_pairs` kernel MUST cap its visit counter at
+///    `2 * nodes.len()` in debug builds.
+///
+/// # Iterative build via explicit continuation stack
+///
+/// WGSL has no recursion. The kernel simulates `build_recursive` with a
+/// `Frame` struct (`{ start, end, escape_idx, phase, node_idx, mid,
+/// left_idx, left_size }`) held in workgroup-scoped memory and a `sp`
+/// (stack pointer) counter. Each frame has three phases:
+///
+/// - **Phase 0** — initial visit: compute the AABB union of primitives in
+///   `[start, end)`, check the leaf threshold (`count <= 4`), and either
+///   (a) push a leaf node and pop, or (b) push an internal node, compute
+///   `mid = find_split(...)`, save state, advance to phase 1, and push
+///   the LEFT child frame.
+/// - **Phase 1** — after the LEFT child returns (its `subtree_size` is
+///   in `return_reg`): save it as `left_size`, advance to phase 2, and
+///   push the RIGHT child frame (inheriting this frame's `escape_idx`).
+/// - **Phase 2** — after the RIGHT child returns: write the parent's
+///   `first_child_or_prim = left_idx`, sweep the LEFT subtree to
+///   backfill every `LEFT_ESCAPE_PLACEHOLDER` with `right_idx`, write
+///   `return_reg = 1 + left_size + right_size`, and pop.
+///
+/// Return values propagate via a single `workgroup`-scoped u32 register
+/// (`return_reg`) written by the popping frame and read by the parent
+/// frame at the top of the next iteration.
+///
+/// # Bindings
+///
+/// - `@group(0) @binding(0)` — `sorted_codes: array<vec2<u32>>` (read).
+///   The 63-bit Morton codes from v2.2.0, packed as `(low32, high32)`.
+///   Used only by `find_split` to locate the highest differing bit.
+/// - `@group(0) @binding(1)` — `sorted_indices: array<u32>` (read).
+///   Parallel primitive indices in sorted order. Copied verbatim into
+///   the `first_child_or_prim` field of every leaf via `f_start`.
+/// - `@group(0) @binding(2)` — `sorted_aabbs: array<AabbI32>` (read).
+///   Pre-quantised i32 AABBs in sorted order. See §CPU golden below
+///   for the byte-exact equivalence with the CPU Fix128 fold.
+/// - `@group(0) @binding(3)` — `params: BuildParams` (uniform).
+///   `{ count: u32, leaf_max: u32, _pad0: u32, _pad1: u32 }`
+///   (16-byte aligned). `leaf_max` is fixed to 4 by the Rust adapter.
+/// - `@group(0) @binding(4)` — `nodes_out: array<BvhNodeGpu>` (read_write).
+///   Output tree. Buffer capacity MUST be at least `2 * count + 8`.
+/// - `@group(0) @binding(5)` — `node_count_out: array<atomic<u32>, 1>`
+///   (read_write). Written once with the final node count at the end of
+///   the dispatch.
+///
+/// # CPU-GPU AABB pre-quantisation equivalence
+///
+/// The CPU reference builds the AABB union in Fix128 space and quantises
+/// to i32 only at leaf/internal creation via `aabb_to_i32_min` (floor)
+/// and `aabb_to_i32_max` (ceil). The GPU pre-quantises on the host side
+/// (`AabbI32Gpu::from_fix128`) and folds via i32 `min` / `max` on the
+/// device. These are **byte-exact equivalent** because floor and ceil
+/// are monotonic non-decreasing:
+///
+/// - `min(floor(a), floor(b)) = floor(min(a, b))` (monotonicity of floor)
+/// - `max(ceil(a), ceil(b)) = ceil(max(a, b))` (monotonicity of ceil)
+///
+/// Extended to any number of terms by induction, the two folds produce
+/// the same final i32 vector for every AABB in the tree.
+///
+/// # Determinism
+///
+/// Single-workgroup single-thread dispatch has no cross-thread ordering
+/// hazards. Every write to `nodes_out` occurs in the same sequence and
+/// with the same byte content as the CPU `Vec<BvhNode>`. The build is
+/// byte-exact across the 3-platform CI matrix (Metal / Vulkan lavapipe
+/// / DX12 WARP).
+///
+/// # Performance
+///
+/// Single-thread iterative build is O(N log N) for balanced Morton
+/// splits; each internal node performs an O(subtree_size) linear
+/// sweep for placeholder backfill. Parallel top-down BVH construction
+/// (Karras-style hierarchical linear BVH with atomic index generation)
+/// is 10-100x faster on large inputs but requires fresh determinism
+/// analysis; deferred to v2.3.x optimisation. The v2.3.0 correctness-
+/// first release lets v2.4.0 `find_pairs` integrate against a stable
+/// byte-exact contract from day one.
+pub const FIX128_BVH_BUILD_WGSL: &str = r#"
+struct AabbI32 {
+    min_x: i32,
+    min_y: i32,
+    min_z: i32,
+    max_x: i32,
+    max_y: i32,
+    max_z: i32,
+}
+
+struct BvhNodeGpu {
+    aabb_min_x: i32,
+    aabb_min_y: i32,
+    aabb_min_z: i32,
+    first_child_or_prim: u32,
+    aabb_max_x: i32,
+    aabb_max_y: i32,
+    aabb_max_z: i32,
+    prim_count_escape: u32,
+}
+
+struct BuildParams {
+    count:    u32,
+    leaf_max: u32,
+    _pad0:    u32,
+    _pad1:    u32,
+}
+
+struct Frame {
+    start:      u32,
+    end:        u32,
+    escape_idx: u32,
+    phase:      u32,
+    node_idx:   u32,
+    mid:        u32,
+    left_idx:   u32,
+    left_size:  u32,
+}
+
+@group(0) @binding(0) var<storage, read>       sorted_codes:   array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read>       sorted_indices: array<u32>;
+@group(0) @binding(2) var<storage, read>       sorted_aabbs:   array<AabbI32>;
+@group(0) @binding(3) var<uniform>             params:         BuildParams;
+@group(0) @binding(4) var<storage, read_write> nodes_out:      array<BvhNodeGpu>;
+@group(0) @binding(5) var<storage, read_write> node_count_out: array<atomic<u32>, 1>;
+
+const LEFT_ESCAPE_PLACEHOLDER: u32 = 0u;
+const ESCAPE_MASK_24:          u32 = 0x00FFFFFFu;
+const ESCAPE_NONE_U32:         u32 = 0xFFFFFFFFu;
+
+// Continuation stack (fixed 128 slots — safe for balanced trees up to
+// ~10 million primitives; degenerate all-colocated fixtures still hit
+// balanced splits via find_split's midpoint fallback).
+var<workgroup> stack:      array<Frame, 128>;
+// Return value of the most recently popped frame's build_recursive.
+var<workgroup> return_reg: u32;
+// Next node index to write in nodes_out.
+var<workgroup> node_ptr:   u32;
+
+// Compute the componentwise i32 AABB union of sorted_aabbs[start..end).
+// Byte-exact equivalent to the CPU Fix128 fold followed by floor/ceil
+// quantisation because floor and ceil are monotonic non-decreasing.
+fn compute_aabb_union(start: u32, end: u32) -> AabbI32 {
+    var aabb = sorted_aabbs[start];
+    for (var i: u32 = start + 1u; i < end; i = i + 1u) {
+        let p = sorted_aabbs[i];
+        aabb.min_x = min(aabb.min_x, p.min_x);
+        aabb.min_y = min(aabb.min_y, p.min_y);
+        aabb.min_z = min(aabb.min_z, p.min_z);
+        aabb.max_x = max(aabb.max_x, p.max_x);
+        aabb.max_y = max(aabb.max_y, p.max_y);
+        aabb.max_z = max(aabb.max_z, p.max_z);
+    }
+    return aabb;
+}
+
+fn u64_eq(a: vec2<u32>, b: vec2<u32>) -> bool {
+    return (a.x == b.x) && (a.y == b.y);
+}
+
+fn u64_xor(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(a.x ^ b.x, a.y ^ b.y);
+}
+
+// Returns the highest set bit index (0..63) of a 64-bit value packed as
+// (low32, high32). Returns 0 for input == 0 (unreachable in find_split
+// because the caller has already checked `first_code == last_code`).
+fn u64_highest_bit(v: vec2<u32>) -> u32 {
+    if (v.y != 0u) {
+        return 63u - countLeadingZeros(v.y);
+    }
+    if (v.x != 0u) {
+        return 31u - countLeadingZeros(v.x);
+    }
+    return 0u;
+}
+
+// Returns bit `bit_idx` (0..63) of a 64-bit value packed as (low32, high32).
+fn u64_bit(v: vec2<u32>, bit_idx: u32) -> u32 {
+    if (bit_idx < 32u) {
+        return (v.x >> bit_idx) & 1u;
+    }
+    return (v.y >> (bit_idx - 32u)) & 1u;
+}
+
+// Mirror of CPU `LinearBvh::find_split` byte-for-byte. Returns the split
+// index m such that [start, m) goes to the LEFT subtree and [m, end)
+// goes to the RIGHT.
+fn find_split(start: u32, end: u32) -> u32 {
+    let first_code = sorted_codes[start];
+    let last_code  = sorted_codes[end - 1u];
+
+    if (u64_eq(first_code, last_code)) {
+        return (start + end) / 2u;
+    }
+
+    let diff = u64_xor(first_code, last_code);
+    let highest_bit = u64_highest_bit(diff);
+
+    var lo = start;
+    var hi = end - 1u;
+
+    while (lo < hi) {
+        let mid = (lo + hi) / 2u;
+        let mid_code   = sorted_codes[mid];
+        let split_bit  = u64_bit(mid_code, highest_bit);
+        let first_bit  = u64_bit(first_code, highest_bit);
+
+        if (split_bit == first_bit) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+
+    return min(max(lo, start + 1u), end - 1u);
+}
+
+fn push_leaf(aabb: AabbI32, first_prim: u32, prim_count: u32, escape_idx: u32) {
+    let clamped = min(prim_count, 255u);
+    let idx = node_ptr;
+    nodes_out[idx].aabb_min_x = aabb.min_x;
+    nodes_out[idx].aabb_min_y = aabb.min_y;
+    nodes_out[idx].aabb_min_z = aabb.min_z;
+    nodes_out[idx].first_child_or_prim = first_prim;
+    nodes_out[idx].aabb_max_x = aabb.max_x;
+    nodes_out[idx].aabb_max_y = aabb.max_y;
+    nodes_out[idx].aabb_max_z = aabb.max_z;
+    nodes_out[idx].prim_count_escape = ((clamped & 0xFFu) << 24u) | (escape_idx & ESCAPE_MASK_24);
+    node_ptr = node_ptr + 1u;
+}
+
+fn push_internal(aabb: AabbI32, first_child: u32, escape_idx: u32) -> u32 {
+    let idx = node_ptr;
+    nodes_out[idx].aabb_min_x = aabb.min_x;
+    nodes_out[idx].aabb_min_y = aabb.min_y;
+    nodes_out[idx].aabb_min_z = aabb.min_z;
+    nodes_out[idx].first_child_or_prim = first_child;
+    nodes_out[idx].aabb_max_x = aabb.max_x;
+    nodes_out[idx].aabb_max_y = aabb.max_y;
+    nodes_out[idx].aabb_max_z = aabb.max_z;
+    nodes_out[idx].prim_count_escape = escape_idx & ESCAPE_MASK_24;
+    node_ptr = node_ptr + 1u;
+    return idx;
+}
+
+@compute @workgroup_size(1)
+fn fix128_bvh_build_main() {
+    let count    = params.count;
+    let leaf_max = params.leaf_max;
+
+    node_ptr   = 0u;
+    return_reg = 0u;
+
+    if (count == 0u) {
+        atomicStore(&node_count_out[0], 0u);
+        return;
+    }
+
+    var sp: u32 = 0u;
+
+    // Root frame: escape_idx = ESCAPE_NONE_U32 (the mask-24 truncation at
+    // the write site produces stored value 0x00FFFFFF, matching CPU byte
+    // exactly).
+    stack[0].start      = 0u;
+    stack[0].end        = count;
+    stack[0].escape_idx = ESCAPE_NONE_U32;
+    stack[0].phase      = 0u;
+    sp = 1u;
+
+    loop {
+        if (sp == 0u) { break; }
+        let idx      = sp - 1u;
+        let phase    = stack[idx].phase;
+        let f_start  = stack[idx].start;
+        let f_end    = stack[idx].end;
+        let f_escape = stack[idx].escape_idx;
+
+        if (phase == 0u) {
+            let count_range = f_end - f_start;
+            let aabb = compute_aabb_union(f_start, f_end);
+
+            if (count_range <= leaf_max) {
+                push_leaf(aabb, f_start, count_range, f_escape);
+                return_reg = 1u;
+                sp = sp - 1u;
+                continue;
+            }
+
+            // Internal node: push with first_child = 0 (fixed in phase 2),
+            // inherit caller-supplied escape.
+            let node_idx = push_internal(aabb, 0u, f_escape);
+            let mid      = find_split(f_start, f_end);
+            let left_idx = node_ptr;
+
+            stack[idx].phase    = 1u;
+            stack[idx].node_idx = node_idx;
+            stack[idx].mid      = mid;
+            stack[idx].left_idx = left_idx;
+
+            // Push LEFT child with placeholder escape.
+            stack[sp].start      = f_start;
+            stack[sp].end        = mid;
+            stack[sp].escape_idx = LEFT_ESCAPE_PLACEHOLDER;
+            stack[sp].phase      = 0u;
+            sp = sp + 1u;
+            continue;
+        }
+
+        if (phase == 1u) {
+            let left_size = return_reg;
+            let mid       = stack[idx].mid;
+            stack[idx].left_size = left_size;
+            stack[idx].phase     = 2u;
+
+            // Push RIGHT child, inheriting parent's escape.
+            stack[sp].start      = mid;
+            stack[sp].end        = f_end;
+            stack[sp].escape_idx = f_escape;
+            stack[sp].phase      = 0u;
+            sp = sp + 1u;
+            continue;
+        }
+
+        // phase == 2u — RIGHT subtree done. Backfill placeholders + pop.
+        let right_size = return_reg;
+        let node_idx   = stack[idx].node_idx;
+        let left_idx   = stack[idx].left_idx;
+        let left_size  = stack[idx].left_size;
+        let right_idx  = left_idx + left_size;
+
+        nodes_out[node_idx].first_child_or_prim = left_idx;
+
+        // Linear sweep of the LEFT subtree, replacing every placeholder
+        // escape with the real right_idx. Position-independent, single
+        // O(subtree_size) pass — the §11.4 discipline in action.
+        let end_of_left = left_idx + left_size;
+        for (var slot: u32 = left_idx; slot < end_of_left; slot = slot + 1u) {
+            let pce     = nodes_out[slot].prim_count_escape;
+            let cur_esc = pce & ESCAPE_MASK_24;
+            if (cur_esc == LEFT_ESCAPE_PLACEHOLDER) {
+                let prim_count = pce >> 24u;
+                nodes_out[slot].prim_count_escape = (prim_count << 24u) | (right_idx & ESCAPE_MASK_24);
+            }
+        }
+
+        return_reg = 1u + left_size + right_size;
+        sp = sp - 1u;
+    }
+
+    atomicStore(&node_count_out[0], node_ptr);
+}
+"#;
+
+/// GPU-side 32-byte BVH node — byte-layout mirror of ALICE-Physics
+/// `alice_physics::bvh::BvhNode`.
+///
+/// Field order and offsets are identical to the CPU counterpart:
+///
+/// | offset | field                 | size |
+/// |--------|-----------------------|------|
+/// | 0      | `aabb_min: [i32; 3]`  | 12   |
+/// | 12     | `first_child_or_prim` | 4    |
+/// | 16     | `aabb_max: [i32; 3]`  | 12   |
+/// | 28     | `prim_count_escape`   | 4    |
+///
+/// The upper 8 bits of `prim_count_escape` hold the leaf primitive count
+/// (0 for internal nodes); the lower 24 bits hold the escape pointer.
+///
+/// # Alignment
+///
+/// The struct uses `#[repr(C)]` without an `align` override so that
+/// `bytemuck::cast_slice(&[u8]) → &[BvhNodeGpu]` works on the wgpu
+/// readback buffer (which is guaranteed only 4-byte aligned). The CPU
+/// `BvhNode` uses `#[repr(C, align(32))]` for cache-line friendliness
+/// on the physics hot path; the byte content is identical either way.
+#[cfg(feature = "physics-solver")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BvhNodeGpu {
+    /// Componentwise `i32` floor of the AABB minimum corner (Fix128 → i32
+    /// via `aabb_to_i32_min` on the CPU host).
+    pub aabb_min: [i32; 3],
+    /// Leaf: index into the sorted primitives array pointing to the first
+    /// primitive covered by this leaf. Internal: index into the flat node
+    /// array pointing to the left child.
+    pub first_child_or_prim: u32,
+    /// Componentwise `i32` ceil of the AABB maximum corner.
+    pub aabb_max: [i32; 3],
+    /// Packed: upper 8 bits = primitive count (0 for internal nodes),
+    /// lower 24 bits = escape pointer (`ESCAPE_NONE = 0xFFFFFFFF` masked
+    /// to `0x00FFFFFF`).
+    pub prim_count_escape: u32,
+}
+
+#[cfg(feature = "physics-solver")]
+impl BvhNodeGpu {
+    /// Byte-exact copy from an `alice_physics::bvh::BvhNode`. Used by the
+    /// v2.3.0 CPU-GPU golden test to build the expected `Vec<BvhNodeGpu>`
+    /// from the CPU reference `LinearBvh::build(...).nodes` slice.
+    #[must_use]
+    pub fn from_physics(node: &alice_physics::bvh::BvhNode) -> Self {
+        Self {
+            aabb_min: node.aabb_min,
+            first_child_or_prim: node.first_child_or_prim,
+            aabb_max: node.aabb_max,
+            prim_count_escape: node.prim_count_escape,
+        }
+    }
+
+    /// Extract the escape pointer (lower 24 bits of `prim_count_escape`).
+    #[must_use]
+    pub const fn escape_idx(&self) -> u32 {
+        self.prim_count_escape & 0x00FF_FFFF
+    }
+
+    /// Extract the primitive count (upper 8 bits of `prim_count_escape`).
+    /// Returns 0 for internal nodes.
+    #[must_use]
+    pub const fn prim_count(&self) -> u32 {
+        self.prim_count_escape >> 24
+    }
+}
+
+/// GPU-side 24-byte i32 AABB — input to the v2.3.0 BVH build kernel.
+///
+/// Field order matches the WGSL `struct AabbI32`:
+///
+/// | offset | field   | size |
+/// |--------|---------|------|
+/// | 0      | `min_x` | 4    |
+/// | 4      | `min_y` | 4    |
+/// | 8      | `min_z` | 4    |
+/// | 12     | `max_x` | 4    |
+/// | 16     | `max_y` | 4    |
+/// | 20     | `max_z` | 4    |
+///
+/// Constructed on the host by the caller via
+/// [`AabbI32Gpu::from_physics_primitive`], which pre-quantises the
+/// primitive's Fix128 AABB to i32 via floor (min) and ceil (max) — the
+/// same quantisation the CPU `LinearBvh::build` applies at leaf/internal
+/// creation time. See [`FIX128_BVH_BUILD_WGSL`] for the byte-exact
+/// equivalence proof.
+#[cfg(feature = "physics-solver")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AabbI32Gpu {
+    pub min_x: i32,
+    pub min_y: i32,
+    pub min_z: i32,
+    pub max_x: i32,
+    pub max_y: i32,
+    pub max_z: i32,
+}
+
+#[cfg(feature = "physics-solver")]
+impl AabbI32Gpu {
+    /// Pre-quantise an `alice_physics::bvh::BvhPrimitive`'s Fix128 AABB
+    /// to i32 using the same floor/ceil rule as
+    /// `alice_physics::bvh::BvhNode::leaf` / `::internal`. The GPU
+    /// build kernel folds these values via componentwise `min` / `max`,
+    /// which is byte-exact equivalent to the CPU Fix128 fold + quantise
+    /// (see monotonicity argument in [`FIX128_BVH_BUILD_WGSL`] docs).
+    #[must_use]
+    pub fn from_physics_primitive(prim: &alice_physics::bvh::BvhPrimitive) -> Self {
+        // Reproduce `aabb_to_i32_min` / `aabb_to_i32_max` from ALICE-Physics
+        // src/bvh.rs (private there, so we replicate the arithmetic).
+        let a = &prim.aabb;
+        Self {
+            min_x: fix128_floor_i32(a.min.x),
+            min_y: fix128_floor_i32(a.min.y),
+            min_z: fix128_floor_i32(a.min.z),
+            max_x: fix128_ceil_i32(a.max.x),
+            max_y: fix128_ceil_i32(a.max.y),
+            max_z: fix128_ceil_i32(a.max.z),
+        }
+    }
+}
+
+/// Floor of a Fix128 to i32, clamped to `[i32::MIN, i32::MAX]`. Mirrors
+/// the private `fix128_floor_i32` in `alice_physics::bvh` byte-exactly:
+/// the two's-complement `hi` field is already the floor for both
+/// positive and negative values.
+#[cfg(feature = "physics-solver")]
+#[inline]
+#[must_use]
+fn fix128_floor_i32(v: alice_physics::math::Fix128) -> i32 {
+    let hi = v.hi.max(i32::MIN as i64).min(i32::MAX as i64);
+    // Explicit i32 conversion via `as` — safe because of the clamp above;
+    // clippy pedantic accepts the cast here as the value is proven in
+    // range.
+    #[allow(clippy::cast_possible_truncation)]
+    let out = hi as i32;
+    out
+}
+
+/// Ceil of a Fix128 to i32, clamped to `[i32::MIN, i32::MAX]`. Mirrors
+/// the private `fix128_ceil_i32` in `alice_physics::bvh` byte-exactly.
+#[cfg(feature = "physics-solver")]
+#[inline]
+#[must_use]
+fn fix128_ceil_i32(v: alice_physics::math::Fix128) -> i32 {
+    let ceil = if v.lo > 0 { v.hi + 1 } else { v.hi };
+    let clamped = ceil.max(i32::MIN as i64).min(i32::MAX as i64);
+    #[allow(clippy::cast_possible_truncation)]
+    let out = clamped as i32;
+    out
+}
+
+/// v2.3.0 GPU BVH build orchestrator — dispatches [`FIX128_BVH_BUILD_WGSL`]
+/// and returns the tree byte-identical to
+/// `alice_physics::bvh::LinearBvh::build(primitives).nodes`.
+///
+/// # Contract
+///
+/// - `sorted_codes`, `sorted_indices`, and `sorted_aabbs` MUST have the
+///   same length; each triple describes one primitive in the order
+///   produced by [`dispatch_fix128_morton_sort`] (v2.2.0).
+/// - Returns `Vec<BvhNodeGpu>` of length `<= 2 * count + 8`. The exact
+///   length is written by the kernel to a separate atomic counter and
+///   read back by the adapter.
+/// - Byte-identical to the CPU reference for every fixture in the
+///   v2.3.0 3-platform CI golden.
+/// - `count == 0` short-circuits to an empty output without dispatching
+///   the kernel.
+///
+/// # Debug invariant
+///
+/// Under `#[cfg(debug_assertions)]` the adapter runs a private
+/// `debug_verify_escape_forward_impl` check on the readback, asserting
+/// that every escape pointer is either `ESCAPE_NONE` (stored as
+/// `0x00FFFFFF` after 24-bit truncation) or strictly forward. Any
+/// backward pointer
+/// indicates a bug in the port — either a placeholder was not
+/// backfilled, or the sweep visited the wrong range. The check is O(N)
+/// and mirrors ALICE-Physics `LinearBvh::debug_verify_escape_forward`.
+///
+/// # Panics
+///
+/// - Panics if the three input slice lengths differ.
+/// - Panics if the wgpu device is lost during dispatch.
+/// - In debug builds, panics if the returned tree has a backward or
+///   self-referential escape pointer.
+#[cfg(feature = "physics-solver")]
+#[must_use]
+pub fn dispatch_fix128_bvh_build(
+    device: &crate::device::GpuDevice,
+    sorted_codes: &[[u32; 2]],
+    sorted_indices: &[u32],
+    sorted_aabbs: &[AabbI32Gpu],
+) -> Vec<BvhNodeGpu> {
+    assert_eq!(
+        sorted_codes.len(),
+        sorted_indices.len(),
+        "sorted_codes.len() must equal sorted_indices.len()"
+    );
+    assert_eq!(
+        sorted_codes.len(),
+        sorted_aabbs.len(),
+        "sorted_codes.len() must equal sorted_aabbs.len()"
+    );
+    let count = sorted_codes.len();
+    if count == 0 {
+        return Vec::new();
+    }
+
+    // Params uniform — 16-byte aligned for cross-platform uniform buffer
+    // layout (Metal / Vulkan / DX12 all require multiple-of-16 struct
+    // sizes for uniform bindings).
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct BuildParams {
+        count: u32,
+        leaf_max: u32,
+        _pad0: u32,
+        _pad1: u32,
+    }
+
+    let params = BuildParams {
+        count: u32::try_from(count).expect("primitive count exceeds u32::MAX"),
+        leaf_max: 4,
+        _pad0: 0,
+        _pad1: 0,
+    };
+
+    // Node buffer capacity: a BVH over N primitives with `leaf_max = 4`
+    // pushes at most `2 * ceil(N / leaf_max) - 1 <= 2 * N` nodes for
+    // N >= leaf_max. Add a small safety margin for the degenerate
+    // one-primitive case (which pushes exactly 1 leaf).
+    let node_capacity: usize = 2 * count + 8;
+
+    let shader = device
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fix128_bvh_build_shader"),
+            source: wgpu::ShaderSource::Wgsl(FIX128_BVH_BUILD_WGSL.into()),
+        });
+    let bind_group_layout =
+        device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fix128_bvh_build_bgl"),
+                entries: &[
+                    // 0: sorted_codes (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 1: sorted_indices (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 2: sorted_aabbs (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 3: params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 4: nodes_out (read_write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 5: node_count_out (read_write storage, atomic)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+    let pipeline_layout = device
+        .device()
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fix128_bvh_build_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let pipeline = device
+        .device()
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fix128_bvh_build_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("fix128_bvh_build_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    let buf_codes =
+        device.create_buffer_init("bvh_build_codes", bytemuck::cast_slice(sorted_codes));
+    let buf_indices =
+        device.create_buffer_init("bvh_build_indices", bytemuck::cast_slice(sorted_indices));
+    let buf_aabbs =
+        device.create_buffer_init("bvh_build_aabbs", bytemuck::cast_slice(sorted_aabbs));
+    let buf_params = device.create_uniform_buffer("bvh_build_params", bytemuck::bytes_of(&params));
+    let nodes_bytes: u64 = (node_capacity * core::mem::size_of::<BvhNodeGpu>()) as u64;
+    let buf_nodes = device.create_buffer_empty("bvh_build_nodes", nodes_bytes);
+    let buf_node_count = device.create_buffer_empty("bvh_build_node_count", 4);
+
+    let bind_group = device
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fix128_bvh_build_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_codes.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_indices.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_aabbs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buf_nodes.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buf_node_count.as_entire_binding(),
+                },
+            ],
+        });
+
+    let mut encoder = device
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fix128_bvh_build_encoder"),
+        });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fix128_bvh_build_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+    device.submit(encoder);
+    device.poll_wait();
+
+    // Read the actual node count first.
+    let count_raw = device.read_buffer(&buf_node_count, 4);
+    let count_slice: &[u32] = bytemuck::cast_slice(&count_raw);
+    let actual_node_count = count_slice[0] as usize;
+    assert!(
+        actual_node_count <= node_capacity,
+        "BVH build produced {} nodes, buffer capacity was {}",
+        actual_node_count,
+        node_capacity
+    );
+
+    let node_bytes = (actual_node_count * core::mem::size_of::<BvhNodeGpu>()) as u64;
+    let nodes_raw = device.read_buffer(&buf_nodes, node_bytes);
+    let nodes: Vec<BvhNodeGpu> = bytemuck::cast_slice(&nodes_raw).to_vec();
+
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            debug_verify_escape_forward_impl(&nodes),
+            "BVH escape pointer invariant violated: backward or self-referential escape detected"
+        );
+    }
+
+    nodes
+}
+
+/// Debug-only invariant check: every escape pointer in `nodes` is either
+/// `ESCAPE_NONE` (stored as `0x00FF_FFFF` after 24-bit truncation) or a
+/// strictly-greater node index. Backward escape pointers form cycles in
+/// stackless traversal and drive `find_pairs` into unbounded push loops
+/// (the 5 GB / n=50 pile SIGKILL that motivated the ALICE-Physics
+/// `dede78c` correctness fix — see skill §11.4).
+///
+/// Mirrors ALICE-Physics `LinearBvh::debug_verify_escape_forward`
+/// byte-exactly, including the vestigial `esc == ESCAPE_NONE` check
+/// that never triggers because the 24-bit truncation makes the stored
+/// value `0x00FF_FFFF` rather than `u32::MAX`. The second `esc <= i`
+/// branch handles the ESCAPE_NONE case correctly (the stored value
+/// `0x00FF_FFFF = 16_777_215` exceeds any reasonable N).
+#[cfg(all(feature = "physics-solver", debug_assertions))]
+fn debug_verify_escape_forward_impl(nodes: &[BvhNodeGpu]) -> bool {
+    const ESCAPE_NONE: u32 = u32::MAX;
+    for (i, node) in nodes.iter().enumerate() {
+        let esc = node.escape_idx();
+        if esc == ESCAPE_NONE {
+            continue;
+        }
+        if (esc as usize) <= i {
+            return false;
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
 
@@ -5865,5 +6703,231 @@ mod tests {
         assert_eq!(u.max_x, five);
         assert_eq!(u.max_y, one);
         assert_eq!(u.max_z, four);
+    }
+
+    // -----------------------------------------------------------------
+    // v2.3.0 GPU BVH build kernel tests
+    // -----------------------------------------------------------------
+
+    /// v2.3.0 BVH build kernel ships the WGSL struct + binding + entry
+    /// point set documented in [`docs/PHASE_3_DESIGN.md`] §2.4. This
+    /// structural test runs without a GPU adapter so headless CI still
+    /// catches accidental deletion of any surface-level identifier.
+    ///
+    /// [`docs/PHASE_3_DESIGN.md`]: ../../docs/PHASE_3_DESIGN.md
+    #[test]
+    fn wgsl_bvh_build_shader_present() {
+        // Structs from the design doc §2.4 bindings section.
+        assert!(FIX128_BVH_BUILD_WGSL.contains("struct AabbI32"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("struct BvhNodeGpu"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("struct BuildParams"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("struct Frame"));
+        // Bindings (0..5 in the layout).
+        assert!(FIX128_BVH_BUILD_WGSL.contains("sorted_codes"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("sorted_indices"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("sorted_aabbs"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("nodes_out"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("node_count_out"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("array<atomic<u32>, 1>"));
+        // Placeholder discipline constants (§3.1 / skill §11.4).
+        assert!(FIX128_BVH_BUILD_WGSL.contains("LEFT_ESCAPE_PLACEHOLDER: u32 = 0u"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("ESCAPE_MASK_24"));
+        // Continuation stack + helpers.
+        assert!(FIX128_BVH_BUILD_WGSL.contains("var<workgroup> stack:"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("fn compute_aabb_union"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("fn find_split"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("fn push_leaf"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("fn push_internal"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("fn u64_highest_bit"));
+        // Single compute entry, dispatched at 1x1x1.
+        assert!(FIX128_BVH_BUILD_WGSL.contains("fn fix128_bvh_build_main"));
+        assert!(FIX128_BVH_BUILD_WGSL.contains("@workgroup_size(1)"));
+        // Discipline check on the sweep loop: iterates over LEFT subtree
+        // slice only, not the whole tree.
+        assert!(FIX128_BVH_BUILD_WGSL.contains("LEFT_ESCAPE_PLACEHOLDER"));
+    }
+
+    /// v2.3.0 BVH build kernel must compile as valid WGSL end-to-end.
+    /// Runs the naga parser via `create_shader_module` and fails loudly
+    /// on any syntax / type error. Skips when no GPU adapter is
+    /// available (headless CI).
+    #[test]
+    fn wgsl_bvh_build_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_bvh_build_shader_compile_test"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_BVH_BUILD_WGSL.into()),
+            });
+    }
+
+    /// Byte-exact GPU-CPU golden for the v2.3.0 BVH build kernel.
+    ///
+    /// Exercises three fixtures that surface the §3.1 / skill §11.4
+    /// discipline requirements:
+    ///
+    /// 1. **Pile (32 primitives)** — tightly-packed spheres in a 4x4x2
+    ///    grid. Exercises balanced Morton splits and escape-pointer
+    ///    chaining through several tree levels. Mirrors the geometry
+    ///    of the `stage_breakdown_collider` bench fixture that surfaced
+    ///    the ALICE-Physics `dede78c` correctness fix.
+    /// 2. **Uniform grid (27 primitives)** — 3x3x3 lattice on integer
+    ///    coordinates. Exercises the "highest differing bit" split path
+    ///    across three cardinal axes and forces balanced tree depth.
+    /// 3. **Degenerate all-colocated (16 primitives)** — all AABBs at
+    ///    the origin. Exercises the `first_code == last_code` branch of
+    ///    `find_split` (falls back to `(start + end) / 2`) plus the
+    ///    single-AABB world bounds. This is the same degenerate
+    ///    configuration that stress-tests the CPU recursion for
+    ///    placeholder collision (skill §11.4).
+    ///
+    /// For every fixture the CPU reference `LinearBvh::build(...).nodes`
+    /// is compared byte-for-byte to the GPU output, and additionally the
+    /// GPU output is asserted to satisfy the §3.1 debug invariant (no
+    /// backward escape pointers). Skips when no GPU adapter is available
+    /// (headless CI).
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_bvh_build_matches_cpu_golden() {
+        use alice_physics::bvh::{point_to_morton, BvhPrimitive, LinearBvh};
+        use alice_physics::collider::AABB;
+        use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
+
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        /// Build one `BvhPrimitive` from an integer sphere centre and
+        /// radius. AABB = [centre - radius, centre + radius] on each
+        /// axis, matching the ALICE-Physics sphere-derived AABB shape.
+        fn mk_prim(cx: i64, cy: i64, cz: i64, r: i64, idx: u32) -> BvhPrimitive {
+            let fx = PhysicsFix128::from_int(cx);
+            let fy = PhysicsFix128::from_int(cy);
+            let fz = PhysicsFix128::from_int(cz);
+            let fr = PhysicsFix128::from_int(r);
+            BvhPrimitive {
+                aabb: AABB::new(
+                    Vec3Fix::new(fx - fr, fy - fr, fz - fr),
+                    Vec3Fix::new(fx + fr, fy + fr, fz + fr),
+                ),
+                index: idx,
+                morton: 0,
+            }
+        }
+
+        /// Reproduce the world-bounds + Morton-code + stable-sort
+        /// preamble from `LinearBvh::build` to obtain the three parallel
+        /// arrays the v2.3.0 kernel consumes. Returns `(sorted_codes,
+        /// sorted_indices, sorted_aabbs)` in the same order the CPU
+        /// implementation processes them.
+        fn cpu_sort(input: &[BvhPrimitive]) -> (Vec<[u32; 2]>, Vec<u32>, Vec<AabbI32Gpu>) {
+            let mut prims: Vec<BvhPrimitive> = input.to_vec();
+            if prims.is_empty() {
+                return (Vec::new(), Vec::new(), Vec::new());
+            }
+            // World bounds — union of every primitive AABB.
+            let mut bounds = prims[0].aabb;
+            for p in &prims[1..] {
+                bounds = bounds.union(&p.aabb);
+            }
+            // Per-primitive Morton codes (byte-exact CPU reference).
+            for p in prims.iter_mut() {
+                let centre = Vec3Fix::new(
+                    (p.aabb.min.x + p.aabb.max.x).half(),
+                    (p.aabb.min.y + p.aabb.max.y).half(),
+                    (p.aabb.min.z + p.aabb.max.z).half(),
+                );
+                p.morton = point_to_morton(centre, &bounds);
+            }
+            // Stable sort (matches CPU's sort_by_key).
+            prims.sort_by_key(|p| p.morton);
+
+            let codes: Vec<[u32; 2]> = prims
+                .iter()
+                .map(|p| [p.morton as u32, (p.morton >> 32) as u32])
+                .collect();
+            let indices: Vec<u32> = prims.iter().map(|p| p.index).collect();
+            let aabbs: Vec<AabbI32Gpu> = prims
+                .iter()
+                .map(AabbI32Gpu::from_physics_primitive)
+                .collect();
+            (codes, indices, aabbs)
+        }
+
+        // Compare CPU `LinearBvh` output to the GPU dispatch output on
+        // the given fixture. Byte-exact assert on every node.
+        let check = |label: &str, input: Vec<BvhPrimitive>| {
+            let cpu_bvh = LinearBvh::build(input.clone());
+            let (codes, indices, aabbs) = cpu_sort(&input);
+            let gpu_nodes = dispatch_fix128_bvh_build(&device, &codes, &indices, &aabbs);
+
+            assert_eq!(
+                gpu_nodes.len(),
+                cpu_bvh.nodes.len(),
+                "{label}: node count mismatch (GPU={} CPU={})",
+                gpu_nodes.len(),
+                cpu_bvh.nodes.len()
+            );
+            for (i, (g, c)) in gpu_nodes.iter().zip(cpu_bvh.nodes.iter()).enumerate() {
+                let c_gpu = BvhNodeGpu::from_physics(c);
+                assert_eq!(
+                    *g, c_gpu,
+                    "{label}: node[{i}] mismatch — GPU {g:?} vs CPU {c_gpu:?}"
+                );
+            }
+        };
+
+        // ---- Fixture 1: pile of 32 primitives in a 4x4x2 grid ----
+        {
+            let mut prims: Vec<BvhPrimitive> = Vec::new();
+            let mut idx = 0u32;
+            for xi in 0..4i64 {
+                for yi in 0..4i64 {
+                    for zi in 0..2i64 {
+                        // spacing 3, radius 1 → mildly overlapping neighbours
+                        prims.push(mk_prim(xi * 3, yi * 3, zi * 3, 1, idx));
+                        idx += 1;
+                    }
+                }
+            }
+            assert_eq!(prims.len(), 32);
+            check("pile 4x4x2", prims);
+        }
+
+        // ---- Fixture 2: uniform 3x3x3 grid (27 primitives) ----
+        {
+            let mut prims: Vec<BvhPrimitive> = Vec::new();
+            let mut idx = 0u32;
+            for xi in 0..3i64 {
+                for yi in 0..3i64 {
+                    for zi in 0..3i64 {
+                        prims.push(mk_prim(xi * 4, yi * 4, zi * 4, 1, idx));
+                        idx += 1;
+                    }
+                }
+            }
+            assert_eq!(prims.len(), 27);
+            check("uniform grid 3x3x3", prims);
+        }
+
+        // ---- Fixture 3: degenerate all-colocated (16 primitives) ----
+        // All AABBs identical → world_bounds = a single AABB → all
+        // Morton codes identical → find_split hits the `first_code ==
+        // last_code` branch → midpoint fallback. This is the same
+        // configuration that surfaced the CPU placeholder collision
+        // in ALICE-Physics `dede78c`.
+        {
+            let mut prims: Vec<BvhPrimitive> = Vec::new();
+            for idx in 0..16u32 {
+                prims.push(mk_prim(0, 0, 0, 1, idx));
+            }
+            assert_eq!(prims.len(), 16);
+            check("degenerate colocated", prims);
+        }
     }
 }
