@@ -64,6 +64,70 @@ Each release is a self-contained additive step. The v2.1.0 primitives (AABB help
 
 Subsequent releases (v2.2+) layer on top without breaking v2.1's contracts.
 
+### 2.3 v2.2.0 scope (upcoming: Morton sort kernel)
+
+The v2.2.0 release ships the **deterministic Morton sort kernel** that consumes the v2.1.0 `FIX128_MORTON_CODE_WGSL` output and produces the same sorted (Morton-code, primitive-index) pair sequence that `ALICE-Physics::LinearBvh::build` obtains from `primitives.sort_by_key(|p| p.morton)` on the CPU. The sorted output is the direct input for the v2.3.0 BVH build kernel.
+
+#### Algorithm choice — LSB-first 8-bit radix, one pass per dispatch
+
+Deterministic sorts on the GPU face a design trade-off between throughput and determinism guarantees. For Phase 3 we prioritise **guaranteed byte-exact CPU-GPU parity across every 3-platform CI run** over raw throughput, and choose LSB-first 8-bit radix sort with one compute dispatch per radix pass:
+
+- **8-bit radix** — each pass processes 8 bits of the 63-bit Morton code, so **8 dispatches** cover the whole key space (the top bit of the 63-bit code is always 0, so 8 × 8 = 64 covers everything with one wasted pass, or exactly 8 with a `if pass == 7 { mask = 0x7F }` guard in the shader).
+- **LSB-first** — process bits 0-7 first, then bits 8-15, and so on. LSB-first radix is naturally stable: two keys with the same current-byte value keep their relative order from the previous pass. This is exactly what CPU `sort_by_key` produces (Rust's `sort_by_key` uses a stable sort — Timsort — under the hood).
+- **One dispatch per pass** — each pass is a self-contained compute dispatch: (1) build the 256-bin histogram of current-byte values, (2) exclusive-scan the histogram to bucket offsets, (3) scatter each input key/index pair to its target position in the output arrays. Ping-pong between two `(codes, indices)` buffer pairs across the 8 passes.
+
+The alternative (single-dispatch multi-pass with workgroup-scoped tiling) is faster but introduces cross-workgroup ordering hazards that require careful `workgroupBarrier` placement and open the v0.8.1 FXC X4026 uniformity crash risk on WARP. Explicitly out of scope for v2.2.0; may revisit in a v2.2.x optimisation pass once the byte-exact contract is locked.
+
+#### Determinism proof sketch
+
+Each pass is deterministic because:
+
+1. The histogram step reads every input exactly once and increments a fixed-size (256-entry) counter array via `atomicAdd`. The set of increments is fully determined by the input, not the order in which they occur.
+2. The exclusive-scan step is deterministic by construction (single-threaded prefix sum, or well-known deterministic parallel scan primitives — details in the v2.2.0 impl).
+3. The scatter step reads each input exactly once and writes it to a position derived deterministically from `(bucket_offset, input_index_in_bucket)`. Because LSB-first radix processes buckets in ascending value order and the input-index-in-bucket is monotonic within each thread's assigned range, the output is uniquely determined by the input.
+
+Across the 8 passes, the ping-pong preserves the invariant "buffer A holds the state after the last-even pass, buffer B after the last-odd pass". The final result is byte-identical to `stable_sort_by_key(morton)` on the CPU.
+
+#### Bindings (per pass)
+
+- `@group(0) @binding(0) var<storage, read>       codes_in:    array<vec2<u32>>` — input 63-bit Morton codes as `(low32, high32)`.
+- `@group(0) @binding(1) var<storage, read>       indices_in:  array<u32>` — input primitive indices (parallel to codes).
+- `@group(0) @binding(2) var<storage, read_write> codes_out:   array<vec2<u32>>` — output codes.
+- `@group(0) @binding(3) var<storage, read_write> indices_out: array<u32>` — output indices.
+- `@group(0) @binding(4) var<uniform>             params: SortPassParams` — `{ pass_bit_shift: u32, count: u32 }`. On pass `p`, `pass_bit_shift = p * 8u` and the shader extracts `(code >> pass_bit_shift) & 0xFFu` as the histogram key.
+- `@group(0) @binding(5) var<storage, read_write> histogram: array<atomic<u32>, 256>` — 256-bin histogram, zeroed by the CPU between passes.
+
+Between passes the CPU (a) swaps `(codes_in, codes_out)` and `(indices_in, indices_out)` bindings, (b) zeroes the histogram buffer, (c) updates `params.pass_bit_shift`. This is cheap host-side book-keeping; the compute work stays fully on the GPU.
+
+#### CPU golden strategy
+
+The v2.2.0 CPU golden mirrors the CPU implementation:
+
+```rust
+let mut cpu_pairs: Vec<(u64, u32)> = /* ... zip morton and index ... */;
+cpu_pairs.sort_by_key(|(m, _)| *m); // Timsort — stable
+```
+
+The GPU test dispatches 8 passes (or 7 with the top-bit guard), reads back the sorted `(codes_out, indices_out)` pair, and asserts byte-for-byte equality against `cpu_pairs`.
+
+#### Edge cases covered by the v2.2.0 fixture
+
+- **Empty array** — `count = 0`, all passes short-circuit, output is empty.
+- **Single element** — `count = 1`, all 8 passes leave it in place.
+- **All codes identical** — degenerate histogram (one bucket = N, others = 0). Output preserves insertion order because LSB-first + stable.
+- **All codes distinct** — general case.
+- **Duplicate Morton codes** (same AABB centre from two different bodies) — stability guarantees the pair with the lower primitive index comes first. Test asserts this explicitly.
+- **Ascending pre-sorted input** — output equals input; no swaps.
+- **Descending pre-sorted input** — full reversal; exercises every bucket-crossing.
+
+The fixture size for the v2.2.0 golden is **64 primitives** — small enough to hand-verify and large enough to exceed the workgroup size (64) so cross-workgroup ordering is exercised.
+
+#### Skeleton in v2.1.x (this session)
+
+The `FIX128_MORTON_SORT_WGSL` constant lands in this session as a **skeleton preview** — struct definitions + bindings + a no-op smoke entry point, with the impl body marked `// TODO(v2.2.0-impl)`. Naga validation passes; no `#[deprecated]` attribute; no adapter integration. External `Fix128GpuKernel` implementers can start compiling against the binding-layout contract now and swap in the v2.2.0 impl body when it ships.
+
+The version stays at 2.1.0 — a skeleton is not a functional promise, so no MINOR bump. The `Unreleased` section of `CHANGELOG.md` documents the skeleton so the v2.2.0 release notes can pick up the diff cleanly.
+
 ## §3 Determinism Invariants
 
 Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogued in the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill:
