@@ -215,6 +215,81 @@ fn debug_verify_escape_forward(nodes: &[BvhNodeGpu]) -> bool {
 
 Any backward escape pointer indicates a bug in the port — either a placeholder was not backfilled, or the sweep visited the wrong range. The check is O(N) and runs only in debug builds.
 
+### 2.5 v2.4.0 scope (upcoming: GPU BVH find_pairs kernel)
+
+The v2.4.0 release ships the **GPU BVH `find_pairs` kernel** that consumes the v2.3.0 `Vec<BvhNodeGpu>` output plus the v2.2.0 sorted primitive indices, and produces a `Vec<(u32, u32)>` **byte-identical** to `alice_physics::bvh::LinearBvh::find_pairs()` on the CPU. This closes the broad-phase pipeline: after v2.4.0 the caller can go BvhPrimitive input → Morton sort → BVH build → pair list entirely on the GPU (minus the final `sort_unstable` + `dedup` that stay host-side per §CPU golden below).
+
+#### Algorithm choice — single-workgroup single-thread stackless traversal
+
+The CPU `find_pairs` iterates each primitive in `bvh.primitives` order and calls `query_callback(&self.bounds, |prim_j| { if prim_i < prim_j { pairs.push(...) } })`. The v2.4.0 port mirrors this exactly under the same discipline as v2.3.0:
+
+- **Single workgroup, single thread** (`@workgroup_size(1)`, dispatched with `dispatch_workgroups(1, 1, 1)`) — the outer `for &prim_i in &self.primitives` loop runs sequentially on one invocation, and every inner tree walk shares that single thread's atomic emission counter. This is the same correctness-first choice as v2.3.0 and v2.2.0's scatter kernel: eliminates every cross-thread ordering hazard that could break byte-exact parity.
+- **Stackless traversal via escape pointers** — the inner query mirrors the CPU `query_callback` byte-for-byte: `idx = 0`; loop while `idx != ESCAPE_NONE && idx < node_count`; on AABB-hit-and-leaf emit each primitive and jump to `escape_idx()`; on AABB-hit-and-internal descend to `first_child_or_prim`; on AABB-miss skip via `escape_idx()`. Because the CPU passes `self.bounds` (the world AABB) as the query, every `intersects_i32` check passes and the walk visits every internal + leaf node in flat-array order. The escape pointer is still exercised on the leaf → next-sibling transition.
+- **`atomicAdd`-based pair emission** — pair output uses `atomicAdd(&counters[0], 1u)` to reserve a slot in `pairs_out`. The single-thread dispatch means only one invocation ever increments the counter, so `atomicAdd` is functionally equivalent to a plain increment; the atomic wrapper is kept for buffer-layout consistency with other Phase 3 kernels and to make future v2.4.x parallelisation a drop-in change. The `prim_i < prim_j` filter is applied at emission time (same as the CPU), so total emissions equal the final unique-pair count (no duplicates possible).
+- **Debug cycle guard (§11.4)** — per-primitive visit counter is capped at `2 * node_count`. On overflow, the kernel sets `atomicStore(&counters[1], 1u)` and breaks the current inner loop (production behaviour matches CPU: unbounded loop would OOM, we prefer graceful truncation + Rust-side panic). The Rust adapter reads `counters[1]` under `#[cfg(debug_assertions)]` and panics if non-zero. This is the mechanism the [design doc §3.1](#31-gpu-bvh-construction--114-discipline-applied) mandates for every Phase 3 traversal kernel.
+
+The alternative (per-primitive parallel dispatch — one thread per outer-loop iteration) is a v2.4.x optimisation. It requires each thread to reserve a contiguous output range via prefix-sum on the per-primitive pair count, which is a two-dispatch pattern. The v2.4.0 correctness-first choice is single-thread; parallel dispatch lands additively once the byte-exact contract is locked.
+
+#### Bindings (v2.4.0 layout — frozen at this release)
+
+- `@group(0) @binding(0) var<storage, read>       nodes:        array<BvhNodeGpu>` — v2.3.0 build output.
+- `@group(0) @binding(1) var<storage, read>       primitives:   array<u32>` — sorted primitive body indices from v2.2.0 (the `sorted_indices` output; corresponds to CPU `LinearBvh::primitives`).
+- `@group(0) @binding(2) var<uniform>             params:       FindPairsParams` — `{ node_count: u32, prim_count: u32, max_pairs: u32, _pad: u32 }` (16-byte aligned). `max_pairs` bounds the output buffer for overflow detection.
+- `@group(0) @binding(3) var<uniform>             world_bounds: AabbI32` — pre-quantised world AABB (`from_physics_aabb` on the Rust adapter side). Consumed as the query AABB for every inner traversal — matches CPU `query_callback(&self.bounds, ...)`.
+- `@group(0) @binding(4) var<storage, read_write> pairs_out:    array<vec2<u32>>` — output pairs. Element `i` = `vec2(prim_i, prim_j)`.
+- `@group(0) @binding(5) var<storage, read_write> counters:     array<atomic<u32>, 2>` — `[0]` = emitted pair count; `[1]` = cycle-guard overflow flag (0 = OK, 1 = at least one prim_i's traversal exceeded the visit cap).
+
+#### CPU golden strategy
+
+The v2.4.0 CPU golden mirrors the CPU implementation end-to-end and applies the same host-side finaliser to both outputs before compare:
+
+```rust
+use alice_physics::bvh::LinearBvh;
+
+let cpu_bvh = LinearBvh::build(fixture.clone());
+let cpu_pairs = cpu_bvh.find_pairs();   // already sort_unstable + dedup applied
+
+let gpu_nodes = dispatch_fix128_bvh_build(&device, &sorted_codes, &sorted_indices, &sorted_aabbs);
+let mut gpu_pairs = dispatch_fix128_bvh_find_pairs(
+    &device,
+    &gpu_nodes,
+    &sorted_indices,
+    &AabbI32Gpu::from_physics_aabb(&cpu_bvh.bounds),
+);
+gpu_pairs.sort_unstable();
+gpu_pairs.dedup();
+
+assert_eq!(gpu_pairs, cpu_pairs);   // byte-exact
+```
+
+The host-side `sort_unstable` + `dedup` on the readback matches the CPU's own tail steps in `find_pairs`. GPU-side sort is deferred to a v2.4.x optimisation once the byte-exact contract is locked; the host tail is O(N² log N²) for pair counts of `N * (N-1) / 2`, which stays well inside the frame budget for N ≤ 10000.
+
+#### Edge cases covered by the v2.4.0 fixture
+
+Same three fixtures as v2.3.0 to exercise the discipline end-to-end:
+
+1. **Pile (32 primitives, 4×4×2 grid, spacing 3, radius 1)** — `32 * 31 / 2 = 496` pairs. Exercises the balanced tree walk over many escape-pointer jumps.
+2. **Uniform grid (27 primitives, 3×3×3, spacing 4, radius 1)** — `27 * 26 / 2 = 351` pairs. Exercises the "highest differing bit" split path via the walk.
+3. **Degenerate all-colocated (16 primitives at origin)** — `16 * 15 / 2 = 120` pairs. Exercises the midpoint-fallback split path plus the all-AABBs-identical-with-world-bounds edge case.
+
+Every fixture asserts `assert_eq!(gpu_pairs, cpu_pairs)` on the final host-sorted-and-deduped `Vec<(u32, u32)>`. Cycle-overflow flag is asserted zero under `#[cfg(debug_assertions)]` on the Rust adapter path.
+
+#### Post-dispatch debug invariant (Rust adapter)
+
+Under `#[cfg(debug_assertions)]`, the Rust adapter reads `counters[1]` and panics on cycle overflow:
+
+```rust
+#[cfg(debug_assertions)]
+{
+    assert!(
+        cycle_overflow == 0,
+        "BVH find_pairs cycle guard triggered: traversal visited > 2 * node_count nodes for at least one primitive. This indicates a malformed tree with backward escape pointers (skill §11.4)."
+    );
+}
+```
+
+Any overflow means the tree has a backward or self-referential escape pointer that slipped through v2.3.0's `debug_verify_escape_forward` check — an escalated bug report, not a benign fixture.
+
 ## §3 Determinism Invariants
 
 Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogued in the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill:

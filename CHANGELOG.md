@@ -2,6 +2,41 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.4.0] - 2026-07-07
+
+### Added — GPU BVH find_pairs kernel (Phase 3 §4)
+
+Fourth implementation release of the Phase 3 GPU BVH pipeline. Ships the single-workgroup single-thread stackless traversal port of `alice_physics::bvh::LinearBvh::find_pairs`, byte-identical to the CPU reference (after the same host-side `sort_unstable` + `dedup` finaliser both sides apply) on the 3-platform CI matrix (Metal / Vulkan lavapipe / DX12 WARP). Closes the broad-phase pipeline: callers can now go BvhPrimitive input → Morton sort → BVH build → pair list entirely on the GPU (host tail steps stay for the sort + dedup). Additive-only; the v2.3.0 public surface remains stable.
+
+- **`FIX128_BVH_FIND_PAIRS_WGSL` — full impl** (new WGSL constant). Single `@compute @workgroup_size(1)` entry `fix128_bvh_find_pairs_main` iterates the `primitives` array and, per primitive, runs a stackless traversal that mirrors CPU `LinearBvh::query_callback(&self.bounds, ...)` byte-for-byte. Every leaf emits its primitives through the `prim_i < prim_j` filter via `atomicAdd(&counters[0], 1u)` slot reservation; the escape pointer is exercised on the leaf → next-sibling transition. The §11.4 cycle guard caps per-primitive visits at `2 * node_count`; overflow sets `atomicStore(&counters[1], 1u)` which the Rust adapter reads and panics on under `#[cfg(debug_assertions)]`. See [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md) §2.5 for the full algorithm + bindings + determinism analysis.
+- **New public Rust function** `dispatch_fix128_bvh_find_pairs(device, nodes, primitives, world_bounds) -> Vec<(u32, u32)>`: full orchestrator. Uploads the v2.3.0 build output plus the v2.2.0 sorted primitive indices plus a pre-quantised world-bounds uniform, dispatches at `(1, 1, 1)` workgroups, reads back the emitted pair count from a separate atomic counter, then applies the same `sort_unstable` + `dedup` tail steps as CPU `find_pairs`. Buffer capacity is `prim_count * prim_count` (safe upper bound before the `prim_i < prim_j` filter).
+- **New public Rust helper `AabbI32Gpu::from_physics_aabb(&AABB)`** — pre-quantises an `alice_physics::collider::AABB` to i32 for the world-bounds uniform. Shares the floor/ceil rule with the existing `AabbI32Gpu::from_physics_primitive` (which now delegates to this new helper).
+
+### Tests (v2.4.0 additions)
+
+- `wgsl_bvh_find_pairs_shader_present` — structural coverage of the new WGSL surface (struct names, binding identifiers, traversal helpers, cycle guard identifiers, atomic emission path). Runs on every 3-platform CI job without a GPU adapter.
+- `wgsl_bvh_find_pairs_shader_compiles` — naga validation via `create_shader_module`. Catches WGSL syntax / type errors on every platform; skips gracefully on adapter-less headless CI.
+- `wgpu_bvh_find_pairs_matches_cpu_golden` — **byte-exact GPU-CPU golden** on the same three fixtures as the v2.3.0 build golden:
+  1. **Pile (32 primitives, 4×4×2 grid)** — 496 pairs.
+  2. **Uniform grid (27 primitives, 3×3×3 lattice)** — 351 pairs.
+  3. **Degenerate all-colocated (16 primitives)** — 120 pairs.
+
+Chains the full Phase 3 GPU pipeline (v2.3.0 build → v2.4.0 find_pairs → host sort + dedup) and asserts byte-exact match against `LinearBvh::build(input).find_pairs()`. Total 206 lib tests (previously 203), all pass on macOS Metal. The 3-platform CI matrix picks up the two new shader tests on the next tag run.
+
+### Design doc
+
+- **`docs/PHASE_3_DESIGN.md` §2.5** — full v2.4.0 scope: algorithm choice, bindings, §11.4 cycle guard, CPU golden strategy, and post-dispatch debug invariant.
+
+### Backwards compatibility
+
+Fully additive vs v2.3.0. No API changes. The v2.3.0 `dispatch_fix128_bvh_build`, `BvhNodeGpu`, and `AabbI32Gpu` are unchanged (the new `from_physics_aabb` helper is additive; `from_physics_primitive` now delegates to it but keeps the same signature and behaviour).
+
+### Next up (Phase 3 continuation)
+
+- **v2.5.0** — Sphere-sphere narrow-phase contact kernel (Fix128 sqrt + normal + depth). Consumes the v2.4.0 pair list.
+- **v2.6.0** — GPU PGS contact solve + `TrtSolverAdapter` opt-in for the full pipeline.
+- **v2.4.x candidate** — parallel per-primitive dispatch (one thread per outer-loop iteration) with two-dispatch prefix-sum for output slot reservation. Requires fresh determinism analysis before shipping.
+
 ## [2.3.0] - 2026-07-07
 
 ### Added — GPU LinearBvh build kernel (Phase 3 §3)

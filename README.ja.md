@@ -353,6 +353,7 @@ alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
 | Fix128 Morton コード (Phase 3 §1) | v2.1.0 | `FIX128_MORTON_CODE_WGSL` |
 | Fix128 Morton ソート (Phase 3 §2) | v2.2.0 | `FIX128_MORTON_SORT_WGSL` + `dispatch_fix128_morton_sort` |
 | Fix128 GPU BVH build (Phase 3 §3) | v2.3.0 | `FIX128_BVH_BUILD_WGSL` + `dispatch_fix128_bvh_build` |
+| Fix128 GPU BVH find_pairs (Phase 3 §4) | v2.4.0 | `FIX128_BVH_FIND_PAIRS_WGSL` + `dispatch_fix128_bvh_find_pairs` |
 
 CPU 側 `Fix128Gpu` は `sqrt` (v1.0.1、`alice_physics::Fix128::sqrt` に delegate) と `div` (v1.0.6) も持つ (host precompute 用)。v1.1.0 の単一制約 uniform 版 (`FIX128_PGS_PROJECT_DISTANCE_WGSL`) は v1.7.0 で deprecate、v2.0.0 で削除済。外部 `Fix128GpuKernel` 実装者は上表の rigid rod / batched シェーダーへ移行を。
 

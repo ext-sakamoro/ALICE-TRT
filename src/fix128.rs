@@ -4307,9 +4307,19 @@ impl AabbI32Gpu {
     /// (see monotonicity argument in [`FIX128_BVH_BUILD_WGSL`] docs).
     #[must_use]
     pub fn from_physics_primitive(prim: &alice_physics::bvh::BvhPrimitive) -> Self {
+        Self::from_physics_aabb(&prim.aabb)
+    }
+
+    /// Pre-quantise an `alice_physics::collider::AABB` to i32 using the
+    /// same floor/ceil rule as the ALICE-Physics private
+    /// `aabb_to_i32_min` / `aabb_to_i32_max` helpers. Used to derive
+    /// the world-bounds uniform input for the v2.4.0 `find_pairs`
+    /// kernel from `LinearBvh::bounds`.
+    #[must_use]
+    pub fn from_physics_aabb(aabb: &alice_physics::collider::AABB) -> Self {
         // Reproduce `aabb_to_i32_min` / `aabb_to_i32_max` from ALICE-Physics
         // src/bvh.rs (private there, so we replicate the arithmetic).
-        let a = &prim.aabb;
+        let a = aabb;
         Self {
             min_x: fix128_floor_i32(a.min.x),
             min_y: fix128_floor_i32(a.min.y),
@@ -4644,6 +4654,501 @@ fn debug_verify_escape_forward_impl(nodes: &[BvhNodeGpu]) -> bool {
         }
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// v2.4.0 — GPU BVH find_pairs kernel (Phase 3 §4)
+// ---------------------------------------------------------------------------
+
+/// v2.4.0 GPU BVH `find_pairs` kernel — single-workgroup single-thread
+/// stackless traversal port of `alice_physics::bvh::LinearBvh::find_pairs`.
+///
+/// Consumes the v2.3.0 `Vec<BvhNodeGpu>` output plus the v2.2.0 sorted
+/// primitive index list and a pre-quantised world-bounds AABB, and
+/// produces a `Vec<(u32, u32)>` **byte-identical** to the CPU reference
+/// after both sides apply the same `sort_unstable` + `dedup` finaliser
+/// on the host.
+///
+/// # Algorithm — CPU parity walk
+///
+/// The CPU `find_pairs` iterates each primitive body id in
+/// `bvh.primitives` order and calls
+/// `query_callback(&self.bounds, |prim_j| { if prim_i < prim_j { push } })`.
+/// Because the query AABB is the world bounds, every inner
+/// `intersects_i32` check passes and the traversal visits every internal
+/// + leaf node in flat-array pre-order. The escape pointer is still
+/// exercised on the leaf → next-sibling transition (skill §11.4
+/// discipline).
+///
+/// The v2.4.0 port mirrors this byte-for-byte:
+///
+/// ```text
+/// for i in 0..prim_count:
+///     prim_i = primitives[i]
+///     idx = 0u; visits = 0u
+///     loop:
+///         if idx == ESCAPE_NONE_24 or idx >= node_count: break
+///         visits += 1
+///         if visits > 2 * node_count:              # §11.4 cycle guard
+///             atomicStore(&counters[1], 1u); break
+///         if intersects_world_bounds(node):
+///             if is_leaf:
+///                 for k in start..start+count:
+///                     prim_j = primitives[k]
+///                     if prim_i < prim_j:
+///                         slot = atomicAdd(&counters[0], 1u)
+///                         if slot < max_pairs:
+///                             pairs_out[slot] = vec2(prim_i, prim_j)
+///                 idx = escape
+///             else:
+///                 idx = first_child
+///         else:
+///             idx = escape
+/// ```
+///
+/// # Discipline — §11.4 cycle guard
+///
+/// Per-primitive visit counter is capped at `2 * node_count`. On
+/// overflow, the kernel sets `atomicStore(&counters[1], 1u)` and breaks
+/// the current inner traversal. This is the mechanism the design doc
+/// §3.1 mandates for every Phase 3 traversal kernel — a well-formed
+/// tree (per v2.3.0's `debug_verify_escape_forward` check) never
+/// triggers the guard, so any overflow escalates to a diagnostic panic
+/// in the Rust adapter under `#[cfg(debug_assertions)]`.
+///
+/// # Determinism
+///
+/// Single-workgroup single-thread dispatch has no cross-thread ordering
+/// hazards. The outer for-primitives loop and every inner tree walk
+/// share the same single invocation, so the emission order to
+/// `pairs_out` matches the CPU emission order exactly. The host-side
+/// `sort_unstable` + `dedup` on the readback matches the CPU's own
+/// tail steps in `find_pairs`; the final compared `Vec<(u32, u32)>` is
+/// byte-identical across the 3-platform CI matrix.
+///
+/// # Bindings
+///
+/// - `@group(0) @binding(0)` — `nodes: array<BvhNodeGpu>` (read).
+///   The v2.3.0 build output.
+/// - `@group(0) @binding(1)` — `primitives: array<u32>` (read).
+///   Sorted primitive body indices; corresponds to
+///   `alice_physics::bvh::LinearBvh::primitives`.
+/// - `@group(0) @binding(2)` — `params: FindPairsParams` (uniform).
+///   `{ node_count, prim_count, max_pairs, _pad }` — 16-byte aligned.
+/// - `@group(0) @binding(3)` — `world_bounds: AabbI32` (uniform).
+///   Pre-quantised via `AabbI32Gpu::from_physics_aabb(&bvh.bounds)`.
+/// - `@group(0) @binding(4)` — `pairs_out: array<vec2<u32>>`
+///   (read_write). Element `i` = `vec2(prim_i, prim_j)`.
+/// - `@group(0) @binding(5)` — `counters: array<atomic<u32>, 2>`
+///   (read_write). `[0]` = emitted pair count; `[1]` = cycle overflow
+///   flag.
+///
+/// # Performance
+///
+/// Single-thread traversal is O(N × node_count) for N primitives with
+/// world-bounds query. Per-primitive parallel dispatch (one thread per
+/// outer-loop iteration) is a v2.4.x optimisation requiring a two-
+/// dispatch prefix-sum layout for output slot reservation; the v2.4.0
+/// correctness-first choice lets v2.5.0 sphere-sphere narrow-phase
+/// integrate against a stable byte-exact contract immediately.
+pub const FIX128_BVH_FIND_PAIRS_WGSL: &str = r#"
+struct AabbI32 {
+    min_x: i32,
+    min_y: i32,
+    min_z: i32,
+    max_x: i32,
+    max_y: i32,
+    max_z: i32,
+}
+
+struct BvhNodeGpu {
+    aabb_min_x: i32,
+    aabb_min_y: i32,
+    aabb_min_z: i32,
+    first_child_or_prim: u32,
+    aabb_max_x: i32,
+    aabb_max_y: i32,
+    aabb_max_z: i32,
+    prim_count_escape: u32,
+}
+
+struct FindPairsParams {
+    node_count: u32,
+    prim_count: u32,
+    max_pairs:  u32,
+    _pad:       u32,
+}
+
+@group(0) @binding(0) var<storage, read>       nodes:        array<BvhNodeGpu>;
+@group(0) @binding(1) var<storage, read>       primitives:   array<u32>;
+@group(0) @binding(2) var<uniform>             params:       FindPairsParams;
+@group(0) @binding(3) var<uniform>             world_bounds: AabbI32;
+@group(0) @binding(4) var<storage, read_write> pairs_out:    array<vec2<u32>>;
+@group(0) @binding(5) var<storage, read_write> counters:     array<atomic<u32>, 2>;
+
+const ESCAPE_MASK_24: u32 = 0x00FFFFFFu;
+
+fn node_escape(idx: u32) -> u32 {
+    return nodes[idx].prim_count_escape & ESCAPE_MASK_24;
+}
+
+fn node_prim_count(idx: u32) -> u32 {
+    return nodes[idx].prim_count_escape >> 24u;
+}
+
+fn node_is_leaf(idx: u32) -> bool {
+    return node_prim_count(idx) > 0u;
+}
+
+// Componentwise i32 AABB intersection test — matches CPU
+// BvhNode::intersects_i32 byte-for-byte (integer comparison, no float).
+fn intersects_world(idx: u32) -> bool {
+    let n = nodes[idx];
+    return (n.aabb_min_x <= world_bounds.max_x)
+        && (n.aabb_max_x >= world_bounds.min_x)
+        && (n.aabb_min_y <= world_bounds.max_y)
+        && (n.aabb_max_y >= world_bounds.min_y)
+        && (n.aabb_min_z <= world_bounds.max_z)
+        && (n.aabb_max_z >= world_bounds.min_z);
+}
+
+@compute @workgroup_size(1)
+fn fix128_bvh_find_pairs_main() {
+    let node_count = params.node_count;
+    let prim_count = params.prim_count;
+    let max_pairs  = params.max_pairs;
+
+    // Initialise counters (single-thread dispatch, so no barrier needed).
+    atomicStore(&counters[0], 0u);
+    atomicStore(&counters[1], 0u);
+
+    if (node_count == 0u || prim_count == 0u) {
+        return;
+    }
+
+    let max_visits = 2u * node_count;
+
+    for (var i: u32 = 0u; i < prim_count; i = i + 1u) {
+        let prim_i = primitives[i];
+
+        // Stackless traversal — mirrors CPU LinearBvh::query_callback.
+        var idx: u32 = 0u;
+        var visits: u32 = 0u;
+
+        // Loop bound safety: even in the pathological case where every
+        // node forces a descend / iterate, the traversal cannot exceed
+        // node_count useful visits; the cycle guard breaks the loop
+        // once visits > 2 * node_count and sets the overflow flag.
+        loop {
+            if (idx >= node_count) { break; }
+            if ((idx & ESCAPE_MASK_24) == ESCAPE_MASK_24) { break; }  // ESCAPE_NONE (24-bit)
+
+            visits = visits + 1u;
+            if (visits > max_visits) {
+                atomicStore(&counters[1], 1u);
+                break;
+            }
+
+            if (intersects_world(idx)) {
+                if (node_is_leaf(idx)) {
+                    let start = nodes[idx].first_child_or_prim;
+                    let count = node_prim_count(idx);
+                    let end = start + count;
+                    for (var k: u32 = start; k < end; k = k + 1u) {
+                        if (k >= prim_count) { break; }
+                        let prim_j = primitives[k];
+                        if (prim_i < prim_j) {
+                            let slot = atomicAdd(&counters[0], 1u);
+                            if (slot < max_pairs) {
+                                pairs_out[slot] = vec2<u32>(prim_i, prim_j);
+                            }
+                        }
+                    }
+                    idx = node_escape(idx);
+                } else {
+                    idx = nodes[idx].first_child_or_prim;
+                }
+            } else {
+                idx = node_escape(idx);
+            }
+        }
+    }
+}
+"#;
+
+/// v2.4.0 GPU BVH `find_pairs` orchestrator — dispatches
+/// [`FIX128_BVH_FIND_PAIRS_WGSL`] and returns the pair list byte-
+/// identical (after host-side `sort_unstable` + `dedup`) to
+/// `alice_physics::bvh::LinearBvh::find_pairs()`.
+///
+/// # Contract
+///
+/// - `nodes` is the v2.3.0 build output.
+/// - `primitives` is the v2.2.0 sorted primitive body index list —
+///   corresponds to `alice_physics::bvh::LinearBvh::primitives`.
+/// - `world_bounds` is the pre-quantised world AABB, derived from the
+///   CPU `LinearBvh::bounds` via
+///   [`AabbI32Gpu::from_physics_aabb`].
+/// - Returns `Vec<(u32, u32)>` **after** applying `sort_unstable` +
+///   `dedup` on the host, matching the CPU `find_pairs` tail steps.
+/// - `nodes.is_empty()` or `primitives.is_empty()` short-circuits to an
+///   empty output without dispatching the kernel.
+///
+/// # Debug invariant
+///
+/// Under `#[cfg(debug_assertions)]` the adapter asserts that
+/// `counters[1] == 0` on readback — a non-zero flag means the §11.4
+/// cycle guard fired for at least one primitive, which indicates a
+/// malformed tree with backward escape pointers that slipped past
+/// v2.3.0's `debug_verify_escape_forward` check.
+///
+/// # Panics
+///
+/// - Panics if the wgpu device is lost during dispatch.
+/// - In debug builds, panics if the cycle guard overflow flag is set.
+/// - In any build, panics if the emitted pair count exceeds the
+///   buffer capacity (`prim_count * prim_count`); this indicates a
+///   caller-supplied `primitives` slice with wildly non-unique body
+///   indices.
+#[cfg(feature = "physics-solver")]
+#[must_use]
+pub fn dispatch_fix128_bvh_find_pairs(
+    device: &crate::device::GpuDevice,
+    nodes: &[BvhNodeGpu],
+    primitives: &[u32],
+    world_bounds: &AabbI32Gpu,
+) -> Vec<(u32, u32)> {
+    if nodes.is_empty() || primitives.is_empty() {
+        return Vec::new();
+    }
+    let node_count = nodes.len();
+    let prim_count = primitives.len();
+
+    // Buffer capacity: the outer for-primitives loop emits at most one
+    // pair per (prim_i, prim_j) in the primitives slice after the
+    // `prim_i < prim_j` filter. `prim_count * prim_count` is a safe
+    // upper bound (before filter) that also gracefully handles caller
+    // slices with duplicate body indices without silently truncating.
+    let max_pairs: usize = prim_count.saturating_mul(prim_count);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct FindPairsParams {
+        node_count: u32,
+        prim_count: u32,
+        max_pairs: u32,
+        _pad: u32,
+    }
+
+    let params = FindPairsParams {
+        node_count: u32::try_from(node_count).expect("node_count exceeds u32::MAX"),
+        prim_count: u32::try_from(prim_count).expect("prim_count exceeds u32::MAX"),
+        max_pairs: u32::try_from(max_pairs).expect("max_pairs exceeds u32::MAX"),
+        _pad: 0,
+    };
+
+    let shader = device
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fix128_bvh_find_pairs_shader"),
+            source: wgpu::ShaderSource::Wgsl(FIX128_BVH_FIND_PAIRS_WGSL.into()),
+        });
+    let bind_group_layout =
+        device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fix128_bvh_find_pairs_bgl"),
+                entries: &[
+                    // 0: nodes (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 1: primitives (read storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 2: params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 3: world_bounds (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 4: pairs_out (read_write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 5: counters (read_write storage, atomic[2])
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+    let pipeline_layout = device
+        .device()
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fix128_bvh_find_pairs_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let pipeline = device
+        .device()
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fix128_bvh_find_pairs_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("fix128_bvh_find_pairs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    let buf_nodes = device.create_buffer_init("bvh_find_pairs_nodes", bytemuck::cast_slice(nodes));
+    let buf_primitives = device.create_buffer_init(
+        "bvh_find_pairs_primitives",
+        bytemuck::cast_slice(primitives),
+    );
+    let buf_params =
+        device.create_uniform_buffer("bvh_find_pairs_params", bytemuck::bytes_of(&params));
+    let buf_world_bounds = device.create_uniform_buffer(
+        "bvh_find_pairs_world_bounds",
+        bytemuck::bytes_of(world_bounds),
+    );
+    let pairs_bytes: u64 = (max_pairs * core::mem::size_of::<[u32; 2]>()) as u64;
+    let buf_pairs = device.create_buffer_empty("bvh_find_pairs_pairs", pairs_bytes.max(8));
+    let buf_counters = device.create_buffer_empty("bvh_find_pairs_counters", 8);
+
+    let bind_group = device
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fix128_bvh_find_pairs_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_nodes.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_primitives.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf_world_bounds.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buf_pairs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buf_counters.as_entire_binding(),
+                },
+            ],
+        });
+
+    let mut encoder = device
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fix128_bvh_find_pairs_encoder"),
+        });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fix128_bvh_find_pairs_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+    device.submit(encoder);
+    device.poll_wait();
+
+    // Read counters: [0] = emitted pair count, [1] = cycle overflow flag.
+    let counters_raw = device.read_buffer(&buf_counters, 8);
+    let counters_slice: &[u32] = bytemuck::cast_slice(&counters_raw);
+    let actual_pair_count = counters_slice[0] as usize;
+    let cycle_overflow = counters_slice[1];
+
+    assert!(
+        actual_pair_count <= max_pairs,
+        "BVH find_pairs emitted {} pairs, buffer capacity was {}",
+        actual_pair_count,
+        max_pairs
+    );
+
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            cycle_overflow == 0,
+            "BVH find_pairs cycle guard triggered: at least one primitive's traversal exceeded 2 * node_count node visits. This indicates a malformed tree with backward escape pointers (skill §11.4)."
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = cycle_overflow;
+    }
+
+    // Read only the actually-emitted pairs.
+    let mut pairs: Vec<(u32, u32)> = if actual_pair_count == 0 {
+        Vec::new()
+    } else {
+        let pair_bytes = (actual_pair_count * core::mem::size_of::<[u32; 2]>()) as u64;
+        let raw = device.read_buffer(&buf_pairs, pair_bytes);
+        let flat: &[u32] = bytemuck::cast_slice(&raw);
+        flat.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+    };
+
+    // Host-side finaliser matches CPU find_pairs tail steps exactly.
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
 }
 
 // ---------------------------------------------------------------------------
@@ -6928,6 +7433,211 @@ mod tests {
             }
             assert_eq!(prims.len(), 16);
             check("degenerate colocated", prims);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v2.4.0 GPU BVH find_pairs kernel tests
+    // -----------------------------------------------------------------
+
+    /// v2.4.0 find_pairs kernel ships the WGSL struct + binding + entry
+    /// point set documented in [`docs/PHASE_3_DESIGN.md`] §2.5. This
+    /// structural test runs without a GPU adapter so headless CI still
+    /// catches accidental deletion of any surface-level identifier.
+    ///
+    /// [`docs/PHASE_3_DESIGN.md`]: ../../docs/PHASE_3_DESIGN.md
+    #[test]
+    fn wgsl_bvh_find_pairs_shader_present() {
+        // Structs from the design doc §2.5 bindings section.
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("struct AabbI32"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("struct BvhNodeGpu"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("struct FindPairsParams"));
+        // Bindings (0..5).
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("nodes:"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("primitives:"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("world_bounds:"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("pairs_out:"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("counters:"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("array<atomic<u32>, 2>"));
+        // Traversal helpers.
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("fn node_escape"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("fn node_prim_count"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("fn node_is_leaf"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("fn intersects_world"));
+        // §11.4 cycle guard identifiers.
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("max_visits"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("2u * node_count"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("atomicStore(&counters[1]"));
+        // atomicAdd emission path.
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("atomicAdd(&counters[0]"));
+        // Single compute entry, dispatched at 1x1x1.
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("fn fix128_bvh_find_pairs_main"));
+        assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("@workgroup_size(1)"));
+    }
+
+    /// v2.4.0 find_pairs kernel must compile as valid WGSL end-to-end.
+    /// Runs the naga parser via `create_shader_module` and fails loudly
+    /// on any syntax / type error. Skips when no GPU adapter is
+    /// available (headless CI).
+    #[test]
+    fn wgsl_bvh_find_pairs_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_bvh_find_pairs_shader_compile_test"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_BVH_FIND_PAIRS_WGSL.into()),
+            });
+    }
+
+    /// Byte-exact GPU-CPU golden for the v2.4.0 find_pairs kernel.
+    ///
+    /// Chains the full Phase 3 pipeline on both sides:
+    ///
+    /// - CPU: `LinearBvh::build(fixture) → bvh.find_pairs()` (already
+    ///   `sort_unstable` + `dedup` applied).
+    /// - GPU: reconstruct the sorted (codes, indices, aabbs) from the
+    ///   fixture, call `dispatch_fix128_bvh_build` (v2.3.0) then
+    ///   `dispatch_fix128_bvh_find_pairs` (v2.4.0), which returns the
+    ///   pair list after the same host-side `sort_unstable` + `dedup`.
+    /// - Compare byte-exact via `assert_eq!` on `Vec<(u32, u32)>`.
+    ///
+    /// Uses the same three fixtures as the v2.3.0 build golden to
+    /// exercise every path through the tree walker (balanced,
+    /// distinct-code, and identical-code / midpoint-fallback splits).
+    /// Total expected pair counts (`n * (n-1) / 2`): 496 / 351 / 120.
+    /// Skips when no GPU adapter is available (headless CI).
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_bvh_find_pairs_matches_cpu_golden() {
+        use alice_physics::bvh::{point_to_morton, BvhPrimitive, LinearBvh};
+        use alice_physics::collider::AABB;
+        use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
+
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        // Same primitive construction helper as the v2.3.0 golden.
+        fn mk_prim(cx: i64, cy: i64, cz: i64, r: i64, idx: u32) -> BvhPrimitive {
+            let fx = PhysicsFix128::from_int(cx);
+            let fy = PhysicsFix128::from_int(cy);
+            let fz = PhysicsFix128::from_int(cz);
+            let fr = PhysicsFix128::from_int(r);
+            BvhPrimitive {
+                aabb: AABB::new(
+                    Vec3Fix::new(fx - fr, fy - fr, fz - fr),
+                    Vec3Fix::new(fx + fr, fy + fr, fz + fr),
+                ),
+                index: idx,
+                morton: 0,
+            }
+        }
+
+        // Reproduce the world-bounds + Morton-code + stable-sort preamble
+        // of LinearBvh::build to derive the three parallel arrays the
+        // v2.3.0 build kernel consumes.
+        fn cpu_sort(input: &[BvhPrimitive]) -> (Vec<[u32; 2]>, Vec<u32>, Vec<AabbI32Gpu>) {
+            let mut prims: Vec<BvhPrimitive> = input.to_vec();
+            if prims.is_empty() {
+                return (Vec::new(), Vec::new(), Vec::new());
+            }
+            let mut bounds = prims[0].aabb;
+            for p in &prims[1..] {
+                bounds = bounds.union(&p.aabb);
+            }
+            for p in prims.iter_mut() {
+                let centre = Vec3Fix::new(
+                    (p.aabb.min.x + p.aabb.max.x).half(),
+                    (p.aabb.min.y + p.aabb.max.y).half(),
+                    (p.aabb.min.z + p.aabb.max.z).half(),
+                );
+                p.morton = point_to_morton(centre, &bounds);
+            }
+            prims.sort_by_key(|p| p.morton);
+            let codes: Vec<[u32; 2]> = prims
+                .iter()
+                .map(|p| [p.morton as u32, (p.morton >> 32) as u32])
+                .collect();
+            let indices: Vec<u32> = prims.iter().map(|p| p.index).collect();
+            let aabbs: Vec<AabbI32Gpu> = prims
+                .iter()
+                .map(AabbI32Gpu::from_physics_primitive)
+                .collect();
+            (codes, indices, aabbs)
+        }
+
+        // Full Phase 3 pipeline compare on one fixture.
+        let check = |label: &str, input: Vec<BvhPrimitive>, expected_pair_count: usize| {
+            let cpu_bvh = LinearBvh::build(input.clone());
+            let cpu_pairs = cpu_bvh.find_pairs();
+            assert_eq!(
+                cpu_pairs.len(),
+                expected_pair_count,
+                "{label}: CPU pair count sanity mismatch (got {}, expected {expected_pair_count})",
+                cpu_pairs.len()
+            );
+
+            let (codes, indices, aabbs) = cpu_sort(&input);
+            let gpu_nodes = dispatch_fix128_bvh_build(&device, &codes, &indices, &aabbs);
+            let world_bounds_gpu = AabbI32Gpu::from_physics_aabb(&cpu_bvh.bounds);
+            let gpu_pairs =
+                dispatch_fix128_bvh_find_pairs(&device, &gpu_nodes, &indices, &world_bounds_gpu);
+
+            assert_eq!(
+                gpu_pairs.len(),
+                cpu_pairs.len(),
+                "{label}: pair count mismatch (GPU={} CPU={})",
+                gpu_pairs.len(),
+                cpu_pairs.len()
+            );
+            assert_eq!(gpu_pairs, cpu_pairs, "{label}: pair list mismatch");
+        };
+
+        // Fixture 1: pile 4x4x2 (32 primitives).
+        {
+            let mut prims: Vec<BvhPrimitive> = Vec::new();
+            let mut idx = 0u32;
+            for xi in 0..4i64 {
+                for yi in 0..4i64 {
+                    for zi in 0..2i64 {
+                        prims.push(mk_prim(xi * 3, yi * 3, zi * 3, 1, idx));
+                        idx += 1;
+                    }
+                }
+            }
+            assert_eq!(prims.len(), 32);
+            check("pile 4x4x2", prims, 32 * 31 / 2);
+        }
+
+        // Fixture 2: uniform grid 3x3x3 (27 primitives).
+        {
+            let mut prims: Vec<BvhPrimitive> = Vec::new();
+            let mut idx = 0u32;
+            for xi in 0..3i64 {
+                for yi in 0..3i64 {
+                    for zi in 0..3i64 {
+                        prims.push(mk_prim(xi * 4, yi * 4, zi * 4, 1, idx));
+                        idx += 1;
+                    }
+                }
+            }
+            assert_eq!(prims.len(), 27);
+            check("uniform grid 3x3x3", prims, 27 * 26 / 2);
+        }
+
+        // Fixture 3: degenerate all-colocated (16 primitives).
+        {
+            let mut prims: Vec<BvhPrimitive> = Vec::new();
+            for idx in 0..16u32 {
+                prims.push(mk_prim(0, 0, 0, 1, idx));
+            }
+            assert_eq!(prims.len(), 16);
+            check("degenerate colocated", prims, 16 * 15 / 2);
         }
     }
 }
