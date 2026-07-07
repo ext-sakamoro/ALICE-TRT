@@ -2,6 +2,57 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.1.0] - 2026-07-07
+
+### Added — Phase 3 first primitive kernels (Fix128 AABB helpers + Morton code)
+
+First implementation release of the Phase 3 GPU BVH / narrow-phase / CCD series announced in v2.0.0. Ships two new WGSL constants and one new Rust type; no adapter integration yet, so the v2.0.0 public surface remains additive-only.
+
+- **New public WGSL constant** `FIX128_AABB_HELPERS_WGSL`: standalone valid compute shader declaring `Fix128AabbGpu` (6 × `Fix128Gpu` = 96 bytes) plus the byte-exact helper functions the v2.2+ pipeline consumes: `fix128_add / sub / lt / min / max`, `aabb_from_sphere` (centre + radius → AABB), and `aabb_union` (componentwise min/max). A no-op `aabb_helpers_smoke_main` compute entry keeps the module standalone-compilable; external kernels typically concatenate the source into their own bodies (WGSL has no `include` directive, so cat-ing strings is the common pattern).
+- **New public WGSL constant** `FIX128_MORTON_CODE_WGSL`: per-primitive parallel 63-bit Morton code kernel with bindings `primitives: array<Fix128AabbGpu>` (read storage), `world_bounds: Fix128AabbGpu` (uniform), and `morton_codes: array<vec2<u32>>` (read_write storage). Mirrors `alice_physics::bvh::point_to_morton` byte-for-byte:
+  1. Compute the AABB centre as `(min + max) / 2` per axis (Fix128 add + arithmetic right shift).
+  2. Compute world size per axis (Fix128 sub).
+  3. Normalize the centre via Fix128 divide (v1.4.0 `FIX128_DIV_WGSL` embedded verbatim).
+  4. Extract the upper 21 bits of the fractional part, with the three CPU branches preserved: `t < 0` → `0`, `t.hi >= 1` → `0x1FFFFF`, otherwise `(t.lo_hi >> 11) & 0x1FFFFF`.
+  5. Spread each 21-bit coordinate to 63 bits via the standard 5-round `expand_bits` sequence (u64 emulated as `vec2<u32>` with hardcoded shift-32/16/8/4/2 helpers) and combine via `expand(x) | (expand(y) << 1) | (expand(z) << 2)`.
+- **New public Rust struct** `Fix128AabbGpu`: `#[repr(C)]` byte-layout mirror of the WGSL struct with inherent `from_sphere` and `union` methods that reproduce the shader helpers on the CPU.
+- **README kernel tables** (English + Japanese) updated with the two new entries.
+- **New design doc** [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md): full Phase 3 architecture skeleton covering kernel sequence (v2.1.0 → v2.7.0 candidate), determinism invariants (with an explicit `§11.4` cross-reference to the ALICE-Physics BVH escape-pointer fix as the canonical GPU-port reference), bind group layouts, CPU golden strategy, 3-platform CI matrix, release cadence, and an open-questions log.
+
+### Tests (v2.1.0 additions)
+
+Eight new lib tests exercise the primitives end-to-end:
+
+- `wgsl_aabb_helpers_shader_present` — structural check on every helper name and the `@compute` smoke entry.
+- `wgsl_aabb_helpers_shader_compiles` — naga validation via `create_shader_module` (headless CI safe).
+- `fix128_aabb_gpu_size_and_layout` — asserts `size_of::<Fix128AabbGpu>() == 96` so the type uploads cleanly.
+- `fix128_aabb_gpu_from_sphere` — Rust helper matches its WGSL counterpart on a mixed-sign fixture.
+- `fix128_aabb_gpu_union` — Rust helper matches its WGSL counterpart on positive, negative, and mixed-sign corners so the `fix128_lt` signed compare is fully exercised.
+- `wgsl_morton_code_shader_present` — structural check + every Morton bit-spread mask constant present verbatim.
+- `wgsl_morton_code_shader_compiles` — naga validation on the full 400+-line shader.
+- `wgpu_morton_code_matches_cpu_golden` — **byte-exact GPU-CPU golden**. 16 primitives spanning interior, boundary, and out-of-bounds cases on each axis; every 63-bit `vec2<u32>` GPU output matches `alice_physics::bvh::point_to_morton` byte-for-byte. Requires `--features physics-solver`; skips gracefully on headless CI (no GPU adapter).
+
+Total 197 lib tests (previously 189), all pass on macOS Metal.
+
+### Phase 3 gate status
+
+Documented in the [design doc](docs/PHASE_3_DESIGN.md) §1: gates 1 (collider-attached bench variant) and 2 (>30% of frame time in narrow-phase) satisfied on 2026-07-06 by the ALICE-Physics `stage_breakdown_collider` bench (97.4% at N=100 / 99.8% at N=1000). Gate 3 (workload requirement) deferred to Phase 3 design as documented in the ALICE-Physics [`GPU_OFFLOAD_ROADMAP.md`](../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md).
+
+### Next up (Phase 3 continuation)
+
+- **v2.2.0** — Morton-based deterministic sort kernel + CPU golden.
+- **v2.3.0** — GPU BVH build with the position-independent placeholder + O(subtree_size) sweep discipline established by ALICE-Physics `dede78c`.
+- **v2.4.0** — GPU BVH `find_pairs` with debug cycle guard.
+- **v2.5.0** — Sphere-sphere narrow-phase contact kernel.
+- **v2.6.0** — GPU PGS contact solve + `TrtSolverAdapter` opt-in for the full pipeline.
+
+Each release is additive under the v1.0.0 → v2.x semver stability commitment; the v2.0.0 public API remains intact throughout the series.
+
+### Backwards compatibility
+
+- Fully additive vs v2.0.0. No API changes.
+- The two new WGSL constants and the `Fix128AabbGpu` type are new symbols; existing code continues to compile unchanged.
+
 ## [2.0.0] - 2026-07-07
 
 ### Removed — Deprecated v1.1.0 uniform-based distance projection shader (breaking)

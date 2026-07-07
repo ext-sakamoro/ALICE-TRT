@@ -2631,6 +2631,713 @@ fn fix128_pgs_project_distance_batched_main(
 }
 "#;
 
+/// WGSL compute shader source for **Fix128 AABB helpers** (v2.1.0
+/// Phase 3 first primitive) — declares [`Fix128AabbGpu`] and its
+/// shader-side helpers (`aabb_from_sphere`, `aabb_union`) on top of
+/// the byte-exact `fix128_add / sub / lt / min / max` primitives.
+///
+/// This constant is a **standalone valid WGSL module**: it ships with a
+/// no-op `aabb_helpers_smoke_main` compute entry so `create_shader_module`
+/// succeeds without any binding. External consumers who need the
+/// helpers in their own kernel typically concatenate this source with
+/// their kernel body — WGSL has no `include` directive, so cat-ing
+/// strings is the common pattern (mirroring the v1.4.2 rigid rod
+/// shader's embedded copy of the v1.4.0 div and v1.4.1 sqrt kernels).
+///
+/// # Determinism contract
+///
+/// Every helper reduces to the byte-exact `fix128_add / sub / lt`
+/// primitives; no cross-lane state, no comparison shortcuts on
+/// negative-zero. Consumers that use `aabb_union` on a colour-parallel
+/// dispatch must still enforce workgroup traversal order at the CPU
+/// side (see [determinism-lockstep §1 経路 5][skill]).
+///
+/// [skill]: https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md
+///
+/// # Layout
+///
+/// `Fix128AabbGpu` packs `(min.x, min.y, min.z, max.x, max.y, max.z)`
+/// as six `Fix128Gpu` fields = 6 × 16 bytes = **96 bytes**. The Rust
+/// mirror [`Fix128AabbGpu`] uses the same field order under `#[repr(C)]`.
+///
+/// # Phase 3 role
+///
+/// v2.1.0 ships this helpers module plus the paired
+/// [`FIX128_MORTON_CODE_WGSL`] kernel. Subsequent v2.2+ kernels
+/// (Morton sort, BVH build, find_pairs, narrow-phase, PGS contact)
+/// consume [`Fix128AabbGpu`] as their primitive AABB representation.
+pub const FIX128_AABB_HELPERS_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+struct Fix128AabbGpu {
+    min_x: Fix128Gpu,
+    min_y: Fix128Gpu,
+    min_z: Fix128Gpu,
+    max_x: Fix128Gpu,
+    max_y: Fix128Gpu,
+    max_z: Fix128Gpu,
+}
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let lo_sub  = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid_sub = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let hi_sub  = mid_sub - borrow1;
+    let borrow3 = select(0u, 1u, mid_sub < borrow1);
+    return vec3<u32>(lo_sub, hi_sub, borrow2 + borrow3);
+}
+
+fn fix128_add(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_sub(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+// Signed less-than compare (mirrors `Fix128 as i128` PartialOrd on CPU).
+fn fix128_lt(a: Fix128Gpu, b: Fix128Gpu) -> bool {
+    let a_sign = (a.hi_hi & 0x80000000u) != 0u;
+    let b_sign = (b.hi_hi & 0x80000000u) != 0u;
+    if (a_sign != b_sign) {
+        return a_sign;
+    }
+    if (a.hi_hi != b.hi_hi) { return a.hi_hi < b.hi_hi; }
+    if (a.hi_lo != b.hi_lo) { return a.hi_lo < b.hi_lo; }
+    if (a.lo_hi != b.lo_hi) { return a.lo_hi < b.lo_hi; }
+    return a.lo_lo < b.lo_lo;
+}
+
+fn fix128_min(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_lt(a, b)) { return a; }
+    return b;
+}
+
+fn fix128_max(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_lt(a, b)) { return b; }
+    return a;
+}
+
+// Build an AABB centred on `pos` with half-extents equal to `radius` on
+// every axis. Mirrors the CPU `AABB::from_center_half` used by
+// `ALICE-Physics::solver::detect_collisions` when populating BVH input.
+fn aabb_from_sphere(
+    pos_x: Fix128Gpu,
+    pos_y: Fix128Gpu,
+    pos_z: Fix128Gpu,
+    radius: Fix128Gpu,
+) -> Fix128AabbGpu {
+    var out: Fix128AabbGpu;
+    out.min_x = fix128_sub(pos_x, radius);
+    out.min_y = fix128_sub(pos_y, radius);
+    out.min_z = fix128_sub(pos_z, radius);
+    out.max_x = fix128_add(pos_x, radius);
+    out.max_y = fix128_add(pos_y, radius);
+    out.max_z = fix128_add(pos_z, radius);
+    return out;
+}
+
+// Element-wise union of two AABBs (componentwise min on the mins,
+// componentwise max on the maxes). Mirrors CPU `AABB::union`.
+fn aabb_union(a: Fix128AabbGpu, b: Fix128AabbGpu) -> Fix128AabbGpu {
+    var out: Fix128AabbGpu;
+    out.min_x = fix128_min(a.min_x, b.min_x);
+    out.min_y = fix128_min(a.min_y, b.min_y);
+    out.min_z = fix128_min(a.min_z, b.min_z);
+    out.max_x = fix128_max(a.max_x, b.max_x);
+    out.max_y = fix128_max(a.max_y, b.max_y);
+    out.max_z = fix128_max(a.max_z, b.max_z);
+    return out;
+}
+
+// No-op smoke entry so this module is a standalone valid compute
+// shader. External consumers who cat this source into their own
+// kernel typically remove this entry point.
+@compute @workgroup_size(1)
+fn aabb_helpers_smoke_main() {
+}
+"#;
+
+/// GPU-friendly axis-aligned bounding box in Fix128 space.
+///
+/// Mirrors `alice_physics::collider::AABB` byte-for-byte (each axis of
+/// each corner is one [`Fix128Gpu`] = 16 bytes; total = 96 bytes). The
+/// field order matches the WGSL [`Fix128AabbGpu`](FIX128_AABB_HELPERS_WGSL)
+/// struct so a `Vec<Fix128AabbGpu>` can be uploaded as a storage
+/// buffer without transformation.
+///
+/// # Phase 3
+///
+/// This is the input type for the v2.1.0 Morton code kernel and the
+/// primitive AABB representation for the whole v2.2+ Phase 3 pipeline
+/// (Morton sort → BVH build → find_pairs → sphere-sphere narrow-phase).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Fix128AabbGpu {
+    /// Minimum X in Fix128 space.
+    pub min_x: Fix128Gpu,
+    /// Minimum Y in Fix128 space.
+    pub min_y: Fix128Gpu,
+    /// Minimum Z in Fix128 space.
+    pub min_z: Fix128Gpu,
+    /// Maximum X in Fix128 space.
+    pub max_x: Fix128Gpu,
+    /// Maximum Y in Fix128 space.
+    pub max_y: Fix128Gpu,
+    /// Maximum Z in Fix128 space.
+    pub max_z: Fix128Gpu,
+}
+
+impl Fix128AabbGpu {
+    /// Construct an AABB centred on `(pos_x, pos_y, pos_z)` with the
+    /// given `radius` as half-extent on every axis. Mirrors the WGSL
+    /// `aabb_from_sphere` helper byte-for-byte.
+    #[must_use]
+    pub fn from_sphere(
+        pos_x: Fix128Gpu,
+        pos_y: Fix128Gpu,
+        pos_z: Fix128Gpu,
+        radius: Fix128Gpu,
+    ) -> Self {
+        Self {
+            min_x: pos_x.sub(radius),
+            min_y: pos_y.sub(radius),
+            min_z: pos_z.sub(radius),
+            max_x: pos_x.add(radius),
+            max_y: pos_y.add(radius),
+            max_z: pos_z.add(radius),
+        }
+    }
+
+    /// Element-wise union with `other`. Mirrors the WGSL `aabb_union`
+    /// helper byte-for-byte.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            min_x: Self::fix128_min(self.min_x, other.min_x),
+            min_y: Self::fix128_min(self.min_y, other.min_y),
+            min_z: Self::fix128_min(self.min_z, other.min_z),
+            max_x: Self::fix128_max(self.max_x, other.max_x),
+            max_y: Self::fix128_max(self.max_y, other.max_y),
+            max_z: Self::fix128_max(self.max_z, other.max_z),
+        }
+    }
+
+    /// Signed 128-bit less-than compare. Mirrors the WGSL `fix128_lt`
+    /// helper. The `(hi, lo)` tuple compare works because `hi: i64`
+    /// carries the sign and `lo: u64` is the low unsigned word; Rust
+    /// tuple ordering does lexicographic compare with signed `hi`
+    /// first and unsigned `lo` as tiebreaker.
+    #[inline]
+    #[must_use]
+    fn lt(a: Fix128Gpu, b: Fix128Gpu) -> bool {
+        (a.hi, a.lo) < (b.hi, b.lo)
+    }
+
+    #[inline]
+    fn fix128_min(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+        if Self::lt(a, b) {
+            a
+        } else {
+            b
+        }
+    }
+
+    #[inline]
+    fn fix128_max(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+        if Self::lt(a, b) {
+            b
+        } else {
+            a
+        }
+    }
+}
+
+/// WGSL compute shader source for **Fix128 63-bit Morton code**
+/// (v2.1.0 Phase 3 first primitive kernel).
+///
+/// Per-primitive parallel kernel that mirrors
+/// `alice_physics::bvh::point_to_morton` byte-for-byte on the GPU:
+///
+/// 1. Compute the AABB centre as `(min + max) / 2` on each axis (Fix128
+///    add + arithmetic right shift, both certified in v1.4.x).
+/// 2. Compute world size `world_bounds.max - world_bounds.min` per axis.
+/// 3. Normalize the centre to `[0, 1]` via Fix128 divide (v1.4.0
+///    `FIX128_DIV_WGSL` embedded verbatim), then extract the upper 21
+///    bits of the fractional part as the per-axis coordinate.
+/// 4. Spread each 21-bit coordinate to 63 bits via the standard
+///    `expand_bits` u64 bit-manipulation sequence and combine via
+///    `expand(x) | (expand(y) << 1) | (expand(z) << 2)` into a full
+///    63-bit Morton code.
+///
+/// # Bindings
+///
+/// - `@group(0) @binding(0) var<storage, read>       primitives:   array<Fix128AabbGpu>` — input AABBs
+/// - `@group(0) @binding(1) var<uniform>             world_bounds: Fix128AabbGpu`       — world-space AABB
+/// - `@group(0) @binding(2) var<storage, read_write> morton_codes: array<vec2<u32>>`    — output 63-bit codes as `(low32, high32)`
+///
+/// # Determinism contract
+///
+/// Every arithmetic step reduces to an already-certified Fix128
+/// primitive (`add / sub / mul / div` from v1.4.0). The `expand_bits`
+/// implementation uses only bitwise operations on `vec2<u32>` u64
+/// emulation; no `atomicAdd`, no `workgroupBarrier`, no cross-lane
+/// state. Per-thread output depends only on its own primitive index,
+/// so parallel dispatch order across threads is irrelevant.
+///
+/// The 21-bit coordinate extraction mirrors the three CPU branches
+/// exactly: `t < 0` → `0`, `t.hi >= 1` → `0x1FFFFF`, else
+/// `(t.lo >> 43) & 0x1FFFFF`. The GPU version uses
+/// `t.hi_hi != 0 || t.hi_lo >= 1` for the second branch (equivalent to
+/// checking whether the integer part of the fixed-point value is
+/// `>= 1`) and `t.lo_hi >> 11` for the third branch (equivalent to
+/// `t.lo >> 43` because `t.lo_hi` is bits 32-63 of the low u64 half).
+///
+/// # Phase 3 role
+///
+/// This is the first kernel of the v2.2+ GPU BVH pipeline. It ships
+/// alongside [`FIX128_AABB_HELPERS_WGSL`] (v2.1.0) and feeds the v2.2+
+/// Morton sort → BVH build → find_pairs sequence documented in
+/// [`docs/PHASE_3_DESIGN.md`](../../docs/PHASE_3_DESIGN.md).
+pub const FIX128_MORTON_CODE_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+struct Fix128AabbGpu {
+    min_x: Fix128Gpu,
+    min_y: Fix128Gpu,
+    min_z: Fix128Gpu,
+    max_x: Fix128Gpu,
+    max_y: Fix128Gpu,
+    max_z: Fix128Gpu,
+}
+
+@group(0) @binding(0) var<storage, read>       primitives:   array<Fix128AabbGpu>;
+@group(0) @binding(1) var<uniform>             world_bounds: Fix128AabbGpu;
+@group(0) @binding(2) var<storage, read_write> morton_codes: array<vec2<u32>>;
+
+// ---- 64-bit helpers ----
+
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let lo_sub  = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid     = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let hi_sub  = mid - borrow1;
+    let borrow3 = select(0u, 1u, mid < borrow1);
+    return vec3<u32>(lo_sub, hi_sub, borrow2 + borrow3);
+}
+
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+    let r0 = ll.x;
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+    let r3 = hh.y + carry_to_3;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+// ---- Fix128 basic ops (byte-exact copies from v1.4.x kernels) ----
+
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_sub_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+    let ll = u64_mul_wide(a_lo, b_lo);
+    let lh = u64_mul_wide(a_lo, b_hi);
+    let hl = u64_mul_wide(a_hi, b_lo);
+    let hh = u64_mul_wide(a_hi, b_hi);
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+    let s5a = lh.w + hl.w;
+    let s5b = s5a + hh.y;
+    let p5_u = s5b + carry_to_5;
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+    var p4 = p4_u;
+    var p5 = p5_u;
+    if (a_negative) {
+        let sub_lo = b.lo_lo;
+        let sub_hi = b.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    if (b_negative) {
+        let sub_lo = a.lo_lo;
+        let sub_hi = a.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
+    return out;
+}
+
+// ---- Common Fix128 sign / zero helpers ----
+
+fn fix128_neg(x: Fix128Gpu) -> Fix128Gpu {
+    let inv_lo_lo = ~x.lo_lo;
+    let inv_lo_hi = ~x.lo_hi;
+    let inv_hi_lo = ~x.hi_lo;
+    let inv_hi_hi = ~x.hi_hi;
+    let s0 = inv_lo_lo + 1u;
+    let c0 = select(0u, 1u, s0 < inv_lo_lo);
+    let s1 = inv_lo_hi + c0;
+    let c1 = select(0u, 1u, s1 < inv_lo_hi);
+    let s2 = inv_hi_lo + c1;
+    let c2 = select(0u, 1u, s2 < inv_hi_lo);
+    let s3 = inv_hi_hi + c2;
+    var out: Fix128Gpu;
+    out.lo_lo = s0;
+    out.lo_hi = s1;
+    out.hi_lo = s2;
+    out.hi_hi = s3;
+    return out;
+}
+
+fn fix128_is_zero(x: Fix128Gpu) -> bool {
+    return (x.hi_lo | x.hi_hi | x.lo_lo | x.lo_hi) == 0u;
+}
+
+fn fix128_is_negative(x: Fix128Gpu) -> bool {
+    return ((x.hi_hi >> 31u) & 1u) == 1u;
+}
+
+fn fix128_abs(x: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(x)) { return fix128_neg(x); }
+    return x;
+}
+
+fn fix128_zero() -> Fix128Gpu {
+    return Fix128Gpu(0u, 0u, 0u, 0u);
+}
+
+fn fix128_half(x: Fix128Gpu) -> Fix128Gpu {
+    var out: Fix128Gpu;
+    out.lo_lo = (x.lo_lo >> 1u) | ((x.lo_hi & 1u) << 31u);
+    out.lo_hi = (x.lo_hi >> 1u) | ((x.hi_lo & 1u) << 31u);
+    out.hi_lo = (x.hi_lo >> 1u) | ((x.hi_hi & 1u) << 31u);
+    out.hi_hi = bitcast<u32>(bitcast<i32>(x.hi_hi) >> 1u);
+    return out;
+}
+
+// ---- u128 helpers (for div) ----
+
+fn u128_shl1(x: vec4<u32>) -> vec4<u32> {
+    let c0 = x.x >> 31u;
+    let c1 = x.y >> 31u;
+    let c2 = x.z >> 31u;
+    return vec4<u32>(x.x << 1u, (x.y << 1u) | c0, (x.z << 1u) | c1, (x.w << 1u) | c2);
+}
+
+fn u128_ge(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if (a.w != b.w) { return a.w > b.w; }
+    if (a.z != b.z) { return a.z > b.z; }
+    if (a.y != b.y) { return a.y > b.y; }
+    return a.x >= b.x;
+}
+
+fn u128_sub(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
+    let d0        = a.x - b.x;
+    let borrow0   = select(0u, 1u, a.x < b.x);
+    let m1        = a.y - b.y;
+    let borrow1a  = select(0u, 1u, a.y < b.y);
+    let d1        = m1 - borrow0;
+    let borrow1b  = select(0u, 1u, m1 < borrow0);
+    let borrow1   = borrow1a + borrow1b;
+    let m2        = a.z - b.z;
+    let borrow2a  = select(0u, 1u, a.z < b.z);
+    let d2        = m2 - borrow1;
+    let borrow2b  = select(0u, 1u, m2 < borrow1);
+    let borrow2   = borrow2a + borrow2b;
+    let m3        = a.w - b.w;
+    let d3        = m3 - borrow2;
+    return vec4<u32>(d0, d1, d2, d3);
+}
+
+fn u128_set_bit(x: vec4<u32>, bit_pos: u32) -> vec4<u32> {
+    let word  = bit_pos >> 5u;
+    let shift = bit_pos & 31u;
+    let mask  = 1u << shift;
+    var out = x;
+    if      (word == 0u) { out.x = out.x | mask; }
+    else if (word == 1u) { out.y = out.y | mask; }
+    else if (word == 2u) { out.z = out.z | mask; }
+    else                 { out.w = out.w | mask; }
+    return out;
+}
+
+// ---- div (from v1.4.0, byte-exact against alice_physics::Fix128 / Fix128) ----
+
+fn fix128_div_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_zero(b)) { return fix128_zero(); }
+    let neg_a = fix128_is_negative(a);
+    let neg_b = fix128_is_negative(b);
+    let result_neg = neg_a != neg_b;
+    let abs_a = fix128_abs(a);
+    let abs_b = fix128_abs(b);
+    let a_full = vec4<u32>(abs_a.lo_lo, abs_a.lo_hi, abs_a.hi_lo, abs_a.hi_hi);
+    let b_full = vec4<u32>(abs_b.lo_lo, abs_b.lo_hi, abs_b.hi_lo, abs_b.hi_hi);
+    var q_int = vec4<u32>(0u);
+    var r_int = vec4<u32>(0u);
+    var d     = a_full;
+    for (var i: i32 = 0; i < 128; i = i + 1) {
+        let msb = d.w >> 31u;
+        r_int   = u128_shl1(r_int);
+        r_int.x = r_int.x | msb;
+        d       = u128_shl1(d);
+        if (u128_ge(r_int, b_full)) {
+            r_int = u128_sub(r_int, b_full);
+            q_int = u128_set_bit(q_int, u32(127 - i));
+        }
+    }
+    var quot_lo_lo: u32 = 0u;
+    var quot_lo_hi: u32 = 0u;
+    var r = r_int;
+    for (var i: i32 = 63; i >= 0; i = i - 1) {
+        let overflow_bit = r.w >> 31u;
+        r = u128_shl1(r);
+        if (overflow_bit != 0u || u128_ge(r, b_full)) {
+            r = u128_sub(r, b_full);
+            if (i < 32) {
+                quot_lo_lo = quot_lo_lo | (1u << u32(i));
+            } else {
+                quot_lo_hi = quot_lo_hi | (1u << u32(i - 32));
+            }
+        }
+    }
+    var result: Fix128Gpu;
+    result.hi_lo = q_int.x;
+    result.hi_hi = q_int.y;
+    result.lo_lo = quot_lo_lo;
+    result.lo_hi = quot_lo_hi;
+    if (result_neg) { return fix128_neg(result); }
+    return result;
+}
+
+// ---- u64 emulation for Morton bit-spread ----
+
+fn u64_or(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(a.x | b.x, a.y | b.y);
+}
+
+fn u64_and(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(a.x & b.x, a.y & b.y);
+}
+
+fn u64_shl32(a: vec2<u32>) -> vec2<u32> { return vec2<u32>(0u, a.x); }
+fn u64_shl16(a: vec2<u32>) -> vec2<u32> { return vec2<u32>(a.x << 16u, (a.y << 16u) | (a.x >> 16u)); }
+fn u64_shl8(a: vec2<u32>)  -> vec2<u32> { return vec2<u32>(a.x << 8u,  (a.y << 8u)  | (a.x >> 24u)); }
+fn u64_shl4(a: vec2<u32>)  -> vec2<u32> { return vec2<u32>(a.x << 4u,  (a.y << 4u)  | (a.x >> 28u)); }
+fn u64_shl2(a: vec2<u32>)  -> vec2<u32> { return vec2<u32>(a.x << 2u,  (a.y << 2u)  | (a.x >> 30u)); }
+fn u64_shl1(a: vec2<u32>)  -> vec2<u32> { return vec2<u32>(a.x << 1u,  (a.y << 1u)  | (a.x >> 31u)); }
+
+// Spread a 21-bit coordinate to 63 bits so each input bit `i` lands at
+// output position `3 * i`. Byte-for-byte mirror of
+// `alice_physics::bvh::expand_bits` on u64. Result packed as
+// `vec2<u32>(low32, high32)` = full u64.
+fn expand_bits_u64(v: u32) -> vec2<u32> {
+    var w = vec2<u32>(v & 0x001FFFFFu, 0u);
+    // Step 1: (w | (w << 32)) & 0x001F00000000FFFF
+    w = u64_and(u64_or(w, u64_shl32(w)), vec2<u32>(0x0000FFFFu, 0x001F0000u));
+    // Step 2: (w | (w << 16)) & 0x001F0000FF0000FF
+    w = u64_and(u64_or(w, u64_shl16(w)), vec2<u32>(0xFF0000FFu, 0x001F0000u));
+    // Step 3: (w | (w << 8))  & 0x100F00F00F00F00F
+    w = u64_and(u64_or(w, u64_shl8(w)),  vec2<u32>(0x0F00F00Fu, 0x100F00F0u));
+    // Step 4: (w | (w << 4))  & 0x10C30C30C30C30C3
+    w = u64_and(u64_or(w, u64_shl4(w)),  vec2<u32>(0xC30C30C3u, 0x10C30C30u));
+    // Step 5: (w | (w << 2))  & 0x1249249249249249
+    w = u64_and(u64_or(w, u64_shl2(w)),  vec2<u32>(0x49249249u, 0x12492492u));
+    return w;
+}
+
+// Normalize a single axis of a point relative to the world bounds and
+// extract the upper 21 bits of the fractional part. Mirrors the three
+// CPU branches in `alice_physics::bvh::point_to_morton`:
+//   - size = 0                → coord = 0
+//   - t < 0                   → coord = 0
+//   - t.hi >= 1               → coord = 0x1FFFFF
+//   - otherwise               → coord = (t.lo >> 43) & 0x1FFFFF
+// The GPU expresses `t.lo >> 43` as `t.lo_hi >> 11` since `t.lo_hi`
+// holds bits 32-63 of the low u64 half.
+fn extract_u21_coord(point_axis: Fix128Gpu, bounds_min_axis: Fix128Gpu, size_axis: Fix128Gpu) -> u32 {
+    if (fix128_is_zero(size_axis)) { return 0u; }
+    let offset = fix128_sub_kernel(point_axis, bounds_min_axis);
+    let t = fix128_div_kernel(offset, size_axis);
+    if (fix128_is_negative(t)) { return 0u; }
+    // `t.hi >= 1` when the integer part of the fixed-point value is at
+    // least 1 — i.e. when hi_hi has any bit set or hi_lo is at least 1.
+    if (t.hi_hi != 0u || t.hi_lo >= 1u) { return 0x001FFFFFu; }
+    return (t.lo_hi >> 11u) & 0x001FFFFFu;
+}
+
+// ---- Main: one 63-bit Morton code per primitive ----
+
+@compute @workgroup_size(64)
+fn fix128_morton_code_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&primitives)) { return; }
+    let prim = primitives[i];
+
+    // Centre = (min + max) / 2 per axis.
+    let cx_val = fix128_half(fix128_add_kernel(prim.min_x, prim.max_x));
+    let cy_val = fix128_half(fix128_add_kernel(prim.min_y, prim.max_y));
+    let cz_val = fix128_half(fix128_add_kernel(prim.min_z, prim.max_z));
+
+    // World size per axis.
+    let size_x = fix128_sub_kernel(world_bounds.max_x, world_bounds.min_x);
+    let size_y = fix128_sub_kernel(world_bounds.max_y, world_bounds.min_y);
+    let size_z = fix128_sub_kernel(world_bounds.max_z, world_bounds.min_z);
+
+    // Normalized 21-bit coordinates.
+    let cx = extract_u21_coord(cx_val, world_bounds.min_x, size_x);
+    let cy = extract_u21_coord(cy_val, world_bounds.min_y, size_y);
+    let cz = extract_u21_coord(cz_val, world_bounds.min_z, size_z);
+
+    // Morton = expand(x) | (expand(y) << 1) | (expand(z) << 2).
+    let ex      = expand_bits_u64(cx);
+    let ey      = expand_bits_u64(cy);
+    let ez      = expand_bits_u64(cz);
+    let ey_shl1 = u64_shl1(ey);
+    let ez_shl2 = u64_shl2(ez);
+    let m       = u64_or(u64_or(ex, ey_shl1), ez_shl2);
+
+    morton_codes[i] = m;
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
@@ -4151,5 +4858,346 @@ mod tests {
         <Fix128WgpuKernel<'_> as Fix128GpuKernel>::add(&mut kernel, &a, &b, &mut via_trait);
 
         assert_eq!(via_inherent, via_trait);
+    }
+
+    // -----------------------------------------------------------------
+    // v2.1.0 Phase 3 first primitive — Fix128 AABB helpers
+    // -----------------------------------------------------------------
+
+    /// Fix128 AABB helpers WGSL ships the struct definitions and every
+    /// helper the v2.2+ Phase 3 pipeline consumes: `fix128_add / sub /
+    /// lt / min / max`, `aabb_from_sphere`, and `aabb_union`. The
+    /// smoke `@compute` entry keeps the module standalone-compilable.
+    #[test]
+    fn wgsl_aabb_helpers_shader_present() {
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("struct Fix128Gpu"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("struct Fix128AabbGpu"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn u64_add"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn u64_sub"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn fix128_add"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn fix128_sub"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn fix128_lt"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn fix128_min"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn fix128_max"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn aabb_from_sphere"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn aabb_union"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("fn aabb_helpers_smoke_main"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("@compute"));
+        assert!(FIX128_AABB_HELPERS_WGSL.contains("@workgroup_size(1)"));
+    }
+
+    /// The AABB helpers module must be a standalone valid WGSL shader.
+    /// Skips when no GPU adapter is available (headless CI).
+    #[test]
+    fn wgsl_aabb_helpers_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_aabb_helpers_shader_compile_test"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_AABB_HELPERS_WGSL.into()),
+            });
+    }
+
+    /// `Fix128AabbGpu` occupies the exact `6 × Fix128Gpu = 96` bytes
+    /// so the type can be uploaded directly as a storage buffer.
+    #[test]
+    fn fix128_aabb_gpu_size_and_layout() {
+        assert_eq!(core::mem::size_of::<Fix128AabbGpu>(), 96);
+        assert_eq!(core::mem::size_of::<Fix128Gpu>(), 16);
+    }
+
+    /// `Fix128AabbGpu::from_sphere` matches the WGSL `aabb_from_sphere`
+    /// helper byte-for-byte on the CPU reference. The GPU dispatch
+    /// path is exercised by the v2.2+ Morton kernel tests.
+    #[test]
+    fn fix128_aabb_gpu_from_sphere() {
+        let pos_x = Fix128Gpu::from_int(3);
+        let pos_y = Fix128Gpu::from_int(5);
+        let pos_z = Fix128Gpu::from_int(-1);
+        let radius = Fix128Gpu::from_raw(0, 1u64 << 63); // 0.5
+        let aabb = Fix128AabbGpu::from_sphere(pos_x, pos_y, pos_z, radius);
+        assert_eq!(aabb.min_x, pos_x.sub(radius));
+        assert_eq!(aabb.min_y, pos_y.sub(radius));
+        assert_eq!(aabb.min_z, pos_z.sub(radius));
+        assert_eq!(aabb.max_x, pos_x.add(radius));
+        assert_eq!(aabb.max_y, pos_y.add(radius));
+        assert_eq!(aabb.max_z, pos_z.add(radius));
+    }
+
+    /// v2.1.0 Morton code shader ships every helper it needs to normalize
+    /// a Fix128 coordinate via the v1.4.0 div kernel, extract the upper
+    /// 21 bits, and spread them via the u64-emulated `expand_bits`
+    /// sequence into a full 63-bit Morton code. Compute entry is
+    /// `fix128_morton_code_main`.
+    #[test]
+    fn wgsl_morton_code_shader_present() {
+        assert!(FIX128_MORTON_CODE_WGSL.contains("struct Fix128Gpu"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("struct Fix128AabbGpu"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("primitives"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("world_bounds"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("morton_codes"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("fn fix128_add_kernel"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("fn fix128_sub_kernel"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("fn fix128_mul_kernel"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("fn fix128_div_kernel"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("fn fix128_half"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("fn expand_bits_u64"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("fn extract_u21_coord"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("fn fix128_morton_code_main"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("@compute"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("@workgroup_size(64)"));
+        // The five Morton bit-spread mask constants must be present verbatim.
+        assert!(FIX128_MORTON_CODE_WGSL.contains("0x001F0000u"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("0xFF0000FFu"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("0x100F00F0u"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("0x10C30C30u"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("0x49249249u"));
+        assert!(FIX128_MORTON_CODE_WGSL.contains("0x12492492u"));
+        // The 21-bit mask must be present exactly.
+        assert!(FIX128_MORTON_CODE_WGSL.contains("0x001FFFFFu"));
+    }
+
+    /// Morton code shader must compile as valid WGSL end-to-end
+    /// (structs + bindings + all Fix128 primitives + Morton logic +
+    /// compute entry point). Skips when no GPU adapter is available
+    /// (headless CI).
+    #[test]
+    fn wgsl_morton_code_shader_compiles() {
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fix128_morton_code_shader_compile_test"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_MORTON_CODE_WGSL.into()),
+            });
+    }
+
+    /// GPU dispatch bit-exact contract for the v2.1.0 Morton kernel.
+    ///
+    /// Feeds 16 hand-crafted primitives + a fixed world AABB through
+    /// the `fix128_morton_code_main` kernel and compares the returned
+    /// `vec2<u32>` codes byte-for-byte against
+    /// `alice_physics::bvh::point_to_morton` on the same primitives.
+    ///
+    /// The fixture exercises all three CPU coordinate branches:
+    ///   - Interior primitives (t in the open unit interval)
+    ///   - Boundary primitives (centre exactly on the world bounds)
+    ///   - Out-of-bounds primitives on both the low (t < 0) and high
+    ///     (t.hi >= 1) sides of each axis
+    ///
+    /// A successful golden match on all 16 fixtures confirms the GPU
+    /// kernel reproduces the Fix128 divide, the 21-bit extraction, and
+    /// the 5-round `expand_bits` bit-spread pipeline bit-exact against
+    /// the CPU reference.
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_morton_code_matches_cpu_golden() {
+        use alice_physics::bvh::point_to_morton;
+        use alice_physics::collider::AABB;
+        use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
+
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return, // Headless CI, skip
+        };
+
+        // Byte-for-byte conversion helpers between Fix128Gpu and
+        // alice_physics::math::Fix128 (both share the same
+        // #[repr(C)] { hi: i64, lo: u64 } layout).
+        fn to_physics(g: Fix128Gpu) -> PhysicsFix128 {
+            PhysicsFix128::from_raw(g.hi, g.lo)
+        }
+
+        // Fixture: 16 primitives with mixed centres, plus a fixed world.
+        //
+        // The centre of each AABB is `(min + max) / 2`. Every AABB is
+        // a Sphere-derived AABB with radius 0.5 so `centre == pos`.
+        let world_bounds = Fix128AabbGpu::from_sphere(
+            Fix128Gpu::from_int(0),
+            Fix128Gpu::from_int(0),
+            Fix128Gpu::from_int(0),
+            Fix128Gpu::from_int(10),
+        );
+
+        let r = Fix128Gpu::from_raw(0, 1u64 << 63); // 0.5
+        let mk = |x: i64, y: i64, z: i64| {
+            Fix128AabbGpu::from_sphere(
+                Fix128Gpu::from_int(x),
+                Fix128Gpu::from_int(y),
+                Fix128Gpu::from_int(z),
+                r,
+            )
+        };
+        let primitives: Vec<Fix128AabbGpu> = vec![
+            mk(0, 0, 0),    // centre
+            mk(1, 2, 3),    // interior
+            mk(-1, -2, -3), // interior negative
+            mk(5, 5, 5),    // interior positive
+            mk(-5, -5, -5), // interior negative
+            mk(-10, 0, 0),  // boundary low x
+            mk(10, 0, 0),   // boundary high x
+            mk(0, -10, 0),  // boundary low y
+            mk(0, 10, 0),   // boundary high y
+            mk(0, 0, -10),  // boundary low z
+            mk(0, 0, 10),   // boundary high z
+            mk(-15, 0, 0),  // out-of-bounds low x (t < 0 branch)
+            mk(15, 0, 0),   // out-of-bounds high x (t.hi >= 1 branch)
+            mk(0, -20, 0),  // out-of-bounds low y
+            mk(0, 20, 0),   // out-of-bounds high y
+            mk(7, -3, 4),   // interior mixed
+        ];
+        assert_eq!(primitives.len(), 16);
+
+        // ---- CPU golden ----
+        let cpu_codes: Vec<u64> = primitives
+            .iter()
+            .map(|p| {
+                let centre = Vec3Fix::new(
+                    (to_physics(p.min_x) + to_physics(p.max_x)).half(),
+                    (to_physics(p.min_y) + to_physics(p.max_y)).half(),
+                    (to_physics(p.min_z) + to_physics(p.max_z)).half(),
+                );
+                let wb = AABB {
+                    min: Vec3Fix::new(
+                        to_physics(world_bounds.min_x),
+                        to_physics(world_bounds.min_y),
+                        to_physics(world_bounds.min_z),
+                    ),
+                    max: Vec3Fix::new(
+                        to_physics(world_bounds.max_x),
+                        to_physics(world_bounds.max_y),
+                        to_physics(world_bounds.max_z),
+                    ),
+                };
+                point_to_morton(centre, &wb)
+            })
+            .collect();
+
+        // ---- GPU dispatch ----
+        let primitives_bytes: &[u8] = bytemuck::cast_slice(&primitives);
+        let world_bounds_bytes: &[u8] = bytemuck::bytes_of(&world_bounds);
+
+        let buf_primitives = device.create_buffer_init("morton_primitives", primitives_bytes);
+        let buf_world = device.create_uniform_buffer("morton_world_bounds", world_bounds_bytes);
+        let output_bytes: u64 = (primitives.len() * core::mem::size_of::<[u32; 2]>()) as u64;
+        let buf_output = device.create_buffer_empty("morton_output", output_bytes);
+
+        let shader = device
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("morton_code_shader"),
+                source: wgpu::ShaderSource::Wgsl(FIX128_MORTON_CODE_WGSL.into()),
+            });
+
+        let pipeline = device
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("morton_code_pipeline"),
+                layout: None,
+                module: &shader,
+                entry_point: Some("fix128_morton_code_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        let bind_group = device
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("morton_code_bind_group"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf_primitives.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf_world.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buf_output.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut encoder = device
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("morton_code_encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("morton_code_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (primitives.len() as u32).div_ceil(64);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        device.submit(encoder);
+        device.poll_wait();
+
+        // Read back
+        let raw = device.read_buffer(&buf_output, output_bytes);
+        let gpu_codes: &[[u32; 2]] = bytemuck::cast_slice(&raw);
+
+        // ---- Compare ----
+        for (i, (cpu, gpu)) in cpu_codes.iter().zip(gpu_codes.iter()).enumerate() {
+            let gpu_u64 = (u64::from(gpu[0])) | ((u64::from(gpu[1])) << 32);
+            assert_eq!(
+                *cpu, gpu_u64,
+                "primitive {i}: CPU {cpu:#018x} vs GPU {gpu_u64:#018x}"
+            );
+        }
+    }
+
+    /// `Fix128AabbGpu::union` matches the WGSL `aabb_union` helper
+    /// byte-for-byte on the CPU reference. Exercises positive, negative,
+    /// and mixed-sign corners so the signed compare (`fix128_lt`)
+    /// branch coverage is complete.
+    #[test]
+    fn fix128_aabb_gpu_union() {
+        // AABB 1: [-1, -1, -1] × [1, 1, 1]
+        let one = Fix128Gpu::ONE;
+        let neg_one = Fix128Gpu::from_int(-1);
+        let a = Fix128AabbGpu {
+            min_x: neg_one,
+            min_y: neg_one,
+            min_z: neg_one,
+            max_x: one,
+            max_y: one,
+            max_z: one,
+        };
+        // AABB 2: [0, -3, 2] × [5, 0, 4]
+        let three_neg = Fix128Gpu::from_int(-3);
+        let two = Fix128Gpu::from_int(2);
+        let four = Fix128Gpu::from_int(4);
+        let five = Fix128Gpu::from_int(5);
+        let zero = Fix128Gpu::ZERO;
+        let b = Fix128AabbGpu {
+            min_x: zero,
+            min_y: three_neg,
+            min_z: two,
+            max_x: five,
+            max_y: zero,
+            max_z: four,
+        };
+        let u = a.union(b);
+        // Union: min = componentwise min, max = componentwise max
+        assert_eq!(u.min_x, neg_one);
+        assert_eq!(u.min_y, three_neg);
+        assert_eq!(u.min_z, neg_one);
+        assert_eq!(u.max_x, five);
+        assert_eq!(u.max_y, one);
+        assert_eq!(u.max_z, four);
     }
 }

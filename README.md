@@ -579,6 +579,8 @@ alice-trt = { path = "../ALICE-TRT", features = ["fix128-arithmetic"] }
 | PGS project (distance, batched) | v1.5.1 | `FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL` |
 | Fix128 GPU `div` | v1.4.0 | `FIX128_DIV_WGSL` |
 | Fix128 GPU `sqrt` | v1.4.1 | `FIX128_SQRT_WGSL` |
+| Fix128 AABB helpers (Phase 3 §1) | v2.1.0 | `FIX128_AABB_HELPERS_WGSL` |
+| Fix128 Morton code (Phase 3 §1) | v2.1.0 | `FIX128_MORTON_CODE_WGSL` |
 
 CPU-side `Fix128Gpu` also exposes `sqrt` (v1.0.1, delegates to `alice_physics::Fix128::sqrt`) and `div` (v1.0.6) for host precompute paths. The v1.1.0 single-constraint uniform variant (`FIX128_PGS_PROJECT_DISTANCE_WGSL`) was deprecated in v1.7.0 and removed in v2.0.0; external `Fix128GpuKernel` implementers should migrate to the rigid-rod or batched shader listed above.
 
