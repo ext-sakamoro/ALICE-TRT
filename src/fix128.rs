@@ -8529,6 +8529,865 @@ pub fn dispatch_fix128_quat_rotate_vec(
 }
 
 // ---------------------------------------------------------------------------
+// v3.1.0 Phase 4 §2 — Ball-socket joint solve kernel + orchestrator.
+// Byte-exact port of `alice_physics::joint::solve_ball_joint` running as
+// a single-workgroup single-thread compute pass over the uploaded joint
+// list. Inlines Fix128 add / sub / mul / div / sqrt, quaternion mul +
+// rotate, and Vec3 ops.
+// ---------------------------------------------------------------------------
+
+/// GPU-side 128-byte ball-socket joint — byte-layout mirror of the
+/// `alice_physics::joint::BallJoint` variant of `Joint`. Non-Ball
+/// variants of `Joint` are filtered out by the caller (adapter
+/// `send_joints` panics on other variants for v3.1.0).
+///
+/// Layout matches the WGSL `struct BallSocketJointGpu`:
+///
+/// | offset | field            | size |
+/// |--------|------------------|------|
+/// | 0      | `body_a`         | 4    |
+/// | 4      | `body_b`         | 4    |
+/// | 8      | `_pad0`          | 4    |
+/// | 12     | `_pad1`          | 4    |
+/// | 16     | `local_anchor_a` | 48   |
+/// | 64     | `local_anchor_b` | 48   |
+/// | 112    | `compliance`     | 16   |
+///
+/// The 8-byte padding after `body_b` aligns `local_anchor_a` to a
+/// 16-byte boundary, matching the `ContactConstraintGpu` convention.
+#[cfg(feature = "physics-solver")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BallSocketJointGpu {
+    pub body_a: u32,
+    pub body_b: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub local_anchor_a: Vec3FixGpu,
+    pub local_anchor_b: Vec3FixGpu,
+    pub compliance: Fix128Gpu,
+}
+
+#[cfg(feature = "physics-solver")]
+impl BallSocketJointGpu {
+    /// Convert an `alice_physics::joint::BallJoint` to the GPU-side
+    /// byte-layout mirror.
+    #[must_use]
+    pub fn from_physics(j: &alice_physics::joint::BallJoint) -> Self {
+        Self {
+            body_a: u32::try_from(j.body_a).expect("body_a exceeds u32::MAX"),
+            body_b: u32::try_from(j.body_b).expect("body_b exceeds u32::MAX"),
+            _pad0: 0,
+            _pad1: 0,
+            local_anchor_a: Vec3FixGpu::from_physics(j.local_anchor_a),
+            local_anchor_b: Vec3FixGpu::from_physics(j.local_anchor_b),
+            compliance: Fix128Gpu::from_raw(j.compliance.hi, j.compliance.lo),
+        }
+    }
+}
+
+/// WGSL compute shader source for **Fix128 ball-socket joint solve**
+/// (v3.1.0 Phase 4 §2). Byte-exact port of
+/// `alice_physics::joint::solve_ball_joint`.
+///
+/// # Algorithm per joint
+///
+/// ```text
+/// anchor_a = body_a.position + rotate_vec(body_a.rotation, local_anchor_a)
+/// anchor_b = body_b.position + rotate_vec(body_b.rotation, local_anchor_b)
+/// delta = anchor_b - anchor_a
+/// distance = sqrt(dot(delta, delta))     // via Vec3::length()
+/// if distance == 0: skip
+/// compliance_term = compliance / dt_sq   // dt_sq = dt * dt precomputed on CPU
+/// w_sum = body_a.inv_mass + body_b.inv_mass + compliance_term
+/// if w_sum == 0: skip
+/// inv_w_sum = 1 / w_sum
+/// lambda = distance * inv_w_sum
+/// normal = delta * (1 / distance)        // via normalize_with_length
+/// correction = normal * lambda
+/// if body_a.inv_mass != 0: position_a += correction * body_a.inv_mass
+/// if body_b.inv_mass != 0: position_b -= correction * body_b.inv_mass
+/// ```
+///
+/// # Bindings
+///
+/// - `@group(0) @binding(0)` — `joints: array<BallSocketJointGpu>` (read).
+/// - `@group(0) @binding(1)` — `body_positions: array<Vec3FixGpu>`
+///   (read_write). In-place position update.
+/// - `@group(0) @binding(2)` — `body_rotations: array<QuatFixGpu>` (read).
+/// - `@group(0) @binding(3)` — `body_inv_masses: array<Fix128Gpu>` (read).
+/// - `@group(0) @binding(4)` — `params: BallSocketSolveParams` (uniform).
+///   `{ joint_count, _pad0/1/2, dt_sq }`.
+///
+/// # Dispatch
+///
+/// `@compute @workgroup_size(1)` + `dispatch_workgroups(1, 1, 1)` —
+/// single-thread iterates the joint list top to bottom. This preserves
+/// the CPU `for joint in joints` order exactly, giving byte-exact CPU
+/// parity for any valid joint list.
+pub const FIX128_BALL_SOCKET_JOINT_SOLVE_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+struct Vec3FixGpu {
+    x: Fix128Gpu,
+    y: Fix128Gpu,
+    z: Fix128Gpu,
+}
+
+struct QuatFixGpu {
+    x: Fix128Gpu,
+    y: Fix128Gpu,
+    z: Fix128Gpu,
+    w: Fix128Gpu,
+}
+
+struct BallSocketJointGpu {
+    body_a: u32,
+    body_b: u32,
+    _pad0: u32,
+    _pad1: u32,
+    local_anchor_a: Vec3FixGpu,
+    local_anchor_b: Vec3FixGpu,
+    compliance: Fix128Gpu,
+}
+
+struct BallSocketSolveParams {
+    joint_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    dt_sq: Fix128Gpu,
+}
+
+@group(0) @binding(0) var<storage, read>       joints:          array<BallSocketJointGpu>;
+@group(0) @binding(1) var<storage, read_write> body_positions:  array<Vec3FixGpu>;
+@group(0) @binding(2) var<storage, read>       body_rotations:  array<QuatFixGpu>;
+@group(0) @binding(3) var<storage, read>       body_inv_masses: array<Fix128Gpu>;
+@group(0) @binding(4) var<uniform>             params:          BallSocketSolveParams;
+
+// ---- 64-bit helpers (byte-exact copies) ----
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let lo_sub  = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid     = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let hi_sub  = mid - borrow1;
+    let borrow3 = select(0u, 1u, mid < borrow1);
+    return vec3<u32>(lo_sub, hi_sub, borrow2 + borrow3);
+}
+
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+    let r0 = ll.x;
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+    let r3 = hh.y + carry_to_3;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+// ---- Fix128 core ops ----
+
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_sub_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+    let ll = u64_mul_wide(a_lo, b_lo);
+    let lh = u64_mul_wide(a_lo, b_hi);
+    let hl = u64_mul_wide(a_hi, b_lo);
+    let hh = u64_mul_wide(a_hi, b_hi);
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+    let s5a = lh.w + hl.w;
+    let s5b = s5a + hh.y;
+    let p5_u = s5b + carry_to_5;
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+    var p4 = p4_u;
+    var p5 = p5_u;
+    if (a_negative) {
+        let sub_lo = b.lo_lo;
+        let sub_hi = b.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    if (b_negative) {
+        let sub_lo = a.lo_lo;
+        let sub_hi = a.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
+    return out;
+}
+
+fn fix128_neg(x: Fix128Gpu) -> Fix128Gpu {
+    let inv_lo_lo = ~x.lo_lo;
+    let inv_lo_hi = ~x.lo_hi;
+    let inv_hi_lo = ~x.hi_lo;
+    let inv_hi_hi = ~x.hi_hi;
+    let s0 = inv_lo_lo + 1u;
+    let c0 = select(0u, 1u, s0 < inv_lo_lo);
+    let s1 = inv_lo_hi + c0;
+    let c1 = select(0u, 1u, s1 < inv_lo_hi);
+    let s2 = inv_hi_lo + c1;
+    let c2 = select(0u, 1u, s2 < inv_hi_lo);
+    let s3 = inv_hi_hi + c2;
+    var out: Fix128Gpu;
+    out.lo_lo = s0;
+    out.lo_hi = s1;
+    out.hi_lo = s2;
+    out.hi_hi = s3;
+    return out;
+}
+
+fn fix128_is_zero(x: Fix128Gpu) -> bool {
+    return (x.hi_lo | x.hi_hi | x.lo_lo | x.lo_hi) == 0u;
+}
+
+fn fix128_is_negative(x: Fix128Gpu) -> bool {
+    return ((x.hi_hi >> 31u) & 1u) == 1u;
+}
+
+fn fix128_abs(x: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(x)) { return fix128_neg(x); }
+    return x;
+}
+
+fn fix128_zero() -> Fix128Gpu {
+    return Fix128Gpu(0u, 0u, 0u, 0u);
+}
+
+fn fix128_one() -> Fix128Gpu {
+    return Fix128Gpu(1u, 0u, 0u, 0u);
+}
+
+fn fix128_half(x: Fix128Gpu) -> Fix128Gpu {
+    var out: Fix128Gpu;
+    out.lo_lo = (x.lo_lo >> 1u) | ((x.lo_hi & 1u) << 31u);
+    out.lo_hi = (x.lo_hi >> 1u) | ((x.hi_lo & 1u) << 31u);
+    out.hi_lo = (x.hi_lo >> 1u) | ((x.hi_hi & 1u) << 31u);
+    out.hi_hi = bitcast<u32>(bitcast<i32>(x.hi_hi) >> 1u);
+    return out;
+}
+
+// ---- u128 helpers (for div) ----
+
+fn u128_shl1(x: vec4<u32>) -> vec4<u32> {
+    let c0 = x.x >> 31u;
+    let c1 = x.y >> 31u;
+    let c2 = x.z >> 31u;
+    return vec4<u32>(x.x << 1u, (x.y << 1u) | c0, (x.z << 1u) | c1, (x.w << 1u) | c2);
+}
+
+fn u128_ge(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if (a.w != b.w) { return a.w > b.w; }
+    if (a.z != b.z) { return a.z > b.z; }
+    if (a.y != b.y) { return a.y > b.y; }
+    return a.x >= b.x;
+}
+
+fn u128_sub(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
+    let d0        = a.x - b.x;
+    let borrow0   = select(0u, 1u, a.x < b.x);
+    let m1        = a.y - b.y;
+    let borrow1a  = select(0u, 1u, a.y < b.y);
+    let d1        = m1 - borrow0;
+    let borrow1b  = select(0u, 1u, m1 < borrow0);
+    let borrow1   = borrow1a + borrow1b;
+    let m2        = a.z - b.z;
+    let borrow2a  = select(0u, 1u, a.z < b.z);
+    let d2        = m2 - borrow1;
+    let borrow2b  = select(0u, 1u, m2 < borrow1);
+    let borrow2   = borrow2a + borrow2b;
+    let m3        = a.w - b.w;
+    let d3        = m3 - borrow2;
+    return vec4<u32>(d0, d1, d2, d3);
+}
+
+fn u128_set_bit(x: vec4<u32>, bit_pos: u32) -> vec4<u32> {
+    let word  = bit_pos >> 5u;
+    let shift = bit_pos & 31u;
+    let mask  = 1u << shift;
+    var out = x;
+    if      (word == 0u) { out.x = out.x | mask; }
+    else if (word == 1u) { out.y = out.y | mask; }
+    else if (word == 2u) { out.z = out.z | mask; }
+    else                 { out.w = out.w | mask; }
+    return out;
+}
+
+// ---- div ----
+
+fn fix128_div_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_zero(b)) { return fix128_zero(); }
+    let neg_a = fix128_is_negative(a);
+    let neg_b = fix128_is_negative(b);
+    let result_neg = neg_a != neg_b;
+    let abs_a = fix128_abs(a);
+    let abs_b = fix128_abs(b);
+    let a_full = vec4<u32>(abs_a.lo_lo, abs_a.lo_hi, abs_a.hi_lo, abs_a.hi_hi);
+    let b_full = vec4<u32>(abs_b.lo_lo, abs_b.lo_hi, abs_b.hi_lo, abs_b.hi_hi);
+    var q_int = vec4<u32>(0u);
+    var r_int = vec4<u32>(0u);
+    var d     = a_full;
+    for (var i: i32 = 0; i < 128; i = i + 1) {
+        let msb = d.w >> 31u;
+        r_int   = u128_shl1(r_int);
+        r_int.x = r_int.x | msb;
+        d       = u128_shl1(d);
+        if (u128_ge(r_int, b_full)) {
+            r_int = u128_sub(r_int, b_full);
+            q_int = u128_set_bit(q_int, u32(127 - i));
+        }
+    }
+    var quot_lo_lo: u32 = 0u;
+    var quot_lo_hi: u32 = 0u;
+    var r = r_int;
+    for (var i: i32 = 63; i >= 0; i = i - 1) {
+        let overflow_bit = r.w >> 31u;
+        r = u128_shl1(r);
+        if (overflow_bit != 0u || u128_ge(r, b_full)) {
+            r = u128_sub(r, b_full);
+            if (i < 32) {
+                quot_lo_lo = quot_lo_lo | (1u << u32(i));
+            } else {
+                quot_lo_hi = quot_lo_hi | (1u << u32(i - 32));
+            }
+        }
+    }
+    var result: Fix128Gpu;
+    result.hi_lo = q_int.x;
+    result.hi_hi = q_int.y;
+    result.lo_lo = quot_lo_lo;
+    result.lo_hi = quot_lo_hi;
+    if (result_neg) { return fix128_neg(result); }
+    return result;
+}
+
+// ---- sqrt ----
+
+fn fix128_sqrt(a: Fix128Gpu) -> Fix128Gpu {
+    if (fix128_is_negative(a) || fix128_is_zero(a)) {
+        return fix128_zero();
+    }
+    var sig_bits: u32;
+    if (a.hi_hi != 0u || a.hi_lo != 0u) {
+        var lz: u32;
+        if (a.hi_hi != 0u) { lz = countLeadingZeros(a.hi_hi); }
+        else               { lz = 32u + countLeadingZeros(a.hi_lo); }
+        sig_bits = 128u - lz;
+    } else {
+        var lz: u32;
+        if (a.lo_hi != 0u) { lz = countLeadingZeros(a.lo_hi); }
+        else               { lz = 32u + countLeadingZeros(a.lo_lo); }
+        sig_bits = 64u - lz;
+    }
+    let result_bit = (sig_bits + 63u) / 2u;
+
+    var x: Fix128Gpu;
+    x.hi_lo = 0u;
+    x.hi_hi = 0u;
+    x.lo_lo = 0u;
+    x.lo_hi = 0u;
+    if (result_bit >= 64u) {
+        let shift_raw = result_bit - 64u;
+        let shift = min(shift_raw, 62u);
+        if (shift < 32u) {
+            x.hi_lo = 1u << shift;
+        } else {
+            x.hi_hi = 1u << (shift - 32u);
+        }
+    } else {
+        if (result_bit < 32u) {
+            x.lo_lo = 1u << result_bit;
+        } else {
+            x.lo_hi = 1u << (result_bit - 32u);
+        }
+    }
+
+    for (var i: i32 = 0; i < 64; i = i + 1) {
+        let div = fix128_div_kernel(a, x);
+        let sum = fix128_add_kernel(x, div);
+        x = fix128_half(sum);
+    }
+    return x;
+}
+
+// ---- Vec3 helpers ----
+
+fn vec3_add(a: Vec3FixGpu, b: Vec3FixGpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_add_kernel(a.x, b.x);
+    out.y = fix128_add_kernel(a.y, b.y);
+    out.z = fix128_add_kernel(a.z, b.z);
+    return out;
+}
+
+fn vec3_sub(a: Vec3FixGpu, b: Vec3FixGpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_sub_kernel(a.x, b.x);
+    out.y = fix128_sub_kernel(a.y, b.y);
+    out.z = fix128_sub_kernel(a.z, b.z);
+    return out;
+}
+
+fn vec3_scale(a: Vec3FixGpu, s: Fix128Gpu) -> Vec3FixGpu {
+    var out: Vec3FixGpu;
+    out.x = fix128_mul_kernel(a.x, s);
+    out.y = fix128_mul_kernel(a.y, s);
+    out.z = fix128_mul_kernel(a.z, s);
+    return out;
+}
+
+// ---- Quaternion helpers ----
+
+fn quat_mul(a: QuatFixGpu, b: QuatFixGpu) -> QuatFixGpu {
+    let x_t1 = fix128_mul_kernel(a.w, b.x);
+    let x_t2 = fix128_mul_kernel(a.x, b.w);
+    let x_t3 = fix128_mul_kernel(a.y, b.z);
+    let x_t4 = fix128_mul_kernel(a.z, b.y);
+    let x_s1 = fix128_add_kernel(x_t1, x_t2);
+    let x_s2 = fix128_add_kernel(x_s1, x_t3);
+    let rx   = fix128_sub_kernel(x_s2, x_t4);
+
+    let y_t1 = fix128_mul_kernel(a.w, b.y);
+    let y_t2 = fix128_mul_kernel(a.x, b.z);
+    let y_t3 = fix128_mul_kernel(a.y, b.w);
+    let y_t4 = fix128_mul_kernel(a.z, b.x);
+    let y_s1 = fix128_sub_kernel(y_t1, y_t2);
+    let y_s2 = fix128_add_kernel(y_s1, y_t3);
+    let ry   = fix128_add_kernel(y_s2, y_t4);
+
+    let z_t1 = fix128_mul_kernel(a.w, b.z);
+    let z_t2 = fix128_mul_kernel(a.x, b.y);
+    let z_t3 = fix128_mul_kernel(a.y, b.x);
+    let z_t4 = fix128_mul_kernel(a.z, b.w);
+    let z_s1 = fix128_add_kernel(z_t1, z_t2);
+    let z_s2 = fix128_sub_kernel(z_s1, z_t3);
+    let rz   = fix128_add_kernel(z_s2, z_t4);
+
+    let w_t1 = fix128_mul_kernel(a.w, b.w);
+    let w_t2 = fix128_mul_kernel(a.x, b.x);
+    let w_t3 = fix128_mul_kernel(a.y, b.y);
+    let w_t4 = fix128_mul_kernel(a.z, b.z);
+    let w_s1 = fix128_sub_kernel(w_t1, w_t2);
+    let w_s2 = fix128_sub_kernel(w_s1, w_t3);
+    let rw   = fix128_sub_kernel(w_s2, w_t4);
+
+    var out: QuatFixGpu;
+    out.x = rx;
+    out.y = ry;
+    out.z = rz;
+    out.w = rw;
+    return out;
+}
+
+fn quat_conjugate(q: QuatFixGpu) -> QuatFixGpu {
+    var out: QuatFixGpu;
+    out.x = fix128_neg(q.x);
+    out.y = fix128_neg(q.y);
+    out.z = fix128_neg(q.z);
+    out.w = q.w;
+    return out;
+}
+
+fn quat_rotate_vec(q: QuatFixGpu, v: Vec3FixGpu) -> Vec3FixGpu {
+    var qv: QuatFixGpu;
+    qv.x = v.x;
+    qv.y = v.y;
+    qv.z = v.z;
+    qv.w = fix128_zero();
+    let tmp    = quat_mul(q, qv);
+    let result = quat_mul(tmp, quat_conjugate(q));
+    var out: Vec3FixGpu;
+    out.x = result.x;
+    out.y = result.y;
+    out.z = result.z;
+    return out;
+}
+
+// ---- Ball-socket joint solve entry ----
+
+@compute @workgroup_size(1)
+fn fix128_ball_socket_joint_solve_main() {
+    let count = params.joint_count;
+    let dt_sq = params.dt_sq;
+    if (count == 0u) { return; }
+
+    let zero = fix128_zero();
+    let one  = fix128_one();
+
+    for (var i: u32 = 0u; i < count; i = i + 1u) {
+        let j = joints[i];
+        let a = j.body_a;
+        let b = j.body_b;
+
+        let rot_a = body_rotations[a];
+        let rot_b = body_rotations[b];
+
+        // World-space anchors: anchor = position + rotate_vec(rotation, local_anchor)
+        let rotated_a = quat_rotate_vec(rot_a, j.local_anchor_a);
+        let rotated_b = quat_rotate_vec(rot_b, j.local_anchor_b);
+        let anchor_a  = vec3_add(body_positions[a], rotated_a);
+        let anchor_b  = vec3_add(body_positions[b], rotated_b);
+
+        // delta = anchor_b - anchor_a
+        let delta = vec3_sub(anchor_b, anchor_a);
+
+        // distance = sqrt(dot(delta, delta)) — matches Vec3::length()
+        let dx_sq   = fix128_mul_kernel(delta.x, delta.x);
+        let dy_sq   = fix128_mul_kernel(delta.y, delta.y);
+        let dz_sq   = fix128_mul_kernel(delta.z, delta.z);
+        let dot_xy  = fix128_add_kernel(dx_sq, dy_sq);
+        let dot_sum = fix128_add_kernel(dot_xy, dz_sq);
+        let distance = fix128_sqrt(dot_sum);
+
+        if (fix128_is_zero(distance)) { continue; }
+
+        // Baumgarte compliance: compliance_term = compliance / dt_sq
+        let compliance_term = fix128_div_kernel(j.compliance, dt_sq);
+        let ma_inv          = body_inv_masses[a];
+        let mb_inv          = body_inv_masses[b];
+        let w_ab            = fix128_add_kernel(ma_inv, mb_inv);
+        let w_sum           = fix128_add_kernel(w_ab, compliance_term);
+
+        if (fix128_is_zero(w_sum)) { continue; }
+
+        let inv_w_sum = fix128_div_kernel(one, w_sum);
+        let lambda    = fix128_mul_kernel(distance, inv_w_sum);
+
+        // normal = delta * (1/distance)
+        let inv_dist = fix128_div_kernel(one, distance);
+        var normal: Vec3FixGpu;
+        normal.x = fix128_mul_kernel(delta.x, inv_dist);
+        normal.y = fix128_mul_kernel(delta.y, inv_dist);
+        normal.z = fix128_mul_kernel(delta.z, inv_dist);
+
+        let correction = vec3_scale(normal, lambda);
+
+        if (!fix128_is_zero(ma_inv)) {
+            let delta_a = vec3_scale(correction, ma_inv);
+            body_positions[a] = vec3_add(body_positions[a], delta_a);
+        }
+        if (!fix128_is_zero(mb_inv)) {
+            let delta_b = vec3_scale(correction, mb_inv);
+            body_positions[b] = vec3_sub(body_positions[b], delta_b);
+        }
+    }
+}
+"#;
+
+/// v3.1.0 Phase 4 §2 orchestrator — dispatches
+/// [`FIX128_BALL_SOCKET_JOINT_SOLVE_WGSL`] for **one** joint-solve
+/// pass. Returns updated body positions; the joint list itself is
+/// not mutated by the solve.
+///
+/// # Contract
+///
+/// - `joints` must be the pre-filtered list of `Joint::Ball` variants
+///   (the caller — usually `TrtSolverAdapter::send_joints` — is
+///   responsible for panicking on other variants).
+/// - `positions[i]` / `rotations[i]` / `inv_masses[i]` are body `i`'s
+///   state.
+/// - `dt` is the substep length; the kernel receives `dt * dt`
+///   precomputed on CPU to avoid one Fix128 mul per joint inside the
+///   kernel body.
+/// - Empty `joints` short-circuits to `positions.to_vec()` without
+///   touching the GPU.
+///
+/// # Panics
+///
+/// - Panics if the wgpu device is lost during dispatch.
+/// - Panics if `positions.len() != rotations.len()` or
+///   `positions.len() != inv_masses.len()`.
+#[cfg(feature = "physics-solver")]
+#[must_use]
+pub fn dispatch_fix128_ball_socket_joint_solve(
+    device: &crate::device::GpuDevice,
+    joints: &[BallSocketJointGpu],
+    positions: &[Vec3FixGpu],
+    rotations: &[QuatFixGpu],
+    inv_masses: &[Fix128Gpu],
+    dt: Fix128Gpu,
+) -> Vec<Vec3FixGpu> {
+    assert_eq!(
+        positions.len(),
+        rotations.len(),
+        "positions.len() must equal rotations.len()"
+    );
+    assert_eq!(
+        positions.len(),
+        inv_masses.len(),
+        "positions.len() must equal inv_masses.len()"
+    );
+    if joints.is_empty() {
+        return positions.to_vec();
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct BallSocketSolveParams {
+        joint_count: u32,
+        _pad0: u32,
+        _pad1: u32,
+        _pad2: u32,
+        dt_sq: Fix128Gpu,
+    }
+
+    let dt_sq = dt.mul(dt);
+    let params = BallSocketSolveParams {
+        joint_count: u32::try_from(joints.len()).expect("joint_count exceeds u32::MAX"),
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+        dt_sq,
+    };
+
+    let shader = device
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fix128_ball_socket_joint_solve_shader"),
+            source: wgpu::ShaderSource::Wgsl(FIX128_BALL_SOCKET_JOINT_SOLVE_WGSL.into()),
+        });
+    let bind_group_layout =
+        device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fix128_ball_socket_joint_solve_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+    let pipeline_layout = device
+        .device()
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fix128_ball_socket_joint_solve_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let pipeline = device
+        .device()
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fix128_ball_socket_joint_solve_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("fix128_ball_socket_joint_solve_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    let buf_joints = device.create_buffer_init("ball_socket_joints", bytemuck::cast_slice(joints));
+    let buf_positions =
+        device.create_buffer_init("ball_socket_positions", bytemuck::cast_slice(positions));
+    let buf_rotations =
+        device.create_buffer_init("ball_socket_rotations", bytemuck::cast_slice(rotations));
+    let buf_inv_masses =
+        device.create_buffer_init("ball_socket_inv_masses", bytemuck::cast_slice(inv_masses));
+    let buf_params =
+        device.create_uniform_buffer("ball_socket_params", bytemuck::bytes_of(&params));
+
+    let bind_group = device
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fix128_ball_socket_joint_solve_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_joints.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_rotations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf_inv_masses.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buf_params.as_entire_binding(),
+                },
+            ],
+        });
+
+    let mut encoder = device
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fix128_ball_socket_joint_solve_encoder"),
+        });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fix128_ball_socket_joint_solve_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+    device.submit(encoder);
+    device.poll_wait();
+
+    let positions_bytes: u64 = (positions.len() * core::mem::size_of::<Vec3FixGpu>()) as u64;
+    let raw_positions = device.read_buffer(&buf_positions, positions_bytes);
+    bytemuck::cast_slice(&raw_positions).to_vec()
+}
+
+// ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
 

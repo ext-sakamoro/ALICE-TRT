@@ -2,6 +2,71 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [3.1.0] - 2026-07-08
+
+### Added — Ball-socket joint solver on GPU (Tier C Phase 4 §2)
+
+New `FIX128_BALL_SOCKET_JOINT_SOLVE_WGSL` kernel byte-exact port of `alice_physics::joint::solve_ball_joint`. Runs as a single-workgroup single-thread compute pass over the uploaded joint list, iterating top to bottom so joint `i+1` observes position updates from joint `i` — standard sequential Gauss-Seidel semantics matching the CPU reference.
+
+The algorithm inlines Fix128 add / sub / mul / div / sqrt, quaternion `mul` + `rotate_vec` (v3.1.0 Phase 4 §1 primitives landed as commit `b3dc3a0`), and Vec3 helpers. Per joint: rotate local anchors into world space via quaternion, compute `delta = anchor_b - anchor_a`, `distance = sqrt(dot(delta, delta))`, `w_sum = ma_inv + mb_inv + compliance / dt_sq`, `lambda = distance / w_sum`, `correction = normal * lambda`, apply weighted correction to `position_a` (+) and `position_b` (-). Skip conditions match CPU: `distance == 0` and `w_sum == 0` both `continue`. Static bodies (`inv_mass == 0`) skip their side of the correction application.
+
+`dt_sq = dt * dt` is precomputed on the CPU and passed via the uniform buffer, saving one Fix128 mul per joint inside the kernel body.
+
+New public API:
+
+- `pub const alice_trt::fix128::FIX128_BALL_SOCKET_JOINT_SOLVE_WGSL: &str` — the full standalone WGSL module.
+- `pub struct alice_trt::fix128::BallSocketJointGpu` (128-byte `#[repr(C)] bytemuck::Pod`) — mirror of `alice_physics::joint::BallJoint`.
+- `pub fn alice_trt::fix128::dispatch_fix128_ball_socket_joint_solve(device, joints, positions, rotations, inv_masses, dt) -> Vec<Vec3FixGpu>` — Rust orchestrator; used both by golden tests and by the `TrtSolverAdapter::dispatch_joint_solve_iteration` trait impl.
+- `impl GpuSolverBridge for TrtSolverAdapter` overrides for `send_joints` / `send_body_rotations` / `dispatch_joint_solve_iteration` (v0.12.0 trait extension on alice-physics). `send_joints` filters to `Joint::Ball` variants and **panics fail-fast** on `Hinge` / `Fixed` / `Slider` / `Spring` / `D6` / `ConeTwist` per the CLAUDE.md 「仮実装完了偽装の禁止ルール」 — silent skip would ship a bridge that produces wrong physics without complaining. Callers with mixed joint types detach the bridge before `step` or wait for the coordinated variant releases (see `docs/PHASE_4_DESIGN.md` roadmap).
+
+### Byte-exact CPU-GPU goldens (3 new)
+
+Added `#[cfg(feature = "physics-solver")]` tests in `physics_bridge::solver_bridge::tests`:
+
+- `ball_socket_joint_solve_single_joint_matches_cpu_golden` — 2 bodies 1 unit apart, zero local anchors, unit inverse masses. Exercises the core code path (quaternion rotation of zero → zero, sqrt-based distance, correction application).
+- `ball_socket_joint_solve_chain_4_body_3_joint_matches_cpu_golden` — 4 bodies at x = 0, 2, 5, 8 with joints (0-1), (1-2), (2-3). Verifies sequential dispatch preserves CPU insertion-major order across bodies shared between adjacent joints.
+- `ball_socket_joint_solve_disconnected_2_island_matches_cpu_golden` — 4 bodies in 2 disjoint pairs (0-1 and 2-3). Verifies second joint's solve does not interfere with first's updates.
+
+All three use a `cpu_ball_socket_solve` helper (~30 lines) that byte-exact ports `solve_ball_joint` into the test module, so any future divergence between the CPU reference and the GPU kernel surfaces as a hard assertion failure instead of silent drift.
+
+Total lib tests: **224 → 227** (all pass, zero regression against v3.0.0 baseline; the two Fix128 phase-1 goldens landed as intermediate commit `b3dc3a0` and account for the 222 → 224 delta).
+
+### `TrtSolverAdapter` field additions (v3.0.0 API-compatible)
+
+Two new private fields on `TrtSolverAdapter`:
+
+- `ball_socket_joints_gpu: Vec<BallSocketJointGpu>` — uploaded joint list, populated by `send_joints`.
+- `body_rotations_gpu: Vec<QuatFixGpu>` — uploaded per-body rotations, populated by `send_body_rotations`.
+
+Existing public API (constructor, contact-solve trait methods, `set_parallel_contact_solve`, distance-constraint helpers) is unchanged. `TrtSolverAdapter::new(Arc<GpuDevice>)` from v3.0.0 continues to work; no migration required beyond opt-in adoption of `world.set_gpu_solver_bridge(Some(Box::new(adapter)))` from v3.0.0 to activate the joint auto-routing.
+
+### Coordinated release — alice-physics v0.12.0
+
+alice-physics v0.11.0 → v0.12.0 ships alongside this release:
+
+- `GpuSolverBridge` trait extension: `send_joints` / `send_body_rotations` / `dispatch_joint_solve_iteration` (default `panic!`).
+- `PhysicsWorld::solve_joints_with_bridge<B>` — explicit-control entry point.
+- `PhysicsWorld::solve_joints_dispatch(dt)` — private helper called from `substep` / `substep_batched` / `substep_with_bridge`. Auto-routes through installed bridge if any; falls back to the free-function `solve_joints`.
+- 3 new tests for joint auto-routing on `PhysicsWorld`.
+
+See alice-physics `CHANGELOG.md` §[0.12.0] and `docs/PHASE_4_DESIGN.md` for the coordinated design brief.
+
+### Forward roadmap (see `docs/PHASE_4_DESIGN.md` §3)
+
+- v3.2.0 — HingeJoint (1 DOF rotational + 3 DOF positional).
+- v3.3.0 — FixedJoint (0 DOF, weld constraint).
+- v3.4.0 — SliderJoint (1 DOF translational + 3 DOF rotational).
+- v3.5.0 — SpringJoint (compliant distance).
+- v3.6.0 — D6Joint (6-DOF configurable).
+- v3.7.0 — ConeTwistJoint (ragdoll).
+
+Each follows the same v3.1.0 pattern: WGSL kernel byte-exact vs CPU reference, 3 byte-exact goldens, adapter fail-fast on other variants.
+
+### CI
+
+- 3-platform physics-solver-matrix from v2.8.1 remains active. macOS Metal + Ubuntu Vulkan lavapipe pass all 227 lib tests including the 3 new ball-socket goldens. Windows DX12 WARP continues to record the pre-existing v2.3.0 `wgpu_bvh_build_matches_cpu_golden` crash as `continue-on-error`.
+- No new WGSL kernels are excluded from the physics-solver-matrix — the ball-socket kernel is exercised on every platform that supports the physics-solver feature.
+
 ## [3.0.0] - 2026-07-08
 
 ### Breaking — `TrtSolverAdapter` no longer carries a lifetime; owns `Arc<GpuDevice>` (Tier S)

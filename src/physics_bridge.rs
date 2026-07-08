@@ -326,6 +326,23 @@ mod solver_bridge {
         /// toggle-on path. A colour-major CPU-golden ships in v2.8.0
         /// alongside this toggle.
         parallel_contact_solve: bool,
+        /// v3.1.0: uploaded ball-socket joint list. Populated by
+        /// [`GpuSolverBridge::send_joints`] and consumed by
+        /// [`GpuSolverBridge::dispatch_joint_solve_iteration`]. Only
+        /// `Joint::Ball` variants are supported in v3.1.0; other
+        /// variants (`Hinge` / `Fixed` / `Slider` / `Spring` / `D6` /
+        /// `ConeTwist`) cause `send_joints` to panic with a
+        /// "not implemented" message that names the offending variant.
+        ball_socket_joints_gpu: Vec<crate::fix128::BallSocketJointGpu>,
+        /// v3.1.0: uploaded per-body rotation array. Populated by
+        /// [`GpuSolverBridge::send_body_rotations`] and consumed
+        /// read-only by
+        /// [`GpuSolverBridge::dispatch_joint_solve_iteration`].
+        /// Callers who use only the contact-solve pipeline don't
+        /// need to populate this — the field stays empty and the
+        /// joint dispatch is a no-op when `ball_socket_joints_gpu`
+        /// is also empty.
+        body_rotations_gpu: Vec<crate::fix128::QuatFixGpu>,
     }
 
     impl TrtSolverAdapter {
@@ -631,6 +648,12 @@ mod solver_bridge {
                 // preserved for existing callers. Callers opt in via
                 // `set_parallel_contact_solve(true)`.
                 parallel_contact_solve: false,
+                // v3.1.0: joint-solve pipeline state. Empty at
+                // construction; populated by the `send_joints` and
+                // `send_body_rotations` methods on the
+                // `GpuSolverBridge` trait impl below.
+                ball_socket_joints_gpu: Vec::new(),
+                body_rotations_gpu: Vec::new(),
             }
         }
 
@@ -1413,6 +1436,54 @@ mod solver_bridge {
                     },
                 ];
             }
+        }
+
+        // ---- v3.1.0: joint-solve pipeline (via GpuSolverBridge) ----
+
+        fn send_joints(&mut self, joints: &[alice_physics::joint::Joint]) {
+            use alice_physics::joint::Joint as PhysicsJoint;
+            self.ball_socket_joints_gpu.clear();
+            self.ball_socket_joints_gpu.reserve(joints.len());
+            for j in joints {
+                match j {
+                    PhysicsJoint::Ball(ball) => {
+                        self.ball_socket_joints_gpu
+                            .push(crate::fix128::BallSocketJointGpu::from_physics(ball));
+                    }
+                    other => panic!(
+                        "TrtSolverAdapter::send_joints only supports Joint::Ball in v3.1.0; got {:?}. Hinge / Fixed / Slider / Spring / D6 / ConeTwist GPU kernels ship in later releases.",
+                        other.joint_type()
+                    ),
+                }
+            }
+        }
+
+        fn send_body_rotations(&mut self, rotations: &[[Fix128; 4]]) {
+            self.body_rotations_gpu = rotations
+                .iter()
+                .map(|q| crate::fix128::QuatFixGpu {
+                    x: Fix128Gpu::from_raw(q[0].hi, q[0].lo),
+                    y: Fix128Gpu::from_raw(q[1].hi, q[1].lo),
+                    z: Fix128Gpu::from_raw(q[2].hi, q[2].lo),
+                    w: Fix128Gpu::from_raw(q[3].hi, q[3].lo),
+                })
+                .collect();
+        }
+
+        fn dispatch_joint_solve_iteration(&mut self, dt: Fix128) {
+            if self.ball_socket_joints_gpu.is_empty() {
+                return;
+            }
+            let dt_gpu = Fix128Gpu::from_raw(dt.hi, dt.lo);
+            let updated_positions = crate::fix128::dispatch_fix128_ball_socket_joint_solve(
+                &self.device,
+                &self.ball_socket_joints_gpu,
+                &self.body_positions_gpu,
+                &self.body_rotations_gpu,
+                &self.body_inv_masses_gpu,
+                dt_gpu,
+            );
+            self.body_positions_gpu = updated_positions;
         }
     }
 
@@ -3123,6 +3194,281 @@ mod solver_bridge {
         fn trt_solver_adapter_is_send_and_sync_v3() {
             fn assert_send_sync<T: Send + Sync>() {}
             assert_send_sync::<TrtSolverAdapter>();
+        }
+
+        // -----------------------------------------------------------------
+        // v3.1.0 Phase 4 §2: ball-socket joint solve byte-exact goldens
+        // -----------------------------------------------------------------
+
+        /// CPU replay helper — walks a `Joint::Ball` list in insertion
+        /// order applying the same position correction the GPU kernel
+        /// does. Byte-exact port of `alice_physics::joint::solve_joints`
+        /// restricted to the ball-socket case.
+        #[cfg(feature = "physics-solver")]
+        fn cpu_ball_socket_solve(
+            joints: &[alice_physics::joint::BallJoint],
+            positions: &mut [alice_physics::math::Vec3Fix],
+            rotations: &[alice_physics::math::QuatFix],
+            inv_masses: &[Fix128],
+            dt: Fix128,
+        ) {
+            use alice_physics::math::Vec3Fix;
+            let dt_sq = dt * dt;
+            for j in joints {
+                let anchor_a =
+                    positions[j.body_a] + rotations[j.body_a].rotate_vec(j.local_anchor_a);
+                let anchor_b =
+                    positions[j.body_b] + rotations[j.body_b].rotate_vec(j.local_anchor_b);
+                let delta = anchor_b - anchor_a;
+                let (normal, distance) = delta.normalize_with_length();
+                if distance.is_zero() {
+                    continue;
+                }
+                let compliance_term = j.compliance / dt_sq;
+                let ma_inv = inv_masses[j.body_a];
+                let mb_inv = inv_masses[j.body_b];
+                let w_sum = ma_inv + mb_inv + compliance_term;
+                if w_sum.is_zero() {
+                    continue;
+                }
+                let inv_w_sum = Fix128::ONE / w_sum;
+                let lambda = distance * inv_w_sum;
+                let correction = normal * lambda;
+                if !ma_inv.is_zero() {
+                    let delta_a = correction * ma_inv;
+                    positions[j.body_a] = Vec3Fix::new(
+                        positions[j.body_a].x + delta_a.x,
+                        positions[j.body_a].y + delta_a.y,
+                        positions[j.body_a].z + delta_a.z,
+                    );
+                }
+                if !mb_inv.is_zero() {
+                    let delta_b = correction * mb_inv;
+                    positions[j.body_b] = Vec3Fix::new(
+                        positions[j.body_b].x - delta_b.x,
+                        positions[j.body_b].y - delta_b.y,
+                        positions[j.body_b].z - delta_b.z,
+                    );
+                }
+            }
+        }
+
+        /// Byte-exact CPU-GPU golden: single ball-socket joint between
+        /// two bodies, 1 unit apart, zero local anchors. Verifies the
+        /// core code path (quaternion rotation of zero anchor → zero,
+        /// distance calculation via sqrt, w_sum, correction) works end
+        /// to end.
+        #[cfg(feature = "physics-solver")]
+        #[test]
+        fn ball_socket_joint_solve_single_joint_matches_cpu_golden() {
+            use alice_physics::joint::BallJoint;
+            use alice_physics::math::{Fix128, QuatFix, Vec3Fix};
+
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let device = std::sync::Arc::new(device);
+
+            let dt = Fix128::from_ratio(1, 60);
+
+            let cpu_positions = vec![
+                Vec3Fix::ZERO,
+                Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+            ];
+            let cpu_rotations = vec![QuatFix::IDENTITY; 2];
+            let cpu_inv_masses = vec![Fix128::ONE, Fix128::ONE];
+            let joints = vec![BallJoint::new(0, 1, Vec3Fix::ZERO, Vec3Fix::ZERO)];
+
+            let mut cpu_p = cpu_positions.clone();
+            cpu_ball_socket_solve(&joints, &mut cpu_p, &cpu_rotations, &cpu_inv_masses, dt);
+
+            let gpu_joints: Vec<crate::fix128::BallSocketJointGpu> = joints
+                .iter()
+                .map(crate::fix128::BallSocketJointGpu::from_physics)
+                .collect();
+            let gpu_positions: Vec<crate::fix128::Vec3FixGpu> = cpu_positions
+                .iter()
+                .map(|v| crate::fix128::Vec3FixGpu::from_physics(*v))
+                .collect();
+            let gpu_rotations: Vec<crate::fix128::QuatFixGpu> = cpu_rotations
+                .iter()
+                .map(|q| crate::fix128::QuatFixGpu::from_physics(*q))
+                .collect();
+            let gpu_inv_masses: Vec<Fix128Gpu> = cpu_inv_masses
+                .iter()
+                .map(|m| Fix128Gpu::from_raw(m.hi, m.lo))
+                .collect();
+            let gpu_p = crate::fix128::dispatch_fix128_ball_socket_joint_solve(
+                &device,
+                &gpu_joints,
+                &gpu_positions,
+                &gpu_rotations,
+                &gpu_inv_masses,
+                Fix128Gpu::from_raw(dt.hi, dt.lo),
+            );
+
+            for (i, (cpu, gpu)) in cpu_p.iter().zip(gpu_p.iter()).enumerate() {
+                for (axis_name, cpu_val, gpu_val) in [
+                    ("x", cpu.x, gpu.x),
+                    ("y", cpu.y, gpu.y),
+                    ("z", cpu.z, gpu.z),
+                ] {
+                    assert_eq!(
+                        gpu_val.hi, cpu_val.hi,
+                        "body {i} {axis_name} hi mismatch — GPU {} vs CPU {}",
+                        gpu_val.hi, cpu_val.hi
+                    );
+                    assert_eq!(
+                        gpu_val.lo, cpu_val.lo,
+                        "body {i} {axis_name} lo mismatch — GPU {:#x} vs CPU {:#x}",
+                        gpu_val.lo, cpu_val.lo
+                    );
+                }
+            }
+        }
+
+        /// Byte-exact CPU-GPU golden: chain of 4 bodies with 3
+        /// ball-socket joints (0-1, 1-2, 2-3). Bodies spaced at
+        /// x = 0, 2, 5, 8 with unit inv_mass. Verifies the
+        /// in-order sequential dispatch (joint i sees positions
+        /// updated by joint i-1 in the same pass) matches CPU.
+        #[cfg(feature = "physics-solver")]
+        #[test]
+        fn ball_socket_joint_solve_chain_4_body_3_joint_matches_cpu_golden() {
+            use alice_physics::joint::BallJoint;
+            use alice_physics::math::{Fix128, QuatFix, Vec3Fix};
+
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let device = std::sync::Arc::new(device);
+
+            let dt = Fix128::from_ratio(1, 60);
+            let cpu_positions = vec![
+                Vec3Fix::new(Fix128::ZERO, Fix128::ZERO, Fix128::ZERO),
+                Vec3Fix::new(Fix128::from_int(2), Fix128::ZERO, Fix128::ZERO),
+                Vec3Fix::new(Fix128::from_int(5), Fix128::ZERO, Fix128::ZERO),
+                Vec3Fix::new(Fix128::from_int(8), Fix128::ZERO, Fix128::ZERO),
+            ];
+            let cpu_rotations = vec![QuatFix::IDENTITY; 4];
+            let cpu_inv_masses = vec![Fix128::ONE; 4];
+            let joints = vec![
+                BallJoint::new(0, 1, Vec3Fix::ZERO, Vec3Fix::ZERO),
+                BallJoint::new(1, 2, Vec3Fix::ZERO, Vec3Fix::ZERO),
+                BallJoint::new(2, 3, Vec3Fix::ZERO, Vec3Fix::ZERO),
+            ];
+
+            let mut cpu_p = cpu_positions.clone();
+            cpu_ball_socket_solve(&joints, &mut cpu_p, &cpu_rotations, &cpu_inv_masses, dt);
+
+            let gpu_joints: Vec<crate::fix128::BallSocketJointGpu> = joints
+                .iter()
+                .map(crate::fix128::BallSocketJointGpu::from_physics)
+                .collect();
+            let gpu_positions: Vec<crate::fix128::Vec3FixGpu> = cpu_positions
+                .iter()
+                .map(|v| crate::fix128::Vec3FixGpu::from_physics(*v))
+                .collect();
+            let gpu_rotations: Vec<crate::fix128::QuatFixGpu> = cpu_rotations
+                .iter()
+                .map(|q| crate::fix128::QuatFixGpu::from_physics(*q))
+                .collect();
+            let gpu_inv_masses: Vec<Fix128Gpu> = cpu_inv_masses
+                .iter()
+                .map(|m| Fix128Gpu::from_raw(m.hi, m.lo))
+                .collect();
+            let gpu_p = crate::fix128::dispatch_fix128_ball_socket_joint_solve(
+                &device,
+                &gpu_joints,
+                &gpu_positions,
+                &gpu_rotations,
+                &gpu_inv_masses,
+                Fix128Gpu::from_raw(dt.hi, dt.lo),
+            );
+
+            for (i, (cpu, gpu)) in cpu_p.iter().zip(gpu_p.iter()).enumerate() {
+                for (axis_name, cpu_val, gpu_val) in [
+                    ("x", cpu.x, gpu.x),
+                    ("y", cpu.y, gpu.y),
+                    ("z", cpu.z, gpu.z),
+                ] {
+                    assert_eq!(gpu_val.hi, cpu_val.hi, "body {i} {axis_name} hi mismatch");
+                    assert_eq!(gpu_val.lo, cpu_val.lo, "body {i} {axis_name} lo mismatch");
+                }
+            }
+        }
+
+        /// Byte-exact CPU-GPU golden: 4 bodies with 2 disconnected
+        /// ball-socket joint pairs (bodies 0-1 and 2-3, no shared
+        /// body). Verifies that the sequential kernel handles
+        /// disjoint islands correctly and that the second joint's
+        /// solve does not interfere with the first's updates.
+        #[cfg(feature = "physics-solver")]
+        #[test]
+        fn ball_socket_joint_solve_disconnected_2_island_matches_cpu_golden() {
+            use alice_physics::joint::BallJoint;
+            use alice_physics::math::{Fix128, QuatFix, Vec3Fix};
+
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let device = std::sync::Arc::new(device);
+
+            let dt = Fix128::from_ratio(1, 60);
+            let cpu_positions = vec![
+                Vec3Fix::new(Fix128::ZERO, Fix128::ZERO, Fix128::ZERO),
+                Vec3Fix::new(Fix128::from_int(3), Fix128::ZERO, Fix128::ZERO),
+                Vec3Fix::new(Fix128::from_int(10), Fix128::from_int(5), Fix128::ZERO),
+                Vec3Fix::new(Fix128::from_int(14), Fix128::from_int(5), Fix128::ZERO),
+            ];
+            let cpu_rotations = vec![QuatFix::IDENTITY; 4];
+            let cpu_inv_masses = vec![Fix128::ONE; 4];
+            let joints = vec![
+                BallJoint::new(0, 1, Vec3Fix::ZERO, Vec3Fix::ZERO),
+                BallJoint::new(2, 3, Vec3Fix::ZERO, Vec3Fix::ZERO),
+            ];
+
+            let mut cpu_p = cpu_positions.clone();
+            cpu_ball_socket_solve(&joints, &mut cpu_p, &cpu_rotations, &cpu_inv_masses, dt);
+
+            let gpu_joints: Vec<crate::fix128::BallSocketJointGpu> = joints
+                .iter()
+                .map(crate::fix128::BallSocketJointGpu::from_physics)
+                .collect();
+            let gpu_positions: Vec<crate::fix128::Vec3FixGpu> = cpu_positions
+                .iter()
+                .map(|v| crate::fix128::Vec3FixGpu::from_physics(*v))
+                .collect();
+            let gpu_rotations: Vec<crate::fix128::QuatFixGpu> = cpu_rotations
+                .iter()
+                .map(|q| crate::fix128::QuatFixGpu::from_physics(*q))
+                .collect();
+            let gpu_inv_masses: Vec<Fix128Gpu> = cpu_inv_masses
+                .iter()
+                .map(|m| Fix128Gpu::from_raw(m.hi, m.lo))
+                .collect();
+            let gpu_p = crate::fix128::dispatch_fix128_ball_socket_joint_solve(
+                &device,
+                &gpu_joints,
+                &gpu_positions,
+                &gpu_rotations,
+                &gpu_inv_masses,
+                Fix128Gpu::from_raw(dt.hi, dt.lo),
+            );
+
+            for (i, (cpu, gpu)) in cpu_p.iter().zip(gpu_p.iter()).enumerate() {
+                for (axis_name, cpu_val, gpu_val) in [
+                    ("x", cpu.x, gpu.x),
+                    ("y", cpu.y, gpu.y),
+                    ("z", cpu.z, gpu.z),
+                ] {
+                    assert_eq!(gpu_val.hi, cpu_val.hi, "body {i} {axis_name} hi mismatch");
+                    assert_eq!(gpu_val.lo, cpu_val.lo, "body {i} {axis_name} lo mismatch");
+                }
+            }
         }
     }
 }
