@@ -2,6 +2,18 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.8.1] - 2026-07-08
+
+### Added — 3-platform byte-exact CPU-GPU physics-solver golden CI lane (Tier B)
+
+New `fix128-physics-solver-matrix` job in `.github/workflows/ci.yml` extends 3-platform verification (macos-latest Metal / ubuntu-latest Vulkan lavapipe / windows-latest DX12 WARP) to the full `--features fix128-arithmetic,physics-solver` byte-exact CPU-GPU golden surface. Prior to this release the physics-solver goldens (`fix128::tests::wgpu_morton_sort_matches_cpu_golden`, `fix128::tests::wgpu_sphere_sphere_contact_matches_cpu_golden`, and all `physics_bridge::solver_bridge::tests::*matches_cpu*` / `*matches_sequential*` / `*byte_exact*` tests) only ran on Mac M2 local; CI stripped the `physics-solver` feature to avoid cloning the `alice-physics` path dep.
+
+The new job clones `alice-physics` sibling unconditionally, drops only the unrelated `alice-sdf` / `alice-db` optional path deps from `Cargo.toml`, and runs `cargo test --lib --features fix128-arithmetic,physics-solver -- --nocapture --test-threads=1`. Tests that construct a `GpuDevice` bail out gracefully on runners without a working adapter (`Ok(d) => d, Err(_) => return`), so the surface is bounded to what each runner can validate; on working adapters the byte-exact goldens fail hard on divergence.
+
+Existing jobs (`fmt` / `actionlint` / `fix128-gpu-matrix`) are unchanged, so the pre-existing fix128-only CI surface remains available for maintainers who want to iterate without the physics-solver dependency.
+
+Zero code change to `src/`, `benches/`, or public API. Patch release only.
+
 ## [2.8.0] - 2026-07-08
 
 ### Added — Parallel Gauss-Seidel PGS contact solve via graph colouring (Tier A performance)

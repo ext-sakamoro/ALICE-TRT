@@ -123,3 +123,87 @@ jobs:
         # candidates will target the 2-buffer bind group layout
         # (Phase 2) and the sequential dispatch pattern.
 
+  fix128-physics-solver-matrix:
+    # v2.8.1 (Tier B): 3-platform byte-exact CPU-GPU physics-solver
+    # golden lane. Extends the fix128-gpu-matrix job by keeping the
+    # `physics-solver` feature (and its `alice-physics` path dep) so
+    # the byte-exact CPU-GPU goldens for the Phase 3 pipeline
+    # (Morton sort / BVH build / find_pairs / sphere-sphere contact /
+    # PGS contact solve sequential + v2.8.0 batched / PhysicsWorld
+    # step_with_bridge) all run on Metal / Vulkan lavapipe / DX12 WARP
+    # instead of Mac M2 local only.
+    name: Fix128 GPU + physics-solver goldens (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned to rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: clippy
+
+      - name: Install Vulkan / Mesa (Linux only — enables lavapipe software adapter)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mesa-vulkan-drivers \
+            vulkan-tools \
+            libvulkan1 \
+            libvulkan-dev
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-physics-solver-${{ hashFiles('Cargo.toml') }}
+
+      - name: Clone ALICE-ML (unconditional path dep used by src/weights.rs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ..
+          git clone --depth 1 https://github.com/ext-sakamoro/ALICE-ML.git
+
+      - name: Clone ALICE-Physics (path dep required by physics-solver feature)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ..
+          git clone --depth 1 https://github.com/ext-sakamoro/ALICE-Physics.git
+
+      - name: Strip alice-sdf / alice-db path deps (not needed for physics-solver goldens)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep alice-physics + physics + physics-solver features. Only
+          # drop alice-sdf / alice-db (unrelated to the goldens) so CI
+          # does not need to clone them.
+          sed -i.bak '/^alice-sdf = {/d; /^alice-db = {/d' Cargo.toml
+          sed -i.bak '/^sdf = \["dep:alice-sdf"/d' Cargo.toml
+          sed -i.bak '/^db = \["dep:alice-db"/d' Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "--- stripped Cargo.toml [dependencies] ---"
+          grep -E "^(alice-|\[)" Cargo.toml || true
+
+      - name: Build (fix128-arithmetic + physics-solver)
+        run: cargo build --lib --features fix128-arithmetic,physics-solver
+
+      - name: Test — physics-solver byte-exact CPU-GPU goldens (all platforms)
+        run: cargo test --lib --features fix128-arithmetic,physics-solver -- --nocapture --test-threads=1
+        # Runs the full 221-test lib suite with physics-solver enabled.
+        # Tests that construct a `GpuDevice` bail out gracefully with
+        # `Ok(d) => d, Err(_) => return` on CI runners without a working
+        # adapter, so the surface is bounded to what the runner can
+        # actually validate. On working adapters (Mac Metal / Ubuntu
+        # Vulkan lavapipe / Windows DX12 WARP) the byte-exact CPU-GPU
+        # goldens for Phase 2/3 kernels + v2.8.0 batched PGS contact
+        # solve execute and fail hard on divergence.
+
