@@ -135,13 +135,13 @@ fn build_random_graph(
 /// `ITERS_PER_STEP` PGS iterations, returning nothing (readback is
 /// included in the timing to represent a full frame cost).
 fn run_pgs(
-    device: &GpuDevice,
+    device: &std::sync::Arc<GpuDevice>,
     parallel: bool,
     constraints: &[ContactConstraint],
     positions: &[[Fix128; 3]],
     inv_masses: &[Fix128],
 ) {
-    let mut adapter = TrtSolverAdapter::new(device);
+    let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(device));
     adapter.set_parallel_contact_solve(parallel);
     let warm_start_factor = Fix128::from_ratio(85, 100);
     let bridge: &mut dyn GpuSolverBridge = &mut adapter;
@@ -163,6 +163,7 @@ fn bench_chain(c: &mut Criterion) {
         eprintln!("No GPU available, skipping contact_solve_batched chain bench");
         return;
     };
+    let device = std::sync::Arc::new(device);
     let mut group = c.benchmark_group("contact_solve_chain");
 
     for n_constraints in [100usize, 1000, 10000] {
@@ -194,6 +195,7 @@ fn bench_random_graph(c: &mut Criterion) {
     let Ok(device) = GpuDevice::new() else {
         return;
     };
+    let device = std::sync::Arc::new(device);
     let mut group = c.benchmark_group("contact_solve_random_graph");
 
     for n_constraints in [100usize, 1000, 10000] {

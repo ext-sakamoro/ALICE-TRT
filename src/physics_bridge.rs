@@ -243,8 +243,8 @@ mod solver_bridge {
     /// directly. `dispatch_iterations` runs one dispatch per PGS
     /// iteration, each modifying `self.positions` on the GPU and
     /// reading it back into CPU memory for the next iteration.
-    pub struct TrtSolverAdapter<'a> {
-        device: &'a crate::device::GpuDevice,
+    pub struct TrtSolverAdapter {
+        device: std::sync::Arc<crate::device::GpuDevice>,
         pipeline_integrate: wgpu::ComputePipeline,
         pipeline_project_floor: wgpu::ComputePipeline,
         pipeline_project_distance: wgpu::ComputePipeline,
@@ -328,13 +328,25 @@ mod solver_bridge {
         parallel_contact_solve: bool,
     }
 
-    impl<'a> TrtSolverAdapter<'a> {
+    impl TrtSolverAdapter {
         /// Construct an empty adapter bound to `device`. The
         /// underlying compute pipeline is compiled once at
         /// construction; each `dispatch_iterations` call reuses it.
         /// Populate the buffers via `send_island` before dispatching.
+        ///
+        /// # v3.0.0 breaking change
+        ///
+        /// The `device` parameter is now `Arc<GpuDevice>` (was
+        /// `&'a GpuDevice` in v2.x). This removes the adapter's
+        /// lifetime and makes it `Send + Sync`, so it can be stored in
+        /// `PhysicsWorld`'s `gpu_solver_bridge` field (introduced in
+        /// alice-physics v0.11.0) or moved across threads. Callers
+        /// that were passing `&device` must now wrap the device in
+        /// `Arc::new(...)` at construction and pass `Arc::clone(&arc)`
+        /// per adapter. See `docs/MIGRATION_v3.md` for the mechanical
+        /// upgrade recipe.
         #[must_use]
-        pub fn new(device: &'a crate::device::GpuDevice) -> Self {
+        pub fn new(device: std::sync::Arc<crate::device::GpuDevice>) -> Self {
             let shader = device
                 .device()
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -719,7 +731,7 @@ mod solver_bridge {
                 let graph = ConstraintGraph::build(&pairs);
                 let colours = graph.greedy_color();
                 crate::fix128::dispatch_fix128_pgs_contact_solve_batched(
-                    self.device,
+                    &self.device,
                     constraints,
                     positions,
                     inv_masses,
@@ -728,7 +740,7 @@ mod solver_bridge {
                 )
             } else {
                 dispatch_fix128_pgs_contact_solve(
-                    self.device,
+                    &self.device,
                     constraints,
                     positions,
                     inv_masses,
@@ -988,7 +1000,7 @@ mod solver_bridge {
         }
     }
 
-    impl GpuSolverBridge for TrtSolverAdapter<'_> {
+    impl GpuSolverBridge for TrtSolverAdapter {
         fn send_island(&mut self, positions: &[[Fix128; 3]], velocities: &[[Fix128; 3]]) {
             self.positions.clear();
             for p in positions {
@@ -1340,7 +1352,7 @@ mod solver_bridge {
                 let graph = ConstraintGraph::build(&pairs);
                 let colours = graph.greedy_color();
                 crate::fix128::dispatch_fix128_pgs_contact_solve_batched(
-                    self.device,
+                    &self.device,
                     &self.contact_constraints_gpu,
                     &self.body_positions_gpu,
                     &self.body_inv_masses_gpu,
@@ -1349,7 +1361,7 @@ mod solver_bridge {
                 )
             } else {
                 dispatch_fix128_pgs_contact_solve(
-                    self.device,
+                    &self.device,
                     &self.contact_constraints_gpu,
                     &self.body_positions_gpu,
                     &self.body_inv_masses_gpu,
@@ -1416,7 +1428,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             let positions = vec![
                 [
                     Fix128::from_raw(1, 0xDEAD_BEEF_0000_0001),
@@ -1466,7 +1479,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             let positions = vec![
                 [
@@ -1569,7 +1583,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Simple deterministic gravity (avoids the non-deterministic
             // `Fix128::from_f64` path used by realistic -9.81 constants).
@@ -1659,7 +1674,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             let gravity = [Fix128::ZERO, Fix128::NEG_ONE, Fix128::ZERO];
             adapter.set_gravity(gravity);
@@ -1762,7 +1778,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Two bodies on the X axis; rest length = 2, initial d = 4.
             let positions = vec![
@@ -1826,7 +1843,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Three bodies roughly in an equilateral triangle;
             // constraints ask each pair to be distance 2.
@@ -1888,7 +1906,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             assert_eq!(adapter.distance_constraint_count(), 0);
             assert!(!adapter.has_distance_constraints());
 
@@ -1920,7 +1939,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             assert!(adapter.parallel_dispatch_enabled());
             adapter.set_parallel_dispatch(false);
             assert!(!adapter.parallel_dispatch_enabled());
@@ -1944,6 +1964,7 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
+            let device = std::sync::Arc::new(device);
 
             let positions = vec![
                 [Fix128::ZERO, Fix128::ZERO, Fix128::ZERO],
@@ -1957,7 +1978,7 @@ mod solver_bridge {
             // Sequential (toggle OFF) baseline. v1.6.0 flipped the
             // default to ON, so the sequential path now needs an
             // explicit opt-out.
-            let mut seq = TrtSolverAdapter::new(&device);
+            let mut seq = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             seq.set_parallel_dispatch(false);
             seq.send_island(&positions, &velocities);
             seq.push_distance_constraint(0, 1, Fix128::from_int(2));
@@ -1968,7 +1989,7 @@ mod solver_bridge {
             seq.recv_island(&mut seq_pos, &mut seq_vel);
 
             // Parallel (toggle ON).
-            let mut par = TrtSolverAdapter::new(&device);
+            let mut par = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             par.set_parallel_dispatch(true);
             par.send_island(&positions, &velocities);
             par.push_distance_constraint(0, 1, Fix128::from_int(2));
@@ -2011,6 +2032,7 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
+            let device = std::sync::Arc::new(device);
 
             // 4-body chain, initial spacing 3 m, rest length 2 m.
             let initial_positions = vec![
@@ -2031,7 +2053,7 @@ mod solver_bridge {
                 .collect();
 
             // GPU: parallel dispatch enabled.
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             adapter.set_parallel_dispatch(true);
             adapter.send_island(&initial_positions, &initial_velocities);
             for &(a, b, rest) in &distance_constraints {
@@ -2118,6 +2140,7 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
+            let device = std::sync::Arc::new(device);
 
             // 4-body chain, initial spacing 3 m, rest length 2 m —
             // constraints should pull each pair closer to 2 m.
@@ -2129,7 +2152,7 @@ mod solver_bridge {
             ];
             let velocities = vec![[Fix128::ZERO; 3]; 4];
 
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             adapter.set_parallel_dispatch(true);
             adapter.send_island(&positions, &velocities);
             adapter.push_distance_constraint(0, 1, Fix128::from_int(2));
@@ -2170,7 +2193,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             adapter.push_distance_constraint(0, 1, Fix128::from_int(2));
             adapter.clear_distance_constraints();
 
@@ -2222,7 +2246,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return, // Headless CI, skip.
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
             let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
@@ -2393,8 +2418,9 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
-            let mut adapter_batched = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
+            let mut adapter_batched = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
 
@@ -2488,7 +2514,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Build a chain-6 fixture (bodies at x = 0, 2, 4, 6, 8, 10;
             // radius 1.1) with a single 60Hz step. Adjacent pairs
@@ -2582,7 +2609,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             fn build_world() -> PhysicsWorld {
                 let mut world = PhysicsWorld::new(alice_physics::solver::SolverConfig::default());
@@ -2641,7 +2669,8 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let device = std::sync::Arc::new(device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Two bodies far apart → no collision → contact_constraints
             // stays empty and solve_contact_constraints does nothing.
@@ -2752,6 +2781,7 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
+            let device = std::sync::Arc::new(device);
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
             let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
@@ -2792,7 +2822,7 @@ mod solver_bridge {
             let mut gpu_c = constraints.clone();
             let mut gpu_p = positions.clone();
             {
-                let mut adapter = TrtSolverAdapter::new(&device);
+                let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
                 adapter.set_parallel_contact_solve(true);
                 let bridge: &mut dyn GpuSolverBridge = &mut adapter;
                 bridge.send_contact_constraints(&gpu_c);
@@ -2866,6 +2896,7 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
+            let device = std::sync::Arc::new(device);
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
             let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
@@ -2904,7 +2935,7 @@ mod solver_bridge {
             let mut gpu_c = constraints.clone();
             let mut gpu_p = positions.clone();
             {
-                let mut adapter = TrtSolverAdapter::new(&device);
+                let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
                 adapter.set_parallel_contact_solve(true);
                 let bridge: &mut dyn GpuSolverBridge = &mut adapter;
                 bridge.send_contact_constraints(&gpu_c);
@@ -2977,6 +3008,7 @@ mod solver_bridge {
                 Ok(d) => d,
                 Err(_) => return,
             };
+            let device = std::sync::Arc::new(device);
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
             let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
@@ -3022,7 +3054,7 @@ mod solver_bridge {
             let mut gpu_c = constraints.clone();
             let mut gpu_p = positions.clone();
             {
-                let mut adapter = TrtSolverAdapter::new(&device);
+                let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
                 adapter.set_parallel_contact_solve(true);
                 let bridge: &mut dyn GpuSolverBridge = &mut adapter;
                 bridge.send_contact_constraints(&gpu_c);
@@ -3073,6 +3105,24 @@ mod solver_bridge {
                     );
                 }
             }
+        }
+
+        // -----------------------------------------------------------------
+        // v3.0.0: compile-time Send + Sync contract check
+        // -----------------------------------------------------------------
+
+        /// v3.0.0 compile-time contract check: `TrtSolverAdapter` (no
+        /// lifetime, holds `Arc<GpuDevice>`) is `Send + Sync`. This is
+        /// what makes it eligible for the
+        /// `PhysicsWorld::set_gpu_solver_bridge` field on alice-physics
+        /// v0.11.0+, whose bound is
+        /// `Box<dyn GpuSolverBridge + Send + Sync>`. Broken bounds
+        /// surface as compile errors on this line rather than as
+        /// runtime failures when installing on the world.
+        #[test]
+        fn trt_solver_adapter_is_send_and_sync_v3() {
+            fn assert_send_sync<T: Send + Sync>() {}
+            assert_send_sync::<TrtSolverAdapter>();
         }
     }
 }

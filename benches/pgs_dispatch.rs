@@ -63,6 +63,7 @@ fn bench_iters(c: &mut Criterion) {
         eprintln!("No GPU available, skipping PGS dispatch benchmarks");
         return;
     };
+    let device = std::sync::Arc::new(device);
     let mut group = c.benchmark_group("pgs_iters_at_n_256");
 
     let (positions, velocities) = build_island(256);
@@ -71,7 +72,7 @@ fn bench_iters(c: &mut Criterion) {
     for iters in [1u32, 4, 16, 64, 256] {
         group.bench_with_input(BenchmarkId::new("iters", iters), &iters, |b, &iters| {
             b.iter(|| {
-                let mut adapter = TrtSolverAdapter::new(&device);
+                let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
                 adapter.send_island(&positions, &velocities);
                 adapter.dispatch_iterations(iters, dt);
                 black_box(&adapter);
@@ -85,6 +86,7 @@ fn bench_bodies(c: &mut Criterion) {
     let Ok(device) = GpuDevice::new() else {
         return;
     };
+    let device = std::sync::Arc::new(device);
     let mut group = c.benchmark_group("pgs_bodies_at_16_iters");
 
     let dt = Fix128::from_ratio(1, 60);
@@ -92,7 +94,7 @@ fn bench_bodies(c: &mut Criterion) {
         let (positions, velocities) = build_island(n);
         group.bench_with_input(BenchmarkId::new("bodies", n), &n, |b, _n| {
             b.iter(|| {
-                let mut adapter = TrtSolverAdapter::new(&device);
+                let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
                 adapter.send_island(&positions, &velocities);
                 adapter.dispatch_iterations(16, dt);
                 black_box(&adapter);
@@ -106,6 +108,7 @@ fn bench_kernel_compositions(c: &mut Criterion) {
     let Ok(device) = GpuDevice::new() else {
         return;
     };
+    let device = std::sync::Arc::new(device);
     let mut group = c.benchmark_group("pgs_kernel_compositions");
 
     let (positions, velocities) = build_island(1024);
@@ -114,7 +117,7 @@ fn bench_kernel_compositions(c: &mut Criterion) {
     // v0.9.0 baseline — no gravity, no floor: pure `p += v * dt`.
     group.bench_function("v0_9_0_baseline_p_plus_v_dt", |b| {
         b.iter(|| {
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             adapter.send_island(&positions, &velocities);
             adapter.dispatch_iterations(16, dt);
             black_box(&adapter);
@@ -124,7 +127,7 @@ fn bench_kernel_compositions(c: &mut Criterion) {
     // v0.9.1 — gravity added (velocities become read/write).
     group.bench_function("v0_9_1_with_gravity", |b| {
         b.iter(|| {
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             adapter.set_gravity([Fix128::ZERO, Fix128::NEG_ONE, Fix128::ZERO]);
             adapter.send_island(&positions, &velocities);
             adapter.dispatch_iterations(16, dt);
@@ -135,7 +138,7 @@ fn bench_kernel_compositions(c: &mut Criterion) {
     // v0.9.2 — gravity + floor: two kernels per iteration.
     group.bench_function("v0_9_2_with_gravity_and_floor", |b| {
         b.iter(|| {
-            let mut adapter = TrtSolverAdapter::new(&device);
+            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             adapter.set_gravity([Fix128::ZERO, Fix128::NEG_ONE, Fix128::ZERO]);
             adapter.set_floor_enabled(true);
             adapter.send_island(&positions, &velocities);

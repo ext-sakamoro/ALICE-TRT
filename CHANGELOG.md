@@ -2,6 +2,55 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [3.0.0] - 2026-07-08
+
+### Breaking — `TrtSolverAdapter` no longer carries a lifetime; owns `Arc<GpuDevice>` (Tier S)
+
+`TrtSolverAdapter<'a>` becomes `TrtSolverAdapter`. `device: &'a GpuDevice` becomes `device: std::sync::Arc<crate::device::GpuDevice>`. `pub fn new(device: &'a GpuDevice)` becomes `pub fn new(device: Arc<GpuDevice>)`. `impl GpuSolverBridge for TrtSolverAdapter<'_>` becomes `impl GpuSolverBridge for TrtSolverAdapter`.
+
+The adapter is now statically `Send + Sync`, which is what unlocks the alice-physics v0.11.0 auto-routing pattern (`PhysicsWorld::set_gpu_solver_bridge(Some(Box::new(adapter)))`). A compile-time assertion in the lib test suite (`trt_solver_adapter_is_send_and_sync_v3`) guarantees the bound stays satisfied on future field additions.
+
+Every non-`new` method on `TrtSolverAdapter` keeps its v2.x signature and behaviour. All 221 v2.8.1 byte-exact CPU-GPU goldens pass on v3.0.0 unchanged (**221 → 222** with the added Send + Sync test, zero regression).
+
+### Migration
+
+Mechanical, ~28 call-site update. See `docs/MIGRATION_v3.md` for the four common patterns (single adapter, multiple adapters reusing device, benchmark helper, game-engine shared device). Summary:
+
+```rust
+// v2.x
+let device = GpuDevice::new().unwrap();
+let mut adapter = TrtSolverAdapter::new(&device);
+
+// v3.0.0
+let device = std::sync::Arc::new(GpuDevice::new().unwrap());
+let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
+```
+
+The internal 22 test call sites and 6 benchmark call sites (`benches/pgs_dispatch.rs` and `benches/contact_solve_batched.rs`) are all migrated in this release. Downstream consumers pick up the migration on their upgrade path.
+
+### Coordinated release — alice-physics v0.11.0
+
+alice-physics v0.11.0 ships alongside v3.0.0 with the field-based auto-routing that motivates this refactor:
+
+- `PhysicsWorld::set_gpu_solver_bridge(Option<Box<dyn GpuSolverBridge + Send + Sync>>)`
+- `PhysicsWorld::take_gpu_solver_bridge() -> Option<Box<dyn ...>>`
+- `PhysicsWorld::gpu_solver_bridge_installed() -> bool`
+
+Once a bridge is installed on a `PhysicsWorld`, every subsequent `step` / `substep` transparently routes contact-solve through the bridge — no `_with_bridge` call required. The v0.10.0 explicit helper methods (`solve_contact_constraints_with_bridge` / `substep_with_bridge` / `step_with_bridge`) remain unchanged and continue to work with an externally-owned bridge as an escape hatch. See alice-physics `CHANGELOG.md` §[0.11.0] for the coordinated release notes.
+
+### Why v3.0.0 now instead of continuing v2.x
+
+The v2.8.0 CHANGELOG previewed this trade-off: the v0.10.0 helper-method pattern gives explicit control at the cost of requiring every caller to hold both the world and the bridge in scope. Game-engine wrappers and simple "install once, step forever" hosts wanted the world to own the bridge and route transparently. That requires `Box<dyn GpuSolverBridge + Send + Sync>`, which requires `TrtSolverAdapter` to be `'static + Send + Sync`, which requires `Arc<GpuDevice>` instead of `&'a GpuDevice`. There is no way to get the auto-routing UX without the breaking change, so v3.0.0 delivers it now rather than accumulating more v2.x code that would then face the same migration later.
+
+### CI
+
+- 3-platform physics-solver-matrix (macOS Metal / Ubuntu Vulkan lavapipe / Windows DX12 WARP) from v2.8.1 remains active and confirms the byte-exact contract on v3.0.0.
+- Windows DX12 WARP continues to record the pre-existing v2.3.0 `wgpu_bvh_build_matches_cpu_golden` crash as `continue-on-error`; unchanged from v2.8.1.
+
+### Documentation
+
+- `docs/MIGRATION_v3.md` — full four-pattern migration guide with commented before/after diffs.
+
 ## [2.8.1] - 2026-07-08
 
 ### Added — 3-platform byte-exact CPU-GPU physics-solver golden CI lane (Tier B)
