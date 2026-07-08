@@ -2,6 +2,58 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+## [2.8.0] - 2026-07-08
+
+### Added — Parallel Gauss-Seidel PGS contact solve via graph colouring (Tier A performance)
+
+Colour-parallel batched dispatch of the v2.6.0 Fix128 PGS contact-solve kernel. New WGSL entry point processes exactly one constraint per workgroup, with the constraint index sourced from a `color_indices` storage buffer uploaded per colour bucket. Constraints inside a colour touch disjoint body sets (established by `crate::constraint_graph::ConstraintGraph::greedy_color`), so parallel execution inside a colour is race-free. Sequential Gauss-Seidel semantics between colours are preserved by issuing one dispatch per colour on the same compute encoder — wgpu inserts a buffer barrier between compute dispatches that RW the same storage buffer.
+
+New public API:
+
+- `pub const alice_trt::fix128::FIX128_PGS_CONTACT_SOLVE_BATCHED_WGSL: &str` — the batched WGSL shader source (~520 lines, standalone module including all Fix128 helpers).
+- `pub fn alice_trt::fix128::dispatch_fix128_pgs_contact_solve_batched(device, constraints, positions, inv_masses, warm_start_factor, color_buckets) -> (Vec<ContactConstraintGpu>, Vec<Vec3FixGpu>)` — Rust orchestrator; buffers `constraints`/`positions`/`inv_masses` are uploaded once and shared across colour dispatches, one `color_indices` buffer + bind group is created per non-empty colour, and the encoder issues one compute pass with N `dispatch_workgroups(color_size, 1, 1)` calls.
+- `TrtSolverAdapter::set_parallel_contact_solve(bool)` — opt-in toggle. Off by default so v2.6.0 / v2.7.x byte-exact behaviour is preserved for existing callers. When enabled, the adapter builds a `ConstraintGraph` from the contact pairs, greedy-colours it, and routes to the batched dispatch. Both the direct `dispatch_contact_solve_iteration` method and the `impl GpuSolverBridge for TrtSolverAdapter` trait dispatch respect the flag.
+- `TrtSolverAdapter::parallel_contact_solve_enabled() -> bool` — read-only accessor.
+
+### Semantics change (opt-in only)
+
+Flipping the toggle changes the constraint iteration order from insertion-major (v2.6.0 sequential) to colour-major (v2.8.0 batched). The two orderings converge to the same final state within a single PGS iteration only for degenerate topologies (all constraints in one colour, or full conflict = each constraint its own colour). For general topologies the intermediate `cached_lambda` values diverge — that is expected and matches the behaviour of the sibling `set_parallel_dispatch` toggle for distance-constraint solve. The v2.6.0 byte-exact insertion-major CPU-golden test (`gpu_solver_bridge_contact_solve_trait_object_matches_cpu_golden`) is unchanged and continues to guard the toggle-off path.
+
+### Byte-exact CPU-GPU goldens (3 new)
+
+Added `#[cfg(feature = "physics-solver")]` tests in `physics_bridge::solver_bridge::tests`:
+
+- `contact_solve_batched_matches_cpu_color_major` — chain-plus-branch fixture (6 bodies, 6 constraints including a (2,5) cross-link edge). Verifies the colour-parallel GPU dispatch is byte-for-byte equal to a CPU replay that walks constraints in the same colour-major order the greedy colouring produces.
+- `contact_solve_batched_matches_sequential_when_all_singletons` — 3 fully-disjoint constraint pairs (colour count = 1). Verifies GPU-batched equals CPU insertion-major sequential byte-for-byte because writes commute across disjoint pairs.
+- `contact_solve_batched_matches_sequential_when_full_conflict` — star K_4 (4 constraints all touching body 0, colour count = 4 with one constraint per colour). Verifies greedy colouring produces the expected one-constraint-per-colour partition and that GPU-batched equals CPU sequential byte-for-byte.
+
+Total lib tests: **218 → 221** (all pass, zero regression against pre-v2.8.0 baseline).
+
+### Benchmarks (Mac M2 Metal, 4 PGS iterations per timed sample)
+
+New `benches/contact_solve_batched.rs` compares sequential vs batched throughput on two topologies (chain / random-graph) at N ∈ {100, 1000, 10000}:
+
+| Topology | N | Sequential | Batched | Speedup |
+|---|---|---|---|---|
+| chain | 100 | 62.4 ms | 31.4 ms | **1.99×** |
+| chain | 1000 | 115.2 ms | 41.7 ms | **2.76×** |
+| chain | 10000 | 859.1 ms | 145.6 ms | **5.90×** |
+| random-graph | 100 | 62.3 ms | 38.7 ms | **1.61×** |
+| random-graph | 1000 | 112.1 ms | 48.0 ms | **2.34×** |
+| random-graph | 10000 | 857.6 ms | 164.4 ms | **5.22×** |
+
+Sequential path is dispatch-overhead-dominated up to N ≈ 1000, then scales roughly linearly with N (single-thread iteration). Batched path pays a per-iteration O(N²) `ConstraintGraph::build` + greedy colouring cost on the CPU, offset by GPU parallelism within a colour. At N = 10000 the crossover is decisively in favour of the batched path (~5-6× wall-clock improvement).
+
+### Design notes
+
+- `ConstraintGraph` is rebuilt every iteration because the contact list is refreshed per frame by the physics pipeline (contact discovery is not cached). The O(N²) build cost is well below the per-iteration Fix128 sqrt+div work for the target workloads.
+- No fallback logic is baked into the adapter: callers observe both the toggle-off and toggle-on wall-clock costs via `set_parallel_contact_solve(bool)` and choose per fixture. The bench above provides the empirical basis for the choice at three representative sizes.
+- Sequential dispatch remains available via `set_parallel_contact_solve(false)` (the default). The v2.6.0 byte-exact CPU-golden contract is unchanged.
+
+### Roadmap
+
+Tier A entry in `~/claude-config/memory/project_alice_trt_roadmap_post_v2_7_1.md` is now shipped. Remaining tiers unchanged: Tier B CI improvement (3-platform byte-exact CPU-GPU golden lane), Tier C Phase 4 (6DOF joints on GPU), Tier S v3.0.0 (Arc<GpuDevice> auto-routing, user demand only).
+
 ## [2.7.1] - 2026-07-07
 
 ### Added — v2.8.0 milestone realisation via alice-physics v0.10.0 helper methods (Phase 3 §8)

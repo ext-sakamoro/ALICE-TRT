@@ -1,6 +1,6 @@
 [package]
 name = "alice-trt"
-version = "2.7.1"
+version = "2.8.0"
 edition = "2021"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 description = "GPU Ternary Inference Engine - Don't move data. Move the law."
@@ -50,6 +50,11 @@ harness = false
 
 [[bench]]
 name = "pgs_dispatch"
+harness = false
+required-features = ["physics-solver"]
+
+[[bench]]
+name = "contact_solve_batched"
 harness = false
 required-features = ["physics-solver"]
 

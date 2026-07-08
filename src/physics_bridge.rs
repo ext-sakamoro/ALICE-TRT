@@ -312,6 +312,20 @@ mod solver_bridge {
         /// [`GpuSolverBridge::dispatch_contact_solve_iteration`].
         /// Element `i == Fix128Gpu::ZERO` marks body `i` as static.
         body_inv_masses_gpu: Vec<Fix128Gpu>,
+        /// v2.8.0: opt-in toggle for the batched (colour-parallel)
+        /// PGS contact-solve dispatch. When `false` (default), the
+        /// adapter uses the v2.6.0 sequential Gauss-Seidel path with
+        /// its full byte-exact CPU-golden contract. When `true`, the
+        /// adapter builds a [`ConstraintGraph`] from the contact
+        /// pairs, greedy-colours it, and dispatches one compute call
+        /// per colour using
+        /// [`crate::fix128::FIX128_PGS_CONTACT_SOLVE_BATCHED_WGSL`].
+        /// Semantics change: the constraint iteration order becomes
+        /// colour-major instead of insertion-major, so the v2.6.0
+        /// insertion-major CPU-golden test no longer applies to the
+        /// toggle-on path. A colour-major CPU-golden ships in v2.8.0
+        /// alongside this toggle.
+        parallel_contact_solve: bool,
     }
 
     impl<'a> TrtSolverAdapter<'a> {
@@ -600,6 +614,11 @@ mod solver_bridge {
                 contact_constraints_gpu: Vec::new(),
                 body_positions_gpu: Vec::new(),
                 body_inv_masses_gpu: Vec::new(),
+                // v2.8.0: colour-parallel contact-solve toggle. Off by
+                // default so v2.6.0 / v2.7.x byte-exact behaviour is
+                // preserved for existing callers. Callers opt in via
+                // `set_parallel_contact_solve(true)`.
+                parallel_contact_solve: false,
             }
         }
 
@@ -618,6 +637,36 @@ mod solver_bridge {
         #[must_use]
         pub const fn parallel_dispatch_enabled(&self) -> bool {
             self.parallel_dispatch
+        }
+
+        /// v2.8.0: toggle the colour-parallel (batched) PGS contact-solve
+        /// dispatch path. Off by default so v2.6.0 byte-exact behaviour
+        /// is preserved for existing callers. When enabled, the adapter
+        /// greedy-colours the contact-constraint graph and dispatches
+        /// one compute call per colour using
+        /// [`crate::fix128::FIX128_PGS_CONTACT_SOLVE_BATCHED_WGSL`].
+        ///
+        /// # Semantics change
+        ///
+        /// Flipping this flag changes the constraint iteration order
+        /// from insertion-major (v2.6.0 sequential) to colour-major
+        /// (v2.8.0 batched). The two orderings converge to the same
+        /// final state within a single PGS iteration only for
+        /// degenerate topologies (all constraints in one colour, or
+        /// full conflict = each constraint its own colour). For
+        /// general topologies the intermediate `cached_lambda` values
+        /// diverge — that is expected and matches the behaviour of
+        /// the sibling `set_parallel_dispatch` toggle for
+        /// distance-constraint solve.
+        pub fn set_parallel_contact_solve(&mut self, enabled: bool) {
+            self.parallel_contact_solve = enabled;
+        }
+
+        /// v2.8.0: current toggle state for the batched contact-solve
+        /// dispatch. See [`Self::set_parallel_contact_solve`].
+        #[must_use]
+        pub const fn parallel_contact_solve_enabled(&self) -> bool {
+            self.parallel_contact_solve
         }
 
         /// v2.6.0 opt-in: run one iteration of GPU PGS contact solve.
@@ -657,13 +706,35 @@ mod solver_bridge {
             inv_masses: &[Fix128Gpu],
             warm_start_factor: Fix128Gpu,
         ) -> (Vec<ContactConstraintGpu>, Vec<Vec3FixGpu>) {
-            dispatch_fix128_pgs_contact_solve(
-                self.device,
-                constraints,
-                positions,
-                inv_masses,
-                warm_start_factor,
-            )
+            if self.parallel_contact_solve {
+                // v2.8.0: colour-parallel batched path. Extract body
+                // pairs, build the conflict graph, greedy-colour it,
+                // and dispatch one compute call per colour. Empty
+                // constraint list is handled inside
+                // `dispatch_fix128_pgs_contact_solve_batched`.
+                let pairs: Vec<(usize, usize)> = constraints
+                    .iter()
+                    .map(|c| (c.body_a as usize, c.body_b as usize))
+                    .collect();
+                let graph = ConstraintGraph::build(&pairs);
+                let colours = graph.greedy_color();
+                crate::fix128::dispatch_fix128_pgs_contact_solve_batched(
+                    self.device,
+                    constraints,
+                    positions,
+                    inv_masses,
+                    warm_start_factor,
+                    &colours,
+                )
+            } else {
+                dispatch_fix128_pgs_contact_solve(
+                    self.device,
+                    constraints,
+                    positions,
+                    inv_masses,
+                    warm_start_factor,
+                )
+            }
         }
 
         /// Set the per-axis gravity vector applied at every iteration
@@ -1253,13 +1324,38 @@ mod solver_bridge {
 
         fn dispatch_contact_solve_iteration(&mut self, warm_start_factor: Fix128) {
             let wsf_gpu = Fix128Gpu::from_raw(warm_start_factor.hi, warm_start_factor.lo);
-            let (updated_constraints, updated_positions) = dispatch_fix128_pgs_contact_solve(
-                self.device,
-                &self.contact_constraints_gpu,
-                &self.body_positions_gpu,
-                &self.body_inv_masses_gpu,
-                wsf_gpu,
-            );
+            let (updated_constraints, updated_positions) = if self.parallel_contact_solve {
+                // v2.8.0: colour-parallel batched path. Rebuild the
+                // conflict graph every iteration because the contact
+                // list is refreshed per frame by the physics pipeline
+                // (contact discovery is not cached). Build cost is
+                // O(N²) in constraint count, which is well below the
+                // per-iteration Fix128 sqrt+div work for the target
+                // workloads.
+                let pairs: Vec<(usize, usize)> = self
+                    .contact_constraints_gpu
+                    .iter()
+                    .map(|c| (c.body_a as usize, c.body_b as usize))
+                    .collect();
+                let graph = ConstraintGraph::build(&pairs);
+                let colours = graph.greedy_color();
+                crate::fix128::dispatch_fix128_pgs_contact_solve_batched(
+                    self.device,
+                    &self.contact_constraints_gpu,
+                    &self.body_positions_gpu,
+                    &self.body_inv_masses_gpu,
+                    wsf_gpu,
+                    &colours,
+                )
+            } else {
+                dispatch_fix128_pgs_contact_solve(
+                    self.device,
+                    &self.contact_constraints_gpu,
+                    &self.body_positions_gpu,
+                    &self.body_inv_masses_gpu,
+                    wsf_gpu,
+                )
+            };
             self.contact_constraints_gpu = updated_constraints;
             self.body_positions_gpu = updated_positions;
         }
@@ -2578,6 +2674,404 @@ mod solver_bridge {
                 assert_eq!(cpu_b.position.y.lo, gpu_b.position.y.lo);
                 assert_eq!(cpu_b.position.z.hi, gpu_b.position.z.hi);
                 assert_eq!(cpu_b.position.z.lo, gpu_b.position.z.lo);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // v2.8.0 parallel Gauss-Seidel PGS contact solve: byte-exact
+        // colour-major CPU-GPU goldens.
+        // -----------------------------------------------------------------
+
+        /// CPU replay of the Stage B PGS contact-solve inner loop
+        /// (`solver::PhysicsWorld::solve_contact_constraints`), keyed
+        /// by an explicit constraint index. Used by the batched goldens
+        /// below to walk constraints in colour-major order.
+        #[cfg(feature = "physics-solver")]
+        fn cpu_stage_b_at(
+            constraints: &mut [alice_physics::solver::ContactConstraint],
+            positions: &mut [[Fix128; 3]],
+            inv_masses: &[Fix128],
+            warm_start_factor: Fix128,
+            w_sum_epsilon: Fix128,
+            ci: usize,
+        ) {
+            use alice_physics::math::Vec3Fix;
+            let c = constraints[ci];
+            if c.contact.depth <= Fix128::ZERO {
+                return;
+            }
+            let ma_inv = inv_masses[c.body_a];
+            let mb_inv = inv_masses[c.body_b];
+            let w_sum = ma_inv + mb_inv;
+            if w_sum < w_sum_epsilon {
+                return;
+            }
+            let inv_w_sum = Fix128::ONE / w_sum;
+            let biased = c.contact.depth - c.cached_lambda * warm_start_factor;
+            let lambda = if biased > Fix128::ZERO {
+                biased
+            } else {
+                Fix128::ZERO
+            };
+            constraints[ci].cached_lambda = lambda;
+            let correction = c.contact.normal * lambda;
+            let ca = correction * (ma_inv * inv_w_sum);
+            let cb = correction * (mb_inv * inv_w_sum);
+            if !ma_inv.is_zero() {
+                let p = &mut positions[c.body_a];
+                let updated = Vec3Fix::new(p[0], p[1], p[2]) + ca;
+                *p = [updated.x, updated.y, updated.z];
+            }
+            if !mb_inv.is_zero() {
+                let p = &mut positions[c.body_b];
+                let updated = Vec3Fix::new(p[0], p[1], p[2]) - cb;
+                *p = [updated.x, updated.y, updated.z];
+            }
+        }
+
+        /// Byte-exact CPU-GPU golden for the v2.8.0 batched contact-solve
+        /// path on a non-trivial topology (chain-plus-branch, 6 bodies,
+        /// 6 constraints). The CPU walks constraints in colour-major
+        /// order using the same greedy colouring as the GPU dispatch;
+        /// the GPU is driven via the opt-in
+        /// `TrtSolverAdapter::set_parallel_contact_solve(true)`.
+        ///
+        /// Topology: 6 bodies at x = 0, 2, 4, 6, 8, 10; radius 1.1.
+        /// Constraints: (0,1), (1,2), (2,3), (3,4), (4,5), (2,5).
+        /// The (2,5) edge cross-links the chain — greedy colouring
+        /// produces a 3-colour partition (verified in-test).
+        #[cfg(feature = "physics-solver")]
+        #[test]
+        fn contact_solve_batched_matches_cpu_color_major() {
+            use crate::constraint_graph::ConstraintGraph;
+            use alice_physics::collider::Contact;
+            use alice_physics::math::{Fix128, Vec3Fix};
+            use alice_physics::solver::ContactConstraint;
+
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+
+            let warm_start_factor = Fix128::from_ratio(85, 100);
+            let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
+
+            let positions: Vec<[Fix128; 3]> = (0..6i64)
+                .map(|i| [Fix128::from_int(i * 2), Fix128::ZERO, Fix128::ZERO])
+                .collect();
+            let inv_masses: Vec<Fix128> = (0..6).map(|_| Fix128::from_int(1)).collect();
+            let mut pairs_usize: Vec<(usize, usize)> =
+                vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (2, 5)];
+            let constraints: Vec<ContactConstraint> = pairs_usize
+                .iter()
+                .map(|&(a, b)| ContactConstraint {
+                    body_a: a,
+                    body_b: b,
+                    contact: Contact {
+                        depth: Fix128::from_ratio(2, 10),
+                        normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                        point_a: Vec3Fix::ZERO,
+                        point_b: Vec3Fix::ZERO,
+                    },
+                    friction: Fix128::from_ratio(3, 10),
+                    restitution: Fix128::from_ratio(2, 10),
+                    cached_lambda: Fix128::ZERO,
+                })
+                .collect();
+
+            // Colour the graph exactly the same way the adapter will.
+            let colours = ConstraintGraph::build(&pairs_usize).greedy_color();
+            // Sanity: chain-plus-branch is expected to need > 1 colour.
+            assert!(
+                colours.len() > 1,
+                "expected multi-colour partition; got {} colour(s)",
+                colours.len()
+            );
+
+            // Drive the GPU through the batched path.
+            let mut gpu_c = constraints.clone();
+            let mut gpu_p = positions.clone();
+            {
+                let mut adapter = TrtSolverAdapter::new(&device);
+                adapter.set_parallel_contact_solve(true);
+                let bridge: &mut dyn GpuSolverBridge = &mut adapter;
+                bridge.send_contact_constraints(&gpu_c);
+                bridge.send_body_state(&gpu_p, &inv_masses);
+                for _ in 0..4 {
+                    bridge.dispatch_contact_solve_iteration(warm_start_factor);
+                }
+                bridge.recv_contact_constraints(&mut gpu_c);
+                bridge.recv_body_positions(&mut gpu_p);
+            }
+
+            // CPU replay of the same 4 iterations in colour-major order.
+            let mut cpu_c = constraints.clone();
+            let mut cpu_p = positions.clone();
+            for _ in 0..4 {
+                for colour in &colours {
+                    for &ci in colour {
+                        cpu_stage_b_at(
+                            &mut cpu_c,
+                            &mut cpu_p,
+                            &inv_masses,
+                            warm_start_factor,
+                            w_sum_epsilon,
+                            ci,
+                        );
+                    }
+                }
+            }
+
+            for (i, (g, c)) in gpu_c.iter().zip(cpu_c.iter()).enumerate() {
+                assert_eq!(
+                    g.cached_lambda.hi, c.cached_lambda.hi,
+                    "cached_lambda hi mismatch at constraint {i}"
+                );
+                assert_eq!(
+                    g.cached_lambda.lo, c.cached_lambda.lo,
+                    "cached_lambda lo mismatch at constraint {i}"
+                );
+            }
+            for (i, (g, c)) in gpu_p.iter().zip(cpu_p.iter()).enumerate() {
+                for axis in 0..3 {
+                    assert_eq!(
+                        g[axis].hi, c[axis].hi,
+                        "position hi mismatch at body {i} axis {axis}"
+                    );
+                    assert_eq!(
+                        g[axis].lo, c[axis].lo,
+                        "position lo mismatch at body {i} axis {axis}"
+                    );
+                }
+            }
+            let _ = pairs_usize.drain(..); // silence unused-mut when the topology never mutates
+        }
+
+        /// Degenerate case: all constraints touch disjoint body pairs
+        /// (no shared body between any two constraints). Greedy
+        /// colouring assigns them all to colour 0, and the batched
+        /// GPU dispatch reduces to a single compute call. Under this
+        /// topology the CPU insertion-major and colour-major orders
+        /// yield identical results because the writes commute, so
+        /// GPU-batched == CPU-sequential byte-exact.
+        #[cfg(feature = "physics-solver")]
+        #[test]
+        fn contact_solve_batched_matches_sequential_when_all_singletons() {
+            use crate::constraint_graph::ConstraintGraph;
+            use alice_physics::collider::Contact;
+            use alice_physics::math::{Fix128, Vec3Fix};
+            use alice_physics::solver::ContactConstraint;
+
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+
+            let warm_start_factor = Fix128::from_ratio(85, 100);
+            let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
+
+            // 6 bodies, 3 disjoint constraint pairs: (0,1), (2,3), (4,5).
+            let positions: Vec<[Fix128; 3]> = (0..6i64)
+                .map(|i| [Fix128::from_int(i * 2), Fix128::ZERO, Fix128::ZERO])
+                .collect();
+            let inv_masses: Vec<Fix128> = (0..6).map(|_| Fix128::from_int(1)).collect();
+            let pairs_usize: Vec<(usize, usize)> = vec![(0, 1), (2, 3), (4, 5)];
+            let constraints: Vec<ContactConstraint> = pairs_usize
+                .iter()
+                .map(|&(a, b)| ContactConstraint {
+                    body_a: a,
+                    body_b: b,
+                    contact: Contact {
+                        depth: Fix128::from_ratio(2, 10),
+                        normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                        point_a: Vec3Fix::ZERO,
+                        point_b: Vec3Fix::ZERO,
+                    },
+                    friction: Fix128::from_ratio(3, 10),
+                    restitution: Fix128::from_ratio(2, 10),
+                    cached_lambda: Fix128::ZERO,
+                })
+                .collect();
+
+            let colours = ConstraintGraph::build(&pairs_usize).greedy_color();
+            assert_eq!(
+                colours.len(),
+                1,
+                "disjoint fixture must produce a single colour bucket"
+            );
+
+            // GPU: batched path.
+            let mut gpu_c = constraints.clone();
+            let mut gpu_p = positions.clone();
+            {
+                let mut adapter = TrtSolverAdapter::new(&device);
+                adapter.set_parallel_contact_solve(true);
+                let bridge: &mut dyn GpuSolverBridge = &mut adapter;
+                bridge.send_contact_constraints(&gpu_c);
+                bridge.send_body_state(&gpu_p, &inv_masses);
+                for _ in 0..4 {
+                    bridge.dispatch_contact_solve_iteration(warm_start_factor);
+                }
+                bridge.recv_contact_constraints(&mut gpu_c);
+                bridge.recv_body_positions(&mut gpu_p);
+            }
+
+            // CPU: sequential (insertion-major) replay — must match
+            // byte-for-byte because writes commute across disjoint pairs.
+            let mut cpu_c = constraints.clone();
+            let mut cpu_p = positions.clone();
+            for _ in 0..4 {
+                for ci in 0..cpu_c.len() {
+                    cpu_stage_b_at(
+                        &mut cpu_c,
+                        &mut cpu_p,
+                        &inv_masses,
+                        warm_start_factor,
+                        w_sum_epsilon,
+                        ci,
+                    );
+                }
+            }
+
+            for (i, (g, c)) in gpu_c.iter().zip(cpu_c.iter()).enumerate() {
+                assert_eq!(
+                    g.cached_lambda.hi, c.cached_lambda.hi,
+                    "cached_lambda hi mismatch at constraint {i}"
+                );
+                assert_eq!(
+                    g.cached_lambda.lo, c.cached_lambda.lo,
+                    "cached_lambda lo mismatch at constraint {i}"
+                );
+            }
+            for (i, (g, c)) in gpu_p.iter().zip(cpu_p.iter()).enumerate() {
+                for axis in 0..3 {
+                    assert_eq!(
+                        g[axis].hi, c[axis].hi,
+                        "position hi mismatch at body {i} axis {axis}"
+                    );
+                    assert_eq!(
+                        g[axis].lo, c[axis].lo,
+                        "position lo mismatch at body {i} axis {axis}"
+                    );
+                }
+            }
+        }
+
+        /// Degenerate case: star K_N — every constraint touches body 0.
+        /// Greedy colouring must assign each constraint its own colour
+        /// (N constraints ⇒ N colours), so the batched GPU dispatch
+        /// issues N single-workgroup compute calls. Each colour's
+        /// dispatch effectively serialises through the constraint,
+        /// which is exactly the sequential order (colour 0 = constraint
+        /// 0, colour 1 = constraint 1, …). Under this topology
+        /// GPU-batched == CPU-sequential byte-exact.
+        #[cfg(feature = "physics-solver")]
+        #[test]
+        fn contact_solve_batched_matches_sequential_when_full_conflict() {
+            use crate::constraint_graph::ConstraintGraph;
+            use alice_physics::collider::Contact;
+            use alice_physics::math::{Fix128, Vec3Fix};
+            use alice_physics::solver::ContactConstraint;
+
+            let device = match crate::device::GpuDevice::new() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+
+            let warm_start_factor = Fix128::from_ratio(85, 100);
+            let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
+
+            // 5 bodies, 4 constraints all touching body 0: star K_4.
+            let positions: Vec<[Fix128; 3]> = (0..5i64)
+                .map(|i| [Fix128::from_int(i * 2), Fix128::ZERO, Fix128::ZERO])
+                .collect();
+            let inv_masses: Vec<Fix128> = (0..5).map(|_| Fix128::from_int(1)).collect();
+            let pairs_usize: Vec<(usize, usize)> = vec![(0, 1), (0, 2), (0, 3), (0, 4)];
+            let constraints: Vec<ContactConstraint> = pairs_usize
+                .iter()
+                .map(|&(a, b)| ContactConstraint {
+                    body_a: a,
+                    body_b: b,
+                    contact: Contact {
+                        depth: Fix128::from_ratio(2, 10),
+                        normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                        point_a: Vec3Fix::ZERO,
+                        point_b: Vec3Fix::ZERO,
+                    },
+                    friction: Fix128::from_ratio(3, 10),
+                    restitution: Fix128::from_ratio(2, 10),
+                    cached_lambda: Fix128::ZERO,
+                })
+                .collect();
+
+            let colours = ConstraintGraph::build(&pairs_usize).greedy_color();
+            assert_eq!(
+                colours.len(),
+                pairs_usize.len(),
+                "star K_N must produce one colour per constraint (chromatic number = N)"
+            );
+            for (c_idx, colour) in colours.iter().enumerate() {
+                assert_eq!(
+                    colour.as_slice(),
+                    &[c_idx],
+                    "greedy colouring must place constraint {c_idx} in its own colour"
+                );
+            }
+
+            // GPU: batched path (N colours ⇒ N sequential dispatches).
+            let mut gpu_c = constraints.clone();
+            let mut gpu_p = positions.clone();
+            {
+                let mut adapter = TrtSolverAdapter::new(&device);
+                adapter.set_parallel_contact_solve(true);
+                let bridge: &mut dyn GpuSolverBridge = &mut adapter;
+                bridge.send_contact_constraints(&gpu_c);
+                bridge.send_body_state(&gpu_p, &inv_masses);
+                for _ in 0..4 {
+                    bridge.dispatch_contact_solve_iteration(warm_start_factor);
+                }
+                bridge.recv_contact_constraints(&mut gpu_c);
+                bridge.recv_body_positions(&mut gpu_p);
+            }
+
+            // CPU: sequential (insertion-major) replay — identical to
+            // the colour-major replay in this fixture.
+            let mut cpu_c = constraints.clone();
+            let mut cpu_p = positions.clone();
+            for _ in 0..4 {
+                for ci in 0..cpu_c.len() {
+                    cpu_stage_b_at(
+                        &mut cpu_c,
+                        &mut cpu_p,
+                        &inv_masses,
+                        warm_start_factor,
+                        w_sum_epsilon,
+                        ci,
+                    );
+                }
+            }
+
+            for (i, (g, c)) in gpu_c.iter().zip(cpu_c.iter()).enumerate() {
+                assert_eq!(
+                    g.cached_lambda.hi, c.cached_lambda.hi,
+                    "cached_lambda hi mismatch at constraint {i}"
+                );
+                assert_eq!(
+                    g.cached_lambda.lo, c.cached_lambda.lo,
+                    "cached_lambda lo mismatch at constraint {i}"
+                );
+            }
+            for (i, (g, c)) in gpu_p.iter().zip(cpu_p.iter()).enumerate() {
+                for axis in 0..3 {
+                    assert_eq!(
+                        g[axis].hi, c[axis].hi,
+                        "position hi mismatch at body {i} axis {axis}"
+                    );
+                    assert_eq!(
+                        g[axis].lo, c[axis].lo,
+                        "position lo mismatch at body {i} axis {axis}"
+                    );
+                }
             }
         }
     }
