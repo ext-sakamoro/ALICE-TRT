@@ -2,6 +2,18 @@
 
 All notable changes to ALICE-TRT will be documented in this file.
 
+**Release audit trail** — each v2.8.0+ release has a
+`docs/audits/STUB_AUDIT_<version>.md` generated retroactively by
+`alice-tracker report --project alice-trt --since <base-commit>` that
+lists exactly which stubs (todo!/unimplemented!/silent-Ok/etc.) were
+introduced during that release window. The audits below record the
+release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
+
+- v2.8.0 — [docs/audits/STUB_AUDIT_v2.8.0.md](docs/audits/STUB_AUDIT_v2.8.0.md) (base: v2.7.1 `a6e6995`)
+- v2.8.1 — [docs/audits/STUB_AUDIT_v2.8.1.md](docs/audits/STUB_AUDIT_v2.8.1.md) (base: v2.8.0 `3f8a901`, **0 new stubs**)
+- v3.0.0 — [docs/audits/STUB_AUDIT_v3.0.0.md](docs/audits/STUB_AUDIT_v3.0.0.md) (base: v2.8.1 `395f583`, **0 new stubs**)
+- v3.1.0 — [docs/audits/STUB_AUDIT_v3.1.0.md](docs/audits/STUB_AUDIT_v3.1.0.md) (base: v3.0.0 `6ec76ee`, **0 new stubs**)
+
 ## [3.1.0] - 2026-07-08
 
 ### Added — Ball-socket joint solver on GPU (Tier C Phase 4 §2)
