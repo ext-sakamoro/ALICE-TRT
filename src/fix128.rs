@@ -7679,6 +7679,856 @@ pub fn dispatch_fix128_pgs_contact_solve_batched(
 }
 
 // ---------------------------------------------------------------------------
+// v3.1.0 Phase 4 §1 — Fix128 quaternion GPU primitives (`QuatFixGpu`).
+// Standalone `quat_mul` and `quat_rotate_vec` kernels required by the
+// ball-socket joint solver; each is a self-contained WGSL module with
+// its own copy of the Fix128 arithmetic helpers. Byte-exact vs the CPU
+// `QuatFix::mul` / `QuatFix::rotate_vec` implementations in
+// `alice_physics::math`.
+// ---------------------------------------------------------------------------
+
+/// GPU-side 64-byte quaternion — byte-layout mirror of
+/// `alice_physics::math::QuatFix`.
+///
+/// Four `Fix128Gpu` fields (`x`, `y`, `z`, `w`) at offsets 0 / 16 / 32 / 48.
+/// Total size 64 bytes; component order matches the CPU struct's
+/// `(x, y, z, w)` layout where `w` is the scalar/real part.
+#[cfg(feature = "physics-solver")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct QuatFixGpu {
+    pub x: Fix128Gpu,
+    pub y: Fix128Gpu,
+    pub z: Fix128Gpu,
+    pub w: Fix128Gpu,
+}
+
+#[cfg(feature = "physics-solver")]
+impl QuatFixGpu {
+    /// Convert an `alice_physics::math::QuatFix` to the GPU-side
+    /// byte-layout mirror. Each component copies the `hi` / `lo` bit
+    /// pattern verbatim via `Fix128Gpu::from_raw`.
+    #[must_use]
+    pub fn from_physics(q: alice_physics::math::QuatFix) -> Self {
+        Self {
+            x: Fix128Gpu::from_raw(q.x.hi, q.x.lo),
+            y: Fix128Gpu::from_raw(q.y.hi, q.y.lo),
+            z: Fix128Gpu::from_raw(q.z.hi, q.z.lo),
+            w: Fix128Gpu::from_raw(q.w.hi, q.w.lo),
+        }
+    }
+}
+
+/// WGSL compute shader source for **Fix128 quaternion multiplication**
+/// (v3.1.0 Phase 4 §1 primitive). Byte-exact port of
+/// `alice_physics::math::QuatFix::mul`:
+///
+/// ```text
+/// x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y
+/// y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x
+/// z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w
+/// w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+/// ```
+///
+/// Each component uses exactly 4 Fix128 muls + 3 add/sub ops in
+/// left-to-right associativity, matching the CPU reference expression
+/// order. Total 16 muls + 12 add/sub per quaternion.
+///
+/// # Bindings
+///
+/// - `@group(0) @binding(0)` — `a: array<Fix128Gpu, 4>` (read) — first
+///   operand `(x, y, z, w)` = 64 bytes.
+/// - `@group(0) @binding(1)` — `b: array<Fix128Gpu, 4>` (read) — second
+///   operand.
+/// - `@group(0) @binding(2)` — `out: array<Fix128Gpu, 4>` (read_write) —
+///   result.
+///
+/// # Dispatch
+///
+/// `@compute @workgroup_size(1)` + `dispatch_workgroups(1, 1, 1)` —
+/// single-thread processes one quaternion pair. Callers batching many
+/// pairs should inline the algorithm into their own kernel (as the
+/// ball-socket joint kernel does).
+pub const FIX128_QUAT_MUL_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+@group(0) @binding(0) var<storage, read>       a:   array<Fix128Gpu, 4>;
+@group(0) @binding(1) var<storage, read>       b:   array<Fix128Gpu, 4>;
+@group(0) @binding(2) var<storage, read_write> out: array<Fix128Gpu, 4>;
+
+// ---- 64-bit helpers (byte-exact copies from v0.3.0 / v1.4.0 kernels) ----
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let lo_sub  = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid     = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let hi_sub  = mid - borrow1;
+    let borrow3 = select(0u, 1u, mid < borrow1);
+    return vec3<u32>(lo_sub, hi_sub, borrow2 + borrow3);
+}
+
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+    let r0 = ll.x;
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+    let r3 = hh.y + carry_to_3;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+// ---- Fix128 add / sub / mul (byte-exact copies from v1.4.x kernels) ----
+
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_sub_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+    let ll = u64_mul_wide(a_lo, b_lo);
+    let lh = u64_mul_wide(a_lo, b_hi);
+    let hl = u64_mul_wide(a_hi, b_lo);
+    let hh = u64_mul_wide(a_hi, b_hi);
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+    let s5a = lh.w + hl.w;
+    let s5b = s5a + hh.y;
+    let p5_u = s5b + carry_to_5;
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+    var p4 = p4_u;
+    var p5 = p5_u;
+    if (a_negative) {
+        let sub_lo = b.lo_lo;
+        let sub_hi = b.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    if (b_negative) {
+        let sub_lo = a.lo_lo;
+        let sub_hi = a.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
+    return out;
+}
+
+// ---- Quaternion mul: byte-exact port of QuatFix::mul ----
+
+@compute @workgroup_size(1)
+fn fix128_quat_mul_main() {
+    let ax = a[0];
+    let ay = a[1];
+    let az = a[2];
+    let aw = a[3];
+    let bx = b[0];
+    let by = b[1];
+    let bz = b[2];
+    let bw = b[3];
+
+    // x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y
+    let x_t1  = fix128_mul_kernel(aw, bx);
+    let x_t2  = fix128_mul_kernel(ax, bw);
+    let x_t3  = fix128_mul_kernel(ay, bz);
+    let x_t4  = fix128_mul_kernel(az, by);
+    let x_s1  = fix128_add_kernel(x_t1, x_t2);
+    let x_s2  = fix128_add_kernel(x_s1, x_t3);
+    out[0]    = fix128_sub_kernel(x_s2, x_t4);
+
+    // y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x
+    let y_t1  = fix128_mul_kernel(aw, by);
+    let y_t2  = fix128_mul_kernel(ax, bz);
+    let y_t3  = fix128_mul_kernel(ay, bw);
+    let y_t4  = fix128_mul_kernel(az, bx);
+    let y_s1  = fix128_sub_kernel(y_t1, y_t2);
+    let y_s2  = fix128_add_kernel(y_s1, y_t3);
+    out[1]    = fix128_add_kernel(y_s2, y_t4);
+
+    // z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w
+    let z_t1  = fix128_mul_kernel(aw, bz);
+    let z_t2  = fix128_mul_kernel(ax, by);
+    let z_t3  = fix128_mul_kernel(ay, bx);
+    let z_t4  = fix128_mul_kernel(az, bw);
+    let z_s1  = fix128_add_kernel(z_t1, z_t2);
+    let z_s2  = fix128_sub_kernel(z_s1, z_t3);
+    out[2]    = fix128_add_kernel(z_s2, z_t4);
+
+    // w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    let w_t1  = fix128_mul_kernel(aw, bw);
+    let w_t2  = fix128_mul_kernel(ax, bx);
+    let w_t3  = fix128_mul_kernel(ay, by);
+    let w_t4  = fix128_mul_kernel(az, bz);
+    let w_s1  = fix128_sub_kernel(w_t1, w_t2);
+    let w_s2  = fix128_sub_kernel(w_s1, w_t3);
+    out[3]    = fix128_sub_kernel(w_s2, w_t4);
+}
+"#;
+
+/// WGSL compute shader source for **Fix128 quaternion vector rotation**
+/// (v3.1.0 Phase 4 §1 primitive). Byte-exact port of
+/// `alice_physics::math::QuatFix::rotate_vec(q, v)`:
+///
+/// ```text
+/// qv     = (v.x, v.y, v.z, 0)
+/// tmp    = q  * qv
+/// result = tmp * q.conjugate()  where conjugate is (-x, -y, -z, w)
+/// return (result.x, result.y, result.z)
+/// ```
+///
+/// Two quaternion multiplications + one conjugate. Each quaternion mul
+/// is 16 Fix128 muls + 12 add/sub (see [`FIX128_QUAT_MUL_WGSL`] for the
+/// exact expression order). Total ~32 muls + ~24 add/sub per rotate.
+///
+/// # Bindings
+///
+/// - `@group(0) @binding(0)` — `q: array<Fix128Gpu, 4>` (read) —
+///   quaternion `(x, y, z, w)` = 64 bytes.
+/// - `@group(0) @binding(1)` — `v: array<Fix128Gpu, 3>` (read) —
+///   input vector = 48 bytes.
+/// - `@group(0) @binding(2)` — `out: array<Fix128Gpu, 3>` (read_write) —
+///   rotated vector.
+///
+/// # Dispatch
+///
+/// `@compute @workgroup_size(1)` + `dispatch_workgroups(1, 1, 1)`.
+pub const FIX128_QUAT_ROTATE_VEC_WGSL: &str = r#"
+struct Fix128Gpu {
+    hi_lo: u32,
+    hi_hi: u32,
+    lo_lo: u32,
+    lo_hi: u32,
+}
+
+@group(0) @binding(0) var<storage, read>       q:   array<Fix128Gpu, 4>;
+@group(0) @binding(1) var<storage, read>       v:   array<Fix128Gpu, 3>;
+@group(0) @binding(2) var<storage, read_write> out: array<Fix128Gpu, 3>;
+
+// ---- 64-bit helpers (byte-exact copies) ----
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let sum_lo = a.x + b.x;
+    let carry1 = select(0u, 1u, sum_lo < a.x);
+    let mid    = a.y + b.y;
+    let carry2 = select(0u, 1u, mid < a.y);
+    let sum_hi = mid + carry1;
+    let carry3 = select(0u, 1u, sum_hi < mid);
+    return vec3<u32>(sum_lo, sum_hi, carry2 + carry3);
+}
+
+fn u64_sub(a: vec2<u32>, b: vec2<u32>) -> vec3<u32> {
+    let lo_sub  = a.x - b.x;
+    let borrow1 = select(0u, 1u, a.x < b.x);
+    let mid     = a.y - b.y;
+    let borrow2 = select(0u, 1u, a.y < b.y);
+    let hi_sub  = mid - borrow1;
+    let borrow3 = select(0u, 1u, mid < borrow1);
+    return vec3<u32>(lo_sub, hi_sub, borrow2 + borrow3);
+}
+
+fn umul_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu;
+    let ah = a >> 16u;
+    let bl = b & 0xFFFFu;
+    let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid       = lh + hl;
+    let mid_carry = select(0u, 1u, mid < lh);
+    let lo_out    = ll + (mid << 16u);
+    let carry_lo  = select(0u, 1u, lo_out < ll);
+    let hi_out    = hh + (mid >> 16u) + (mid_carry << 16u) + carry_lo;
+    return vec2<u32>(lo_out, hi_out);
+}
+
+fn u64_mul_wide(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let ll = umul_wide(a.x, b.x);
+    let lh = umul_wide(a.x, b.y);
+    let hl = umul_wide(a.y, b.x);
+    let hh = umul_wide(a.y, b.y);
+    let r0 = ll.x;
+    let s1a = ll.y + lh.x;
+    let c1a = select(0u, 1u, s1a < ll.y);
+    let r1  = s1a + hl.x;
+    let c1b = select(0u, 1u, r1 < s1a);
+    let carry_to_2 = c1a + c1b;
+    let s2a = lh.y + hl.y;
+    let c2a = select(0u, 1u, s2a < lh.y);
+    let s2b = s2a + hh.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let r2  = s2b + carry_to_2;
+    let c2c = select(0u, 1u, r2 < s2b);
+    let carry_to_3 = c2a + c2b + c2c;
+    let r3 = hh.y + carry_to_3;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+fn fix128_add_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res        = u64_add(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let carry_from_lo = lo_res.z;
+    let hi_res        = u64_add(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_carry = u64_add(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(carry_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_carry.x;
+    out.hi_hi = hi_with_carry.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_sub_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let lo_res         = u64_sub(vec2<u32>(a.lo_lo, a.lo_hi), vec2<u32>(b.lo_lo, b.lo_hi));
+    let borrow_from_lo = lo_res.z;
+    let hi_res         = u64_sub(vec2<u32>(a.hi_lo, a.hi_hi), vec2<u32>(b.hi_lo, b.hi_hi));
+    let hi_with_borrow = u64_sub(vec2<u32>(hi_res.x, hi_res.y), vec2<u32>(borrow_from_lo, 0u));
+    var out: Fix128Gpu;
+    out.hi_lo = hi_with_borrow.x;
+    out.hi_hi = hi_with_borrow.y;
+    out.lo_lo = lo_res.x;
+    out.lo_hi = lo_res.y;
+    return out;
+}
+
+fn fix128_mul_kernel(a: Fix128Gpu, b: Fix128Gpu) -> Fix128Gpu {
+    let a_lo = vec2<u32>(a.lo_lo, a.lo_hi);
+    let a_hi = vec2<u32>(a.hi_lo, a.hi_hi);
+    let b_lo = vec2<u32>(b.lo_lo, b.lo_hi);
+    let b_hi = vec2<u32>(b.hi_lo, b.hi_hi);
+    let ll = u64_mul_wide(a_lo, b_lo);
+    let lh = u64_mul_wide(a_lo, b_hi);
+    let hl = u64_mul_wide(a_hi, b_lo);
+    let hh = u64_mul_wide(a_hi, b_hi);
+    let s2a = ll.z + lh.x;
+    let c2a = select(0u, 1u, s2a < ll.z);
+    let s2b = s2a + hl.x;
+    let c2b = select(0u, 1u, s2b < s2a);
+    let p2  = s2b;
+    let carry_to_3 = c2a + c2b;
+    let s3a = ll.w + lh.y;
+    let c3a = select(0u, 1u, s3a < ll.w);
+    let s3b = s3a + hl.y;
+    let c3b = select(0u, 1u, s3b < s3a);
+    let p3  = s3b + carry_to_3;
+    let c3c = select(0u, 1u, p3 < s3b);
+    let carry_to_4 = c3a + c3b + c3c;
+    let s4a = lh.z + hl.z;
+    let c4a = select(0u, 1u, s4a < lh.z);
+    let s4b = s4a + hh.x;
+    let c4b = select(0u, 1u, s4b < s4a);
+    let p4_u = s4b + carry_to_4;
+    let c4c = select(0u, 1u, p4_u < s4b);
+    let carry_to_5 = c4a + c4b + c4c;
+    let s5a = lh.w + hl.w;
+    let s5b = s5a + hh.y;
+    let p5_u = s5b + carry_to_5;
+    let a_negative = (a.hi_hi & 0x80000000u) != 0u;
+    let b_negative = (b.hi_hi & 0x80000000u) != 0u;
+    var p4 = p4_u;
+    var p5 = p5_u;
+    if (a_negative) {
+        let sub_lo = b.lo_lo;
+        let sub_hi = b.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    if (b_negative) {
+        let sub_lo = a.lo_lo;
+        let sub_hi = a.lo_hi;
+        let new_p4 = p4 - sub_lo;
+        let borrow = select(0u, 1u, p4 < sub_lo);
+        let new_p5 = p5 - sub_hi - borrow;
+        p4 = new_p4;
+        p5 = new_p5;
+    }
+    var out: Fix128Gpu;
+    out.lo_lo = p2;
+    out.lo_hi = p3;
+    out.hi_lo = p4;
+    out.hi_hi = p5;
+    return out;
+}
+
+fn fix128_neg(x: Fix128Gpu) -> Fix128Gpu {
+    let inv_lo_lo = ~x.lo_lo;
+    let inv_lo_hi = ~x.lo_hi;
+    let inv_hi_lo = ~x.hi_lo;
+    let inv_hi_hi = ~x.hi_hi;
+    let s0 = inv_lo_lo + 1u;
+    let c0 = select(0u, 1u, s0 < inv_lo_lo);
+    let s1 = inv_lo_hi + c0;
+    let c1 = select(0u, 1u, s1 < inv_lo_hi);
+    let s2 = inv_hi_lo + c1;
+    let c2 = select(0u, 1u, s2 < inv_hi_lo);
+    let s3 = inv_hi_hi + c2;
+    var out: Fix128Gpu;
+    out.lo_lo = s0;
+    out.lo_hi = s1;
+    out.hi_lo = s2;
+    out.hi_hi = s3;
+    return out;
+}
+
+fn fix128_zero() -> Fix128Gpu {
+    return Fix128Gpu(0u, 0u, 0u, 0u);
+}
+
+// ---- Quaternion helpers: mul (inlined from FIX128_QUAT_MUL_WGSL) ----
+
+struct QuatFixLocal {
+    x: Fix128Gpu,
+    y: Fix128Gpu,
+    z: Fix128Gpu,
+    w: Fix128Gpu,
+}
+
+fn quat_mul(a: QuatFixLocal, b: QuatFixLocal) -> QuatFixLocal {
+    // x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y
+    let x_t1 = fix128_mul_kernel(a.w, b.x);
+    let x_t2 = fix128_mul_kernel(a.x, b.w);
+    let x_t3 = fix128_mul_kernel(a.y, b.z);
+    let x_t4 = fix128_mul_kernel(a.z, b.y);
+    let x_s1 = fix128_add_kernel(x_t1, x_t2);
+    let x_s2 = fix128_add_kernel(x_s1, x_t3);
+    let x    = fix128_sub_kernel(x_s2, x_t4);
+
+    // y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x
+    let y_t1 = fix128_mul_kernel(a.w, b.y);
+    let y_t2 = fix128_mul_kernel(a.x, b.z);
+    let y_t3 = fix128_mul_kernel(a.y, b.w);
+    let y_t4 = fix128_mul_kernel(a.z, b.x);
+    let y_s1 = fix128_sub_kernel(y_t1, y_t2);
+    let y_s2 = fix128_add_kernel(y_s1, y_t3);
+    let y    = fix128_add_kernel(y_s2, y_t4);
+
+    // z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w
+    let z_t1 = fix128_mul_kernel(a.w, b.z);
+    let z_t2 = fix128_mul_kernel(a.x, b.y);
+    let z_t3 = fix128_mul_kernel(a.y, b.x);
+    let z_t4 = fix128_mul_kernel(a.z, b.w);
+    let z_s1 = fix128_add_kernel(z_t1, z_t2);
+    let z_s2 = fix128_sub_kernel(z_s1, z_t3);
+    let z    = fix128_add_kernel(z_s2, z_t4);
+
+    // w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    let w_t1 = fix128_mul_kernel(a.w, b.w);
+    let w_t2 = fix128_mul_kernel(a.x, b.x);
+    let w_t3 = fix128_mul_kernel(a.y, b.y);
+    let w_t4 = fix128_mul_kernel(a.z, b.z);
+    let w_s1 = fix128_sub_kernel(w_t1, w_t2);
+    let w_s2 = fix128_sub_kernel(w_s1, w_t3);
+    let w    = fix128_sub_kernel(w_s2, w_t4);
+
+    var out: QuatFixLocal;
+    out.x = x;
+    out.y = y;
+    out.z = z;
+    out.w = w;
+    return out;
+}
+
+fn quat_conjugate(q: QuatFixLocal) -> QuatFixLocal {
+    var out: QuatFixLocal;
+    out.x = fix128_neg(q.x);
+    out.y = fix128_neg(q.y);
+    out.z = fix128_neg(q.z);
+    out.w = q.w;
+    return out;
+}
+
+// ---- Vector rotate: byte-exact port of QuatFix::rotate_vec ----
+
+@compute @workgroup_size(1)
+fn fix128_quat_rotate_vec_main() {
+    var q_local: QuatFixLocal;
+    q_local.x = q[0];
+    q_local.y = q[1];
+    q_local.z = q[2];
+    q_local.w = q[3];
+
+    // qv = (v.x, v.y, v.z, 0)
+    var qv: QuatFixLocal;
+    qv.x = v[0];
+    qv.y = v[1];
+    qv.z = v[2];
+    qv.w = fix128_zero();
+
+    // result = q * qv * q.conjugate()
+    let tmp    = quat_mul(q_local, qv);
+    let result = quat_mul(tmp, quat_conjugate(q_local));
+
+    out[0] = result.x;
+    out[1] = result.y;
+    out[2] = result.z;
+}
+"#;
+
+/// v3.1.0 Phase 4 §1 dispatch — GPU quaternion multiplication.
+/// Uploads two `QuatFixGpu` operands, dispatches
+/// [`FIX128_QUAT_MUL_WGSL`], reads back the resulting `QuatFixGpu`.
+/// Standalone entry point used only by golden tests; the ball-socket
+/// joint kernel inlines the algorithm directly.
+///
+/// # Panics
+/// Panics if the wgpu device is lost during dispatch.
+#[cfg(feature = "physics-solver")]
+#[must_use]
+pub fn dispatch_fix128_quat_mul(
+    device: &crate::device::GpuDevice,
+    a: QuatFixGpu,
+    b: QuatFixGpu,
+) -> QuatFixGpu {
+    let shader = device
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fix128_quat_mul_shader"),
+            source: wgpu::ShaderSource::Wgsl(FIX128_QUAT_MUL_WGSL.into()),
+        });
+    let bind_group_layout =
+        device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fix128_quat_mul_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+    let pipeline_layout = device
+        .device()
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fix128_quat_mul_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let pipeline = device
+        .device()
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fix128_quat_mul_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("fix128_quat_mul_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    let buf_a = device.create_buffer_init("quat_mul_a", bytemuck::bytes_of(&a));
+    let buf_b = device.create_buffer_init("quat_mul_b", bytemuck::bytes_of(&b));
+    let buf_out = device.create_buffer_init(
+        "quat_mul_out",
+        bytemuck::bytes_of(&QuatFixGpu {
+            x: Fix128Gpu::ZERO,
+            y: Fix128Gpu::ZERO,
+            z: Fix128Gpu::ZERO,
+            w: Fix128Gpu::ZERO,
+        }),
+    );
+
+    let bind_group = device
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fix128_quat_mul_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_out.as_entire_binding(),
+                },
+            ],
+        });
+
+    let mut encoder = device
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fix128_quat_mul_encoder"),
+        });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fix128_quat_mul_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+    device.submit(encoder);
+    device.poll_wait();
+
+    let raw = device.read_buffer(&buf_out, core::mem::size_of::<QuatFixGpu>() as u64);
+    let out_slice: &[QuatFixGpu] = bytemuck::cast_slice(&raw);
+    out_slice[0]
+}
+
+/// v3.1.0 Phase 4 §1 dispatch — GPU quaternion vector rotation.
+/// Applies `QuatFix::rotate_vec` (`q * (v as quat) * q_conjugate`) to
+/// the supplied `(q, v)` pair. Standalone entry point used only by
+/// golden tests; the ball-socket joint kernel inlines the algorithm
+/// directly.
+///
+/// # Panics
+/// Panics if the wgpu device is lost during dispatch.
+#[cfg(feature = "physics-solver")]
+#[must_use]
+pub fn dispatch_fix128_quat_rotate_vec(
+    device: &crate::device::GpuDevice,
+    q: QuatFixGpu,
+    v: Vec3FixGpu,
+) -> Vec3FixGpu {
+    let shader = device
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fix128_quat_rotate_vec_shader"),
+            source: wgpu::ShaderSource::Wgsl(FIX128_QUAT_ROTATE_VEC_WGSL.into()),
+        });
+    let bind_group_layout =
+        device
+            .device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fix128_quat_rotate_vec_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+    let pipeline_layout = device
+        .device()
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fix128_quat_rotate_vec_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let pipeline = device
+        .device()
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fix128_quat_rotate_vec_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("fix128_quat_rotate_vec_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    let buf_q = device.create_buffer_init("quat_rot_q", bytemuck::bytes_of(&q));
+    let buf_v = device.create_buffer_init("quat_rot_v", bytemuck::bytes_of(&v));
+    let buf_out = device.create_buffer_init(
+        "quat_rot_out",
+        bytemuck::bytes_of(&Vec3FixGpu {
+            x: Fix128Gpu::ZERO,
+            y: Fix128Gpu::ZERO,
+            z: Fix128Gpu::ZERO,
+        }),
+    );
+
+    let bind_group = device
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fix128_quat_rotate_vec_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_q.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_v.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_out.as_entire_binding(),
+                },
+            ],
+        });
+
+    let mut encoder = device
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fix128_quat_rotate_vec_encoder"),
+        });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fix128_quat_rotate_vec_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+    device.submit(encoder);
+    device.poll_wait();
+
+    let raw = device.read_buffer(&buf_out, core::mem::size_of::<Vec3FixGpu>() as u64);
+    let out_slice: &[Vec3FixGpu] = bytemuck::cast_slice(&raw);
+    out_slice[0]
+}
+
+// ---------------------------------------------------------------------------
 // wgpu dispatch backend (Fix128 add / sub) — pairs with the WGSL shaders above.
 // ---------------------------------------------------------------------------
 
@@ -10824,6 +11674,141 @@ mod tests {
                 &inv_masses,
                 warm_start_factor,
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v3.1.0 Phase 4 §1: quaternion GPU primitive byte-exact goldens
+    // -----------------------------------------------------------------
+
+    /// Byte-exact CPU-GPU golden for `FIX128_QUAT_MUL_WGSL`. Exercises
+    /// three fixtures: identity × identity, identity × arbitrary
+    /// quaternion, and arbitrary × arbitrary. Each fixture asserts
+    /// that every output word (`x.hi` / `x.lo` / … / `w.hi` / `w.lo`)
+    /// matches the CPU `QuatFix::mul` reference exactly.
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_quat_mul_matches_cpu_golden() {
+        use alice_physics::math::Fix128 as PhysicsFix128;
+        use alice_physics::math::QuatFix as PhysicsQuatFix;
+
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let identity = PhysicsQuatFix::IDENTITY;
+
+        // Arbitrary well-defined quaternion (approximately a 60-degree
+        // rotation around a diagonal axis). Values chosen to exercise
+        // signed and mixed-precision behaviour without needing
+        // `from_axis_angle` (which depends on `sin_cos` and would make
+        // the fixture indirect).
+        let q_a = PhysicsQuatFix::new(
+            PhysicsFix128::from_ratio(3, 10),
+            PhysicsFix128::from_ratio(4, 10),
+            PhysicsFix128::from_ratio(-2, 10),
+            PhysicsFix128::from_ratio(85, 100),
+        );
+        let q_b = PhysicsQuatFix::new(
+            PhysicsFix128::from_ratio(-1, 5),
+            PhysicsFix128::from_ratio(6, 10),
+            PhysicsFix128::from_ratio(1, 10),
+            PhysicsFix128::from_ratio(7, 10),
+        );
+
+        let fixtures: [(PhysicsQuatFix, PhysicsQuatFix, &str); 3] = [
+            (identity, identity, "identity × identity"),
+            (identity, q_a, "identity × arbitrary"),
+            (q_a, q_b, "arbitrary × arbitrary"),
+        ];
+
+        for (a_cpu, b_cpu, label) in fixtures {
+            let cpu_ref = a_cpu.mul(b_cpu);
+            let gpu_out = dispatch_fix128_quat_mul(
+                &device,
+                QuatFixGpu::from_physics(a_cpu),
+                QuatFixGpu::from_physics(b_cpu),
+            );
+            for (component_name, cpu_val, gpu_val) in [
+                ("x", cpu_ref.x, gpu_out.x),
+                ("y", cpu_ref.y, gpu_out.y),
+                ("z", cpu_ref.z, gpu_out.z),
+                ("w", cpu_ref.w, gpu_out.w),
+            ] {
+                assert_eq!(
+                    gpu_val.hi, cpu_val.hi,
+                    "{label}: {component_name} hi mismatch — GPU {} vs CPU {}",
+                    gpu_val.hi, cpu_val.hi
+                );
+                assert_eq!(
+                    gpu_val.lo, cpu_val.lo,
+                    "{label}: {component_name} lo mismatch — GPU {:#x} vs CPU {:#x}",
+                    gpu_val.lo, cpu_val.lo
+                );
+            }
+        }
+    }
+
+    /// Byte-exact CPU-GPU golden for `FIX128_QUAT_ROTATE_VEC_WGSL`.
+    /// Exercises: identity rotation (unchanged vector), rotation by
+    /// arbitrary quaternion, and rotation of the zero vector (which
+    /// must return zero regardless of the quaternion).
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn wgpu_quat_rotate_vec_matches_cpu_golden() {
+        use alice_physics::math::Fix128 as PhysicsFix128;
+        use alice_physics::math::QuatFix as PhysicsQuatFix;
+        use alice_physics::math::Vec3Fix as PhysicsVec3Fix;
+
+        let device = match crate::device::GpuDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let identity = PhysicsQuatFix::IDENTITY;
+        let q_arb = PhysicsQuatFix::new(
+            PhysicsFix128::from_ratio(3, 10),
+            PhysicsFix128::from_ratio(4, 10),
+            PhysicsFix128::from_ratio(-2, 10),
+            PhysicsFix128::from_ratio(85, 100),
+        );
+        let v_arb = PhysicsVec3Fix::new(
+            PhysicsFix128::from_int(1),
+            PhysicsFix128::from_int(2),
+            PhysicsFix128::from_int(-3),
+        );
+        let v_zero = PhysicsVec3Fix::ZERO;
+
+        let fixtures: [(PhysicsQuatFix, PhysicsVec3Fix, &str); 3] = [
+            (identity, v_arb, "identity rotation preserves vector"),
+            (q_arb, v_arb, "arbitrary rotation of arbitrary vector"),
+            (q_arb, v_zero, "any rotation of zero returns zero"),
+        ];
+
+        for (q_cpu, v_cpu, label) in fixtures {
+            let cpu_ref = q_cpu.rotate_vec(v_cpu);
+            let gpu_out = dispatch_fix128_quat_rotate_vec(
+                &device,
+                QuatFixGpu::from_physics(q_cpu),
+                Vec3FixGpu::from_physics(v_cpu),
+            );
+            for (axis_name, cpu_val, gpu_val) in [
+                ("x", cpu_ref.x, gpu_out.x),
+                ("y", cpu_ref.y, gpu_out.y),
+                ("z", cpu_ref.z, gpu_out.z),
+            ] {
+                assert_eq!(
+                    gpu_val.hi, cpu_val.hi,
+                    "{label}: {axis_name} hi mismatch — GPU {} vs CPU {}",
+                    gpu_val.hi, cpu_val.hi
+                );
+                assert_eq!(
+                    gpu_val.lo, cpu_val.lo,
+                    "{label}: {axis_name} lo mismatch — GPU {:#x} vs CPU {:#x}",
+                    gpu_val.lo, cpu_val.lo
+                );
+            }
         }
     }
 }
