@@ -2365,14 +2365,14 @@ mod solver_bridge {
                         continue;
                     }
                     let inv_w_sum = Fix128::ONE / w_sum;
-                    let biased = c.contact.depth - c.cached_lambda * warm_start_factor;
-                    let lambda = if biased > Fix128::ZERO {
-                        biased
-                    } else {
-                        Fix128::ZERO
-                    };
-                    constraints[i].cached_lambda = lambda;
-                    let correction = c.contact.normal * lambda;
+                    // alice-physics 1.2.0 accumulated multiplier (warm_start_factor unused)
+                    let _ = warm_start_factor;
+                    let dlambda = c.contact.depth - c.cached_lambda;
+                    if dlambda <= Fix128::ZERO {
+                        continue;
+                    }
+                    constraints[i].cached_lambda = c.cached_lambda + dlambda;
+                    let correction = c.contact.normal * dlambda;
                     let ca = correction * (ma_inv * inv_w_sum);
                     let cb = correction * (mb_inv * inv_w_sum);
                     if !ma_inv.is_zero() {
@@ -2807,14 +2807,14 @@ mod solver_bridge {
                 return;
             }
             let inv_w_sum = Fix128::ONE / w_sum;
-            let biased = c.contact.depth - c.cached_lambda * warm_start_factor;
-            let lambda = if biased > Fix128::ZERO {
-                biased
-            } else {
-                Fix128::ZERO
-            };
-            constraints[ci].cached_lambda = lambda;
-            let correction = c.contact.normal * lambda;
+            // alice-physics 1.2.0 accumulated multiplier (warm_start_factor unused)
+            let _ = warm_start_factor;
+            let dlambda = c.contact.depth - c.cached_lambda;
+            if dlambda <= Fix128::ZERO {
+                return;
+            }
+            constraints[ci].cached_lambda = c.cached_lambda + dlambda;
+            let correction = c.contact.normal * dlambda;
             let ca = correction * (ma_inv * inv_w_sum);
             let cb = correction * (mb_inv * inv_w_sum);
             if !ma_inv.is_zero() {

@@ -4690,36 +4690,33 @@ fn debug_verify_escape_forward_impl(nodes: &[BvhNodeGpu]) -> bool {
 /// after both sides apply the same `sort_unstable` + `dedup` finaliser
 /// on the host.
 ///
-/// # Algorithm — CPU parity walk
+/// # Algorithm — CPU parity walk (alice-physics 1.2.0)
 ///
-/// The CPU `find_pairs` iterates each primitive body id in
-/// `bvh.primitives` order and calls
-/// `query_callback(&self.bounds, |prim_j| { if prim_i < prim_j { push } })`.
-/// Because the query AABB is the world bounds, every inner
-/// `intersects_i32` check passes and the traversal visits every internal
-/// + leaf node in flat-array pre-order. The escape pointer is still
-/// exercised on the leaf → next-sibling transition (skill §11.4
-/// discipline).
-///
-/// The v2.4.0 port mirrors this byte-for-byte:
+/// The CPU `find_pairs` iterates every **leaf** node, queries the tree
+/// with that leaf's own quantised AABB (`query_stackless`), and pairs each
+/// primitive of the leaf with each primitive of every hit leaf when
+/// `prim_i < prim_j`; the host then applies `sort_unstable` + `dedup`.
+/// The result is a superset of the truly overlapping pairs (leaf boxes are
+/// quantised) and a strict subset of all n(n−1)/2 pairs. Before 1.2.0 the
+/// CPU queried with the world bounds — every `intersects_i32` passed and
+/// all pairs were emitted — and this kernel mirrored that bug byte-for-byte.
 ///
 /// ```text
-/// for i in 0..prim_count:
-///     prim_i = primitives[i]
+/// for q in 0..node_count:
+///     if !is_leaf(q): continue
 ///     idx = 0u; visits = 0u
 ///     loop:
 ///         if idx == ESCAPE_NONE_24 or idx >= node_count: break
 ///         visits += 1
 ///         if visits > 2 * node_count:              # §11.4 cycle guard
 ///             atomicStore(&counters[1], 1u); break
-///         if intersects_world_bounds(node):
-///             if is_leaf:
-///                 for k in start..start+count:
-///                     prim_j = primitives[k]
-///                     if prim_i < prim_j:
-///                         slot = atomicAdd(&counters[0], 1u)
-///                         if slot < max_pairs:
-///                             pairs_out[slot] = vec2(prim_i, prim_j)
+///         if intersects_node(idx, q):
+///             if is_leaf(idx):
+///                 for k in leaf(idx).prims:  prim_j = primitives[k]
+///                     for m in leaf(q).prims: prim_i = primitives[m]
+///                         if prim_i < prim_j:
+///                             slot = atomicAdd(&counters[0], 1u)
+///                             if slot < max_pairs: pairs_out[slot] = (prim_i, prim_j)
 ///                 idx = escape
 ///             else:
 ///                 idx = first_child
@@ -4833,6 +4830,19 @@ fn intersects_world(idx: u32) -> bool {
         && (n.aabb_max_z >= world_bounds.min_z);
 }
 
+// Node-vs-node i32 AABB intersection (the query box is the leaf being
+// expanded). Same comparison as `intersects_world`, different operand.
+fn intersects_node(idx: u32, q: u32) -> bool {
+    let n = nodes[idx];
+    let b = nodes[q];
+    return (n.aabb_min_x <= b.aabb_max_x)
+        && (n.aabb_max_x >= b.aabb_min_x)
+        && (n.aabb_min_y <= b.aabb_max_y)
+        && (n.aabb_max_y >= b.aabb_min_y)
+        && (n.aabb_min_z <= b.aabb_max_z)
+        && (n.aabb_max_z >= b.aabb_min_z);
+}
+
 @compute @workgroup_size(1)
 fn fix128_bvh_find_pairs_main() {
     let node_count = params.node_count;
@@ -4849,17 +4859,20 @@ fn fix128_bvh_find_pairs_main() {
 
     let max_visits = 2u * node_count;
 
-    for (var i: u32 = 0u; i < prim_count; i = i + 1u) {
-        let prim_i = primitives[i];
+    // alice-physics 1.2.0 `find_pairs`: for every LEAF, query the tree with
+    // that leaf's own quantised AABB and pair each of its primitives with
+    // every primitive of every hit leaf (prim_i < prim_j). The pre-1.2.0
+    // walk queried with `world_bounds` (kept as a binding for ABI
+    // stability) and therefore emitted all n(n-1)/2 pairs — the CPU had the
+    // same bug and the two were "byte-exact" on it.
+    for (var q: u32 = 0u; q < node_count; q = q + 1u) {
+        if (!node_is_leaf(q)) { continue; }
+        let q_start = nodes[q].first_child_or_prim;
+        let q_end   = q_start + node_prim_count(q);
 
-        // Stackless traversal — mirrors CPU LinearBvh::query_callback.
+        // Stackless traversal — mirrors CPU LinearBvh::query_stackless.
         var idx: u32 = 0u;
         var visits: u32 = 0u;
-
-        // Loop bound safety: even in the pathological case where every
-        // node forces a descend / iterate, the traversal cannot exceed
-        // node_count useful visits; the cycle guard breaks the loop
-        // once visits > 2 * node_count and sets the overflow flag.
         loop {
             if (idx >= node_count) { break; }
             if ((idx & ESCAPE_MASK_24) == ESCAPE_MASK_24) { break; }  // ESCAPE_NONE (24-bit)
@@ -4870,18 +4883,21 @@ fn fix128_bvh_find_pairs_main() {
                 break;
             }
 
-            if (intersects_world(idx)) {
+            if (intersects_node(idx, q)) {
                 if (node_is_leaf(idx)) {
                     let start = nodes[idx].first_child_or_prim;
-                    let count = node_prim_count(idx);
-                    let end = start + count;
+                    let end = start + node_prim_count(idx);
                     for (var k: u32 = start; k < end; k = k + 1u) {
                         if (k >= prim_count) { break; }
                         let prim_j = primitives[k];
-                        if (prim_i < prim_j) {
-                            let slot = atomicAdd(&counters[0], 1u);
-                            if (slot < max_pairs) {
-                                pairs_out[slot] = vec2<u32>(prim_i, prim_j);
+                        for (var m: u32 = q_start; m < q_end; m = m + 1u) {
+                            if (m >= prim_count) { break; }
+                            let prim_i = primitives[m];
+                            if (prim_i < prim_j) {
+                                let slot = atomicAdd(&counters[0], 1u);
+                                if (slot < max_pairs) {
+                                    pairs_out[slot] = vec2<u32>(prim_i, prim_j);
+                                }
                             }
                         }
                     }
@@ -6092,10 +6108,13 @@ pub fn dispatch_fix128_sphere_sphere_contact(
 ///     w_sum = ma_inv + mb_inv
 ///     if w_sum < W_SUM_EPSILON: continue
 ///     inv_w_sum = ONE / w_sum
-///     biased = depth - cached_lambda * warm_start_factor
-///     lambda = if biased > 0 { biased } else { 0 }
-///     constraints[i].cached_lambda = lambda           // in-place write
-///     correction = normal * lambda
+///     dlambda = depth - cached_lambda            // alice-physics 1.2.0
+///     if dlambda <= 0 { skip }
+///     constraints[i].cached_lambda += dlambda     // accumulated multiplier
+///     correction = normal * dlambda
+///   (`warm_start_factor` stays in the uniform layout for ABI stability but
+///   is not used: alice-physics 1.2.0 re-detects contacts every substep and
+///   accumulates the multiplier within it, see its CHANGELOG)
 ///     corr_a = correction * (ma_inv * inv_w_sum)
 ///     corr_b = correction * (mb_inv * inv_w_sum)
 ///     if !ma_inv.is_zero(): positions[body_a] += corr_a
@@ -6533,7 +6552,6 @@ fn vec3_scale(a: Vec3FixGpu, s: Fix128Gpu) -> Vec3FixGpu {
 @compute @workgroup_size(1)
 fn fix128_pgs_contact_solve_main() {
     let count = params.constraint_count;
-    let wsf   = params.warm_start_factor;
     if (count == 0u) { return; }
 
     let epsilon = fix128_w_sum_epsilon();
@@ -6554,19 +6572,20 @@ fn fix128_pgs_contact_solve_main() {
         if (fix128_lt(w_sum, epsilon)) { continue; }
 
         let inv_w_sum = fix128_div_kernel(one, w_sum);
-        let cl_wsf    = fix128_mul_kernel(c.cached_lambda, wsf);
-        let biased    = fix128_sub_kernel(c.depth, cl_wsf);
-        var lambda: Fix128Gpu;
-        if (fix128_lt(zero, biased)) {
-            lambda = biased;
-        } else {
-            lambda = zero;
-        }
+        // alice-physics 1.2.0 contact multiplier (mirrors CPU
+        // `solve_contact_constraints` byte-for-byte):
+        //   dlambda = depth - lambda_accumulated;  skip if dlambda <= 0
+        //   lambda += dlambda;  correction = normal * dlambda
+        // `params.warm_start_factor` is kept in the uniform layout but no
+        // longer enters the arithmetic (the CPU solver ignores it too).
+        let lambda_prev = c.cached_lambda;
+        let dlambda     = fix128_sub_kernel(c.depth, lambda_prev);
+        if (!fix128_lt(zero, dlambda)) { continue; }
 
-        // In-place write cached_lambda for the next iteration.
-        constraints[i].cached_lambda = lambda;
+        // In-place write of the accumulated multiplier for the next iteration.
+        constraints[i].cached_lambda = fix128_add_kernel(lambda_prev, dlambda);
 
-        let correction = vec3_scale(c.normal, lambda);
+        let correction = vec3_scale(c.normal, dlambda);
         let scale_a = fix128_mul_kernel(ma_inv, inv_w_sum);
         let scale_b = fix128_mul_kernel(mb_inv, inv_w_sum);
         let corr_a  = vec3_scale(correction, scale_a);
@@ -7049,7 +7068,6 @@ fn fix128_pgs_contact_solve_batched_main(
     // This bound is redundant with `dispatch_workgroups` under normal
     // operation but is kept as a defensive overshoot guard.
     let dispatch_count = params.constraint_count;
-    let wsf            = params.warm_start_factor;
     if (dispatch_count == 0u) { return; }
 
     let color_slot = wg_id.x;
@@ -7074,21 +7092,17 @@ fn fix128_pgs_contact_solve_batched_main(
     if (fix128_lt(w_sum, epsilon)) { return; }
 
     let inv_w_sum = fix128_div_kernel(one, w_sum);
-    let cl_wsf    = fix128_mul_kernel(c.cached_lambda, wsf);
-    let biased    = fix128_sub_kernel(c.depth, cl_wsf);
-    var lambda: Fix128Gpu;
-    if (fix128_lt(zero, biased)) {
-        lambda = biased;
-    } else {
-        lambda = zero;
-    }
+    // alice-physics 1.2.0 contact multiplier, see the sequential kernel.
+    let lambda_prev = c.cached_lambda;
+    let dlambda     = fix128_sub_kernel(c.depth, lambda_prev);
+    if (!fix128_lt(zero, dlambda)) { return; }
 
-    // In-place write cached_lambda for the next iteration. Each
-    // workgroup writes a unique `i` (colour buckets touch disjoint
+    // In-place write of the accumulated multiplier for the next iteration.
+    // Each workgroup writes a unique `i` (colour buckets touch disjoint
     // constraint indices as well as disjoint body sets), so no race.
-    constraints[i].cached_lambda = lambda;
+    constraints[i].cached_lambda = fix128_add_kernel(lambda_prev, dlambda);
 
-    let correction = vec3_scale(c.normal, lambda);
+    let correction = vec3_scale(c.normal, dlambda);
     let scale_a = fix128_mul_kernel(ma_inv, inv_w_sum);
     let scale_b = fix128_mul_kernel(mb_inv, inv_w_sum);
     let corr_a  = vec3_scale(correction, scale_a);
@@ -7137,7 +7151,7 @@ fn fix128_pgs_contact_solve_batched_main(
 ///   Not used by v2.6.0 (which handles position correction only)
 ///   but carried through so future friction / restitution kernels
 ///   can consume the same struct without a schema break.
-/// - `cached_lambda` is the warm-start accumulator. Updated in place
+/// - `cached_lambda` is the accumulated contact multiplier (alice-physics 1.2.0). Updated in place
 ///   by every PGS iteration.
 #[cfg(feature = "physics-solver")]
 #[repr(C)]
@@ -11816,13 +11830,35 @@ mod tests {
         }
 
         // Full Phase 3 pipeline compare on one fixture.
-        let check = |label: &str, input: Vec<BvhPrimitive>, expected_pair_count: usize| {
+        //
+        // alice-physics 1.2.0: `find_pairs` queries each leaf with its own
+        // AABB, so the result is a superset of the truly overlapping pairs
+        // (quantised leaf boxes) and no longer all n(n-1)/2 pairs. The
+        // sanity check is therefore "every brute-force overlapping pair is
+        // reported" plus an upper bound, not an exact count.
+        let check = |label: &str, input: Vec<BvhPrimitive>| {
             let cpu_bvh = LinearBvh::build(input.clone());
             let cpu_pairs = cpu_bvh.find_pairs();
-            assert_eq!(
-                cpu_pairs.len(),
-                expected_pair_count,
-                "{label}: CPU pair count sanity mismatch (got {}, expected {expected_pair_count})",
+            let n = input.len();
+            let mut brute: Vec<(u32, u32)> = Vec::new();
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    if input[a].aabb.intersects(&input[b].aabb) {
+                        let (i, j) = (input[a].index, input[b].index);
+                        brute.push(if i < j { (i, j) } else { (j, i) });
+                    }
+                }
+            }
+            brute.sort_unstable();
+            for pair in &brute {
+                assert!(
+                    cpu_pairs.binary_search(pair).is_ok(),
+                    "{label}: CPU find_pairs missed overlapping pair {pair:?}"
+                );
+            }
+            assert!(
+                cpu_pairs.len() <= n * (n - 1) / 2,
+                "{label}: CPU pair count {} exceeds n(n-1)/2",
                 cpu_pairs.len()
             );
 
@@ -11855,7 +11891,7 @@ mod tests {
                 }
             }
             assert_eq!(prims.len(), 32);
-            check("pile 4x4x2", prims, 32 * 31 / 2);
+            check("pile 4x4x2", prims);
         }
 
         // Fixture 2: uniform grid 3x3x3 (27 primitives).
@@ -11871,7 +11907,7 @@ mod tests {
                 }
             }
             assert_eq!(prims.len(), 27);
-            check("uniform grid 3x3x3", prims, 27 * 26 / 2);
+            check("uniform grid 3x3x3", prims);
         }
 
         // Fixture 3: degenerate all-colocated (16 primitives).
@@ -11881,7 +11917,7 @@ mod tests {
                 prims.push(mk_prim(0, 0, 0, 1, idx));
             }
             assert_eq!(prims.len(), 16);
-            check("degenerate colocated", prims, 16 * 15 / 2);
+            check("degenerate colocated", prims);
         }
     }
 
@@ -12304,14 +12340,14 @@ mod tests {
                     continue;
                 }
                 let inv_w_sum = PhysicsFix128::ONE / w_sum;
-                let biased = c.contact.depth - c.cached_lambda * warm_start_factor;
-                let lambda = if biased > PhysicsFix128::ZERO {
-                    biased
-                } else {
-                    PhysicsFix128::ZERO
-                };
-                constraints[i].cached_lambda = lambda;
-                let correction = c.contact.normal * lambda;
+                // alice-physics 1.2.0 accumulated multiplier (warm_start_factor unused)
+                let _ = warm_start_factor;
+                let dlambda = c.contact.depth - c.cached_lambda;
+                if dlambda <= PhysicsFix128::ZERO {
+                    continue;
+                }
+                constraints[i].cached_lambda = c.cached_lambda + dlambda;
+                let correction = c.contact.normal * dlambda;
                 let ca = correction * (ma_inv * inv_w_sum);
                 let cb = correction * (mb_inv * inv_w_sum);
                 if !ma_inv.is_zero() {

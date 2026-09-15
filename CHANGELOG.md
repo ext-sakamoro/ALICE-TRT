@@ -14,6 +14,39 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 - v3.0.0 — [docs/audits/STUB_AUDIT_v3.0.0.md](docs/audits/STUB_AUDIT_v3.0.0.md) (base: v2.8.1 `395f583`, **0 new stubs**)
 - v3.1.0 — [docs/audits/STUB_AUDIT_v3.1.0.md](docs/audits/STUB_AUDIT_v3.1.0.md) (base: v3.0.0 `6ec76ee`, **0 new stubs**)
 
+## [3.2.0] - 2026-09-15
+
+### Changed
+
+- **Contact solve kernels follow alice-physics 1.2.0.** Both
+  `FIX128_PGS_CONTACT_SOLVE_WGSL` and `FIX128_PGS_CONTACT_SOLVE_BATCHED_WGSL`
+  now compute the accumulated contact multiplier
+  (`dlambda = depth − cached_lambda`, skip when `≤ 0`,
+  `cached_lambda += dlambda`, `correction = normal · dlambda`) instead of
+  the warm-start bias `depth − cached_lambda · warm_start_factor`. The CPU
+  solver changed because the bias formulation re-pushed a frame-stale
+  penetration every iteration and substep (a 5 m/s head-on collision
+  separated at ~700 m/s under default settings). `warm_start_factor` stays
+  in the uniform layout for ABI stability but no longer enters the
+  arithmetic; `dispatch_contact_solve_iteration(warm_start_factor)` keeps
+  its signature. Byte-exact parity with the CPU golden is re-established
+  on the new formula (`wgpu_pgs_contact_solve_matches_cpu_golden`, chain /
+  pile / degenerate fixtures).
+- **`FIX128_BVH_FIND_PAIRS_WGSL` mirrors the fixed CPU broad phase.** The
+  1.1.0 CPU `find_pairs` queried the tree with the world bounds and returned
+  every n(n−1)/2 pair; the kernel mirrored that bug byte-for-byte. Both now
+  expand each leaf with its own quantised AABB (`intersects_node`). The
+  parity test's "expected pair count" is replaced by "superset of the
+  brute-force overlapping pairs, bounded by n(n−1)/2" because the
+  quantised result is a superset, not an exact overlap set.
+- Test-side CPU references (`cpu_stage_b`, the bridge integration
+  reference solvers) updated to the same formula.
+
+### Requires
+
+- `alice-physics >= 1.2.0` (path dependency `../ALICE-Physics`; `bvh::point_to_morton`
+  is `pub` again there for the Morton parity test).
+
 ## [3.1.0] - 2026-07-08
 
 ### Added — Ball-socket joint solver on GPU (Tier C Phase 4 §2)
