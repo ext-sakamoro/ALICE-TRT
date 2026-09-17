@@ -14,6 +14,14 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 - v3.0.0 — [docs/audits/STUB_AUDIT_v3.0.0.md](docs/audits/STUB_AUDIT_v3.0.0.md) (base: v2.8.1 `395f583`, **0 new stubs**)
 - v3.1.0 — [docs/audits/STUB_AUDIT_v3.1.0.md](docs/audits/STUB_AUDIT_v3.1.0.md) (base: v3.0.0 `6ec76ee`, **0 new stubs**)
 
+## [Unreleased]
+
+### Added
+- `tests/analytic_oracle.rs` — 閉形式 oracle 5 本 + ignore 1 (CLAUDE.md § 解析解突合テスト規律、2026-09-17): GPU 三値 matvec が simple / tiled 両 kernel で整数閉形式に exact、scaled kernel は γ 倍、`matmul_batch` の各行が `matvec` と bit 一致、ReLU、2 層 ReLU network の f64 閉形式、packed byte 数と圧縮率の閉形式 (`⌈in/32⌉` padding 込み)、Fix128 GPU add / sub / mul / div / sqrt / dot の dyadic 有理数 bit 一致 (0.5·0.25 = 0.125、1/4、√0.25 = 0.5、Σ i(i+1) = 91 520) + √2 / 1/3 を 1e-12、voice bridge の純音閉形式 (RMS = A/√2、ZCR = 2f/sr、centroid = ½、HTK mel 逆変換)、view bridge の解像度 CI の Fix128 GPU matrix job で実行 (device 不在は fail)
+
+### Changed
+- **`sdf_bridge::GpuNeuralSdf::fit` は `todo!` で fail fast** (仮実装の露呈、CLAUDE.md § 仮実装完了偽装の禁止): 2026-09-17 まで「fit a ternary neural network」と doc しながら training data を捨て、固定 `+1/−1/0` pattern と hash random projection で network を組んで返していた (sphere の oracle で RMS 誤差 ≈ 半径、`tests/analytic_oracle.rs` の ignore test に記録) 偽 builder 2 関数を削除、module doc に status 明記 fit 実装 (alice-train STE → `GpuTernaryWeight::from_kernel`) は Backlog
+
 ## [3.2.0] - 2026-09-15
 
 ### Changed

@@ -114,6 +114,12 @@ jobs:
 
       - name: Test — Fix128 GPU dispatch (all platforms — full 29 tests)
         run: cargo test --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1
+
+      # 解析解 oracle (tests/analytic_oracle.rs): GPU 三値 matvec / 2 層 forward の整数閉形式、
+      # Fix128 GPU の dyadic 閉形式、voice / view bridge の閉形式 (CLAUDE.md § 解析解突合テスト規律)
+      # device 不在は fail (skip しない)
+      - name: Test — analytic oracles (GPU + fix128 + voice / view bridges)
+        run: cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --test-threads=1
         # v0.8.1 candidate 1: eliminated `@builtin(workgroup_id)` from
         # FIX128_DOT_WGSL Phase 1 shader by deriving the workgroup
         # index from `global_invocation_id`. This test step will

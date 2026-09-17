@@ -23,9 +23,11 @@ has_toolchain() { rustup toolchain list | grep -q "^$1"; }
 # Steps CI runs that this file cannot reproduce locally (they can only fail remotely):
 #   - ci.yml:fix128-gpu-matrix:Install Vulkan / Mesa (Linux only — enables lavapipe software adapter) (no cargo / grep)
 #   - ci.yml:fix128-gpu-matrix:Clone ALICE-ML (unconditional path dep used by src/weights.rs) (no cargo / grep)
+#   - ci.yml:fix128-gpu-matrix:Strip optional path deps from Cargo.toml (CI does not need them) (needs network / runner-only)
 #   - ci.yml:fix128-physics-solver-matrix:Install Vulkan / Mesa (Linux only — enables lavapipe software adapter) (no cargo / grep)
 #   - ci.yml:fix128-physics-solver-matrix:Clone ALICE-ML (unconditional path dep used by src/weights.rs) (no cargo / grep)
 #   - ci.yml:fix128-physics-solver-matrix:Clone ALICE-Physics (path dep required by physics-solver feature) (no cargo / grep)
+#   - ci.yml:fix128-physics-solver-matrix:Strip alice-sdf / alice-db path deps (not needed for physics-solver goldens) (needs network / runner-only)
 
 need actionlint "brew install actionlint"
 has_toolchain 1.92.0 || { echo "missing toolchain 1.92.0 (rustup toolchain install 1.92.0)" >&2; exit 1; }
@@ -36,51 +38,8 @@ step "ci.yml / fmt: Check formatting"
 step "ci.yml / actionlint: actionlint"
 actionlint .github/workflows/*.yml
 
-step "ci.yml / fix128-gpu-matrix: Strip optional path deps from Cargo.toml (CI does not need them)"
-(
-  export CARGO_TERM_COLOR="always"
-  set -euo pipefail
-  # `alice-physics` / `alice-sdf` / `alice-db` are declared as
-  # `path = "../ALICE-XX", optional = true` for local
-  # development. Each pulls a transitive tree of path deps
-  # (alice-db → alice-zip → ...) that CI cannot reasonably
-  # clone. Since `--features fix128-arithmetic` alone does
-  # not activate any of these three, we strip their declarations
-  # from Cargo.toml before build. The GPU matrix job is
-  # scoped to fix128 tests, so this narrows the CI surface
-  # rather than the tested surface.
-  #
-  # `sed -i.bak` is portable across BSD (macOS) and GNU (Linux).
-  # Remove the three optional declaration lines.
-  sed -i.bak '/^alice-physics = {/d; /^alice-sdf = {/d; /^alice-db = {/d' Cargo.toml
-  # Feature entries that reference the stripped crates must
-  # also go, otherwise cargo +1.92.0 will complain about unknown deps.
-  sed -i.bak '/^physics = \["dep:alice-physics"/d' Cargo.toml
-  sed -i.bak '/^sdf = \["dep:alice-sdf"/d' Cargo.toml
-  sed -i.bak '/^db = \["dep:alice-db"/d' Cargo.toml
-  sed -i.bak '/^physics-solver = /d' Cargo.toml
-  rm -f Cargo.toml.bak
-  echo "--- stripped Cargo.toml [dependencies] ---"
-  grep -E "^(alice-|\[)" Cargo.toml || true
-)
-
 step "ci.yml / fix128-gpu-matrix: Build (fix128-arithmetic)"
 ( export CARGO_TERM_COLOR="always"; cargo +1.92.0 build --lib --features fix128-arithmetic )
-
-step "ci.yml / fix128-physics-solver-matrix: Strip alice-sdf / alice-db path deps (not needed for physics-solver goldens)"
-(
-  export CARGO_TERM_COLOR="always"
-  set -euo pipefail
-  # Keep alice-physics + physics + physics-solver features. Only
-  # drop alice-sdf / alice-db (unrelated to the goldens) so CI
-  # does not need to clone them.
-  sed -i.bak '/^alice-sdf = {/d; /^alice-db = {/d' Cargo.toml
-  sed -i.bak '/^sdf = \["dep:alice-sdf"/d' Cargo.toml
-  sed -i.bak '/^db = \["dep:alice-db"/d' Cargo.toml
-  rm -f Cargo.toml.bak
-  echo "--- stripped Cargo.toml [dependencies] ---"
-  grep -E "^(alice-|\[)" Cargo.toml || true
-)
 
 step "ci.yml / fix128-physics-solver-matrix: Build (fix128-arithmetic + physics-solver)"
 ( export CARGO_TERM_COLOR="always"; cargo +1.92.0 build --lib --features fix128-arithmetic,physics-solver )
@@ -97,6 +56,9 @@ step "ci.yml / fix128-gpu-matrix: Test — WGSL shader source symbol coverage (a
 
 step "ci.yml / fix128-gpu-matrix: Test — Fix128 GPU dispatch (all platforms — full 29 tests)"
 ( export CARGO_TERM_COLOR="always"; cargo +1.92.0 test --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1 )
+
+step "ci.yml / fix128-gpu-matrix: Test — analytic oracles (GPU + fix128 + voice / view bridges)"
+( export CARGO_TERM_COLOR="always"; cargo +1.92.0 test --test analytic_oracle --features fix128-arithmetic,voice,view -- --test-threads=1 )
 
 step "ci.yml / fix128-physics-solver-matrix: Test — physics-solver byte-exact CPU-GPU goldens (all platforms)"
 ( export CARGO_TERM_COLOR="always"; cargo +1.92.0 test --lib --features fix128-arithmetic,physics-solver -- --nocapture --test-threads=1 )

@@ -1,22 +1,31 @@
 //! ALICE-SDF bridge: GPU ternary neural SDF evaluation
 //!
-//! Trains a ternary neural network to approximate an SDF function,
-//! then evaluates it on the GPU using ALICE-TRT's inference engine.
-//! Useful for real-time rendering where the analytical SDF tree is
-//! too expensive to evaluate per-pixel.
+//! Evaluates a ternary neural network that approximates an SDF on the GPU
+//! using ALICE-TRT's inference engine — for real-time rendering where the
+//! analytical SDF tree is too expensive to evaluate per-pixel.
+//!
+//! # Status (2026-09-17)
+//!
+//! **Fitting is not implemented.** [`GpuNeuralSdf::fit`] fails fast with
+//! `todo!`; until 2026-09-17 it silently built the network from a fixed
+//! `+1/−1/0` pattern and a hash-based random projection while its doc
+//! claimed to "fit a ternary neural network" — the returned field bore no
+//! relation to the SDF (oracle `tests/analytic_oracle.rs`, sphere RMS error
+//! ≈ radius; CLAUDE.md § 仮実装完了偽装の禁止).  The training path is
+//! alice-train (STE on CPU) → [`crate::GpuTernaryWeight::from_kernel`]; Backlog
+//! ALICE-TRT.  [`sample_training_data`] and [`GpuNeuralSdf::eval_batch`]
+//! are real and stay.
 //!
 //! # Pipeline
 //!
 //! ```text
-//! SdfNode → sample training points → fit ternary NN → GpuNeuralSdf
+//! SdfNode → sample training points → (fit: TODO) → GpuNeuralSdf
 //! GpuNeuralSdf.eval_batch(points) → approximate distances (GPU)
 //! ```
 
 use alice_sdf::prelude::{eval, SdfNode, Vec3};
 
-use crate::{
-    Activation, GpuDevice, GpuInferenceEngine, GpuTensor, GpuTernaryWeight, TernaryCompute,
-};
+use crate::{GpuDevice, GpuInferenceEngine, GpuTensor, TernaryCompute};
 
 /// A GPU-resident neural approximation of an SDF.
 pub struct GpuNeuralSdf {
@@ -52,8 +61,15 @@ impl Default for NeuralSdfConfig {
 impl GpuNeuralSdf {
     /// Create a neural SDF approximation from an analytical SDF node.
     ///
-    /// Samples `config.num_samples` points within the given bounds,
-    /// evaluates the analytical SDF, and fits a ternary neural network.
+    /// Samples `config.num_samples` points within the given bounds and
+    /// evaluates the analytical SDF (the training set), then must fit a
+    /// ternary network to it.
+    ///
+    /// # Panics
+    ///
+    /// Always — the fit is not implemented (see the module docs).  The
+    /// sampled training set is discarded after being computed so that a
+    /// caller at least gets the SDF-evaluation cost profile.
     pub fn fit(
         device: &GpuDevice,
         sdf: &SdfNode,
@@ -61,47 +77,15 @@ impl GpuNeuralSdf {
         bounds_max: Vec3,
         config: &NeuralSdfConfig,
     ) -> Self {
-        // Sample training data
-        let (points, distances) =
+        let (_points, _distances) =
             sample_training_data(sdf, bounds_min, bounds_max, config.num_samples);
-
-        // Compute distance scale for normalization
-        let max_abs_dist = distances
-            .iter()
-            .map(|d| d.abs())
-            .fold(0.0f32, f32::max)
-            .max(1.0);
-
-        // Build ternary weights via sign-based quantization of random projections
-        let mut engine = GpuInferenceEngine::new();
-        let in_features = 3;
-
-        // Input → Hidden
-        let w0 = random_ternary_weights(
-            device,
+        let _ = device;
+        todo!(
+            "STUB: GpuNeuralSdf::fit — ternary network fitting (hidden {}×{}) is not implemented; \
+             the previous body built a fixed +1/-1/0 pattern unrelated to the SDF (2026-09-17)",
             config.hidden_width,
-            in_features,
-            &points,
-            &distances,
+            config.num_hidden
         );
-        engine.add_layer(w0, Activation::ReLU);
-
-        // Hidden → Hidden
-        for _ in 1..config.num_hidden {
-            let w = random_ternary_projection(device, config.hidden_width, config.hidden_width);
-            engine.add_layer(w, Activation::ReLU);
-        }
-
-        // Hidden → Output (1)
-        let wout = random_ternary_projection(device, 1, config.hidden_width);
-        engine.add_layer(wout, Activation::None);
-
-        Self {
-            engine,
-            bounds_min: bounds_min.to_array(),
-            bounds_max: bounds_max.to_array(),
-            dist_scale: max_abs_dist,
-        }
     }
 
     /// Evaluate the neural SDF at a batch of points on the GPU.
@@ -176,45 +160,6 @@ fn sample_training_data(
     }
 
     (points, distances)
-}
-
-/// Create ternary weights based on training data correlation.
-fn random_ternary_weights(
-    device: &GpuDevice,
-    out_features: usize,
-    in_features: usize,
-    _points: &[f32],
-    _distances: &[f32],
-) -> GpuTernaryWeight {
-    // Simple pattern: alternate +1/-1/0 for initial projection
-    let values: Vec<i8> = (0..out_features * in_features)
-        .map(|i| match i % 3 {
-            0 => 1,
-            1 => -1,
-            _ => 0,
-        })
-        .collect();
-    GpuTernaryWeight::from_ternary(device, &values, out_features, in_features)
-}
-
-/// Create a random ternary projection matrix.
-fn random_ternary_projection(
-    device: &GpuDevice,
-    out_features: usize,
-    in_features: usize,
-) -> GpuTernaryWeight {
-    let values: Vec<i8> = (0..out_features * in_features)
-        .map(|i| {
-            // Hash-based pseudo-random ternary
-            let h = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) >> 62;
-            match h {
-                0 => 1,
-                1 => -1,
-                _ => 0,
-            }
-        })
-        .collect();
-    GpuTernaryWeight::from_ternary(device, &values, out_features, in_features)
 }
 
 #[cfg(test)]
