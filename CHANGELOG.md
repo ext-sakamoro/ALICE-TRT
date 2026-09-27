@@ -16,6 +16,9 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ## [Unreleased]
 
+### Changed
+- **License: `AGPL-3.0` → `AGPL-3.0 OR LicenseRef-Commercial` (dual-licensed、2026-09-27)** AGPL 側の条件は変更なし (既存 AGPL 利用者への影響ゼロ)、商用という選択肢が追加されただけ SPDX が AGPL 単独だと cargo-deny / FOSSA / SBOM に「商用オプションなし」と見えるため宣言を dual に 変更点: SPDX / `LICENSE` → `LICENSE-AGPL` rename / `LICENSE-COMMERCIAL.md` (商用トリガー 6 条件 = クローズド製品・商用 SaaS・エッジ・ファームウェア配布・plugin 再配布・プラットフォーム NDA・保証、社内利用は AGPL 側で無償と明記) / README の選択肢表 商用窓口は法人 `contact@extoria.co.jp`
+
 ### Added
 - `tests/analytic_oracle.rs` — 閉形式 oracle 5 本 + ignore 1 (CLAUDE.md § 解析解突合テスト規律、2026-09-17): GPU 三値 matvec が simple / tiled 両 kernel で整数閉形式に exact、scaled kernel は γ 倍、`matmul_batch` の各行が `matvec` と bit 一致、ReLU、2 層 ReLU network の f64 閉形式、packed byte 数と圧縮率の閉形式 (`⌈in/32⌉` padding 込み)、Fix128 GPU add / sub / mul / div / sqrt / dot の dyadic 有理数 bit 一致 (0.5·0.25 = 0.125、1/4、√0.25 = 0.5、Σ i(i+1) = 91 520) + √2 / 1/3 を 1e-12、voice bridge の純音閉形式 (RMS = A/√2、ZCR = 2f/sr、centroid = ½、HTK mel 逆変換)、view bridge の解像度 CI の Fix128 GPU matrix job で実行 (device 不在は fail)
 

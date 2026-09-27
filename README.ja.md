@@ -385,6 +385,15 @@ CPU 側 `Fix128Gpu` は `sqrt` (v1.0.1、`alice_physics::Fix128::sqrt` に deleg
 
 ## ライセンス
 
-AGPL-3.0. [LICENSE](LICENSE) 参照。
+`AGPL-3.0 OR LicenseRef-Commercial` — デュアルライセンス どちらかを選べる
 
-Copyright (c) Moroya Sakamoto
+| 選択肢 | 条文 | こういう時 |
+|--------|------|-----------|
+| **AGPL-3.0** | [LICENSE-AGPL](LICENSE-AGPL) — 無償、報告義務なし | 自分の project も AGPL 互換の OSS、または社内利用のみ |
+| **商用ライセンス** | [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) — 有償、コピーレフト義務を解除 | クローズドソース製品 / 商用 SaaS / エッジ・ファームウェア配布 / plugin 再配布 / ソース開示を禁じるプラットフォーム NDA |
+
+AGPL は強いコピーレフト: `alice-trt` を link して配布 / 提供する製品・ファームウェア・
+サービスは AGPL で公開する義務がある これはオープンなエコシステムのための意図的な
+選択で、それが実行できない場合のために商用ライセンスを用意している
+
+商用ライセンスの問い合わせ: <contact@extoria.co.jp>
