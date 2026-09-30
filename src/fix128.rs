@@ -12439,13 +12439,8 @@ mod tests {
 
             // 5 adjacent-pair collision constraints.
             let mut constraints: Vec<ContactConstraint> = (0..5usize)
-                .map(|i| ContactConstraint {
-                    body_a: i,
-                    body_b: i + 1,
-                    contact: mk_contact((2, 10), (1, 1), (0, 1), (0, 1)),
-                    friction: PhysicsFix128::from_ratio(3, 10),
-                    restitution: PhysicsFix128::from_ratio(2, 10),
-                    cached_lambda: PhysicsFix128::ZERO,
+                .map(|i| {
+                    ContactConstraint::new(i, i + 1, mk_contact((2, 10), (1, 1), (0, 1), (0, 1)))
                 })
                 .collect();
 
@@ -12488,22 +12483,8 @@ mod tests {
                 Vec3Fix::new(PhysicsFix128::from_int(4), zero, zero),
             ];
             let constraints = vec![
-                ContactConstraint {
-                    body_a: 0,
-                    body_b: 1,
-                    contact: mk_contact((5, 10), (1, 1), (0, 1), (0, 1)),
-                    friction: PhysicsFix128::from_ratio(3, 10),
-                    restitution: PhysicsFix128::from_ratio(2, 10),
-                    cached_lambda: PhysicsFix128::ZERO,
-                },
-                ContactConstraint {
-                    body_a: 2,
-                    body_b: 3,
-                    contact: mk_contact((3, 10), (1, 1), (0, 1), (0, 1)),
-                    friction: PhysicsFix128::from_ratio(3, 10),
-                    restitution: PhysicsFix128::from_ratio(2, 10),
-                    cached_lambda: PhysicsFix128::ZERO,
-                },
+                ContactConstraint::new(0, 1, mk_contact((5, 10), (1, 1), (0, 1), (0, 1))),
+                ContactConstraint::new(2, 3, mk_contact((3, 10), (1, 1), (0, 1), (0, 1))),
             ];
             check_one_iteration(
                 "static+dynamic mix",
@@ -12537,30 +12518,9 @@ mod tests {
             ];
             let inv_masses = vec![one, one, one];
             let constraints = vec![
-                ContactConstraint {
-                    body_a: 0,
-                    body_b: 1,
-                    contact: mk_contact((2, 10), (1, 1), (0, 1), (0, 1)),
-                    friction: PhysicsFix128::from_ratio(3, 10),
-                    restitution: PhysicsFix128::from_ratio(2, 10),
-                    cached_lambda: PhysicsFix128::ZERO,
-                },
-                ContactConstraint {
-                    body_a: 0,
-                    body_b: 2,
-                    contact: mk_contact((3, 10), (0, 1), (1, 1), (0, 1)),
-                    friction: PhysicsFix128::from_ratio(3, 10),
-                    restitution: PhysicsFix128::from_ratio(2, 10),
-                    cached_lambda: PhysicsFix128::ZERO,
-                },
-                ContactConstraint {
-                    body_a: 1,
-                    body_b: 2,
-                    contact: mk_contact((4, 10), (1, 1), (1, 1), (0, 1)),
-                    friction: PhysicsFix128::from_ratio(3, 10),
-                    restitution: PhysicsFix128::from_ratio(2, 10),
-                    cached_lambda: PhysicsFix128::ZERO,
-                },
+                ContactConstraint::new(0, 1, mk_contact((2, 10), (1, 1), (0, 1), (0, 1))),
+                ContactConstraint::new(0, 2, mk_contact((3, 10), (0, 1), (1, 1), (0, 1))),
+                ContactConstraint::new(1, 2, mk_contact((4, 10), (1, 1), (1, 1), (0, 1))),
             ];
             check_one_iteration(
                 "triangle 3-body",

@@ -2329,18 +2329,17 @@ mod solver_bridge {
                 .collect();
             let inv_masses: Vec<Fix128> = (0..6).map(|_| Fix128::from_int(1)).collect();
             let constraints: Vec<ContactConstraint> = (0..5usize)
-                .map(|i| ContactConstraint {
-                    body_a: i,
-                    body_b: i + 1,
-                    contact: Contact {
-                        depth: Fix128::from_ratio(2, 10),
-                        normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
-                        point_a: Vec3Fix::ZERO,
-                        point_b: Vec3Fix::ZERO,
-                    },
-                    friction: Fix128::from_ratio(3, 10),
-                    restitution: Fix128::from_ratio(2, 10),
-                    cached_lambda: Fix128::ZERO,
+                .map(|i| {
+                    ContactConstraint::new(
+                        i,
+                        i + 1,
+                        Contact {
+                            depth: Fix128::from_ratio(2, 10),
+                            normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                            point_a: Vec3Fix::ZERO,
+                            point_b: Vec3Fix::ZERO,
+                        },
+                    )
                 })
                 .collect();
 
@@ -2502,19 +2501,16 @@ mod solver_bridge {
                 [Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO],
             ];
             let inv_masses: Vec<Fix128> = vec![Fix128::from_int(1), Fix128::from_int(1)];
-            let constraints: Vec<ContactConstraint> = vec![ContactConstraint {
-                body_a: 0,
-                body_b: 1,
-                contact: Contact {
+            let constraints: Vec<ContactConstraint> = vec![ContactConstraint::new(
+                0,
+                1,
+                Contact {
                     depth: Fix128::from_ratio(5, 10),
                     normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
                     point_a: Vec3Fix::ZERO,
                     point_b: Vec3Fix::ZERO,
                 },
-                friction: Fix128::from_ratio(3, 10),
-                restitution: Fix128::from_ratio(2, 10),
-                cached_lambda: Fix128::ZERO,
-            }];
+            )];
 
             // Reference: send-dispatch-recv 3 separate times.
             let mut ref_c = constraints.clone();
@@ -2865,18 +2861,17 @@ mod solver_bridge {
                 vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (2, 5)];
             let constraints: Vec<ContactConstraint> = pairs_usize
                 .iter()
-                .map(|&(a, b)| ContactConstraint {
-                    body_a: a,
-                    body_b: b,
-                    contact: Contact {
-                        depth: Fix128::from_ratio(2, 10),
-                        normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
-                        point_a: Vec3Fix::ZERO,
-                        point_b: Vec3Fix::ZERO,
-                    },
-                    friction: Fix128::from_ratio(3, 10),
-                    restitution: Fix128::from_ratio(2, 10),
-                    cached_lambda: Fix128::ZERO,
+                .map(|&(a, b)| {
+                    ContactConstraint::new(
+                        a,
+                        b,
+                        Contact {
+                            depth: Fix128::from_ratio(2, 10),
+                            normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                            point_a: Vec3Fix::ZERO,
+                            point_b: Vec3Fix::ZERO,
+                        },
+                    )
                 })
                 .collect();
 
@@ -2980,18 +2975,17 @@ mod solver_bridge {
             let pairs_usize: Vec<(usize, usize)> = vec![(0, 1), (2, 3), (4, 5)];
             let constraints: Vec<ContactConstraint> = pairs_usize
                 .iter()
-                .map(|&(a, b)| ContactConstraint {
-                    body_a: a,
-                    body_b: b,
-                    contact: Contact {
-                        depth: Fix128::from_ratio(2, 10),
-                        normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
-                        point_a: Vec3Fix::ZERO,
-                        point_b: Vec3Fix::ZERO,
-                    },
-                    friction: Fix128::from_ratio(3, 10),
-                    restitution: Fix128::from_ratio(2, 10),
-                    cached_lambda: Fix128::ZERO,
+                .map(|&(a, b)| {
+                    ContactConstraint::new(
+                        a,
+                        b,
+                        Contact {
+                            depth: Fix128::from_ratio(2, 10),
+                            normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                            point_a: Vec3Fix::ZERO,
+                            point_b: Vec3Fix::ZERO,
+                        },
+                    )
                 })
                 .collect();
 
@@ -3092,18 +3086,17 @@ mod solver_bridge {
             let pairs_usize: Vec<(usize, usize)> = vec![(0, 1), (0, 2), (0, 3), (0, 4)];
             let constraints: Vec<ContactConstraint> = pairs_usize
                 .iter()
-                .map(|&(a, b)| ContactConstraint {
-                    body_a: a,
-                    body_b: b,
-                    contact: Contact {
-                        depth: Fix128::from_ratio(2, 10),
-                        normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
-                        point_a: Vec3Fix::ZERO,
-                        point_b: Vec3Fix::ZERO,
-                    },
-                    friction: Fix128::from_ratio(3, 10),
-                    restitution: Fix128::from_ratio(2, 10),
-                    cached_lambda: Fix128::ZERO,
+                .map(|&(a, b)| {
+                    ContactConstraint::new(
+                        a,
+                        b,
+                        Contact {
+                            depth: Fix128::from_ratio(2, 10),
+                            normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                            point_a: Vec3Fix::ZERO,
+                            point_b: Vec3Fix::ZERO,
+                        },
+                    )
                 })
                 .collect();
 

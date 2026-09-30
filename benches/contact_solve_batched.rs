@@ -54,18 +54,17 @@ fn build_chain(n_constraints: usize) -> (Vec<[Fix128; 3]>, Vec<Fix128>, Vec<Cont
         .collect();
     let inv_masses: Vec<Fix128> = (0..n_bodies).map(|_| Fix128::from_int(1)).collect();
     let constraints: Vec<ContactConstraint> = (0..n_constraints)
-        .map(|i| ContactConstraint {
-            body_a: i,
-            body_b: i + 1,
-            contact: Contact {
-                depth: Fix128::from_ratio(2, 10),
-                normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
-                point_a: Vec3Fix::ZERO,
-                point_b: Vec3Fix::ZERO,
-            },
-            friction: Fix128::from_ratio(3, 10),
-            restitution: Fix128::from_ratio(2, 10),
-            cached_lambda: Fix128::ZERO,
+        .map(|i| {
+            ContactConstraint::new(
+                i,
+                i + 1,
+                Contact {
+                    depth: Fix128::from_ratio(2, 10),
+                    normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
+                    point_a: Vec3Fix::ZERO,
+                    point_b: Vec3Fix::ZERO,
+                },
+            )
         })
         .collect();
     (positions, inv_masses, constraints)
@@ -113,19 +112,16 @@ fn build_random_graph(
             if b < a {
                 std::mem::swap(&mut a, &mut b);
             }
-            ContactConstraint {
-                body_a: a,
-                body_b: b,
-                contact: Contact {
+            ContactConstraint::new(
+                a,
+                b,
+                Contact {
                     depth: Fix128::from_ratio(2, 10),
                     normal: Vec3Fix::new(Fix128::from_int(1), Fix128::ZERO, Fix128::ZERO),
                     point_a: Vec3Fix::ZERO,
                     point_b: Vec3Fix::ZERO,
                 },
-                friction: Fix128::from_ratio(3, 10),
-                restitution: Fix128::from_ratio(2, 10),
-                cached_lambda: Fix128::ZERO,
-            }
+            )
         })
         .collect();
     (positions, inv_masses, constraints)
