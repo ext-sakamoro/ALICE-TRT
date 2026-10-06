@@ -11,9 +11,9 @@
 //! `+1/−1/0` pattern and a hash-based random projection while its doc
 //! claimed to "fit a ternary neural network" — the returned field bore no
 //! relation to the SDF (oracle `tests/analytic_oracle.rs`, sphere RMS error
-//! ≈ radius; CLAUDE.md § 仮実装完了偽装の禁止).  The training path is
-//! alice-train (STE on CPU) → [`crate::GpuTernaryWeight::from_kernel`]; Backlog
-//! ALICE-TRT.  [`sample_training_data`] and [`GpuNeuralSdf::eval_batch`]
+//! ≈ radius).  The training path is
+//! alice-train (STE on CPU) → [`crate::GpuTernaryWeight::from_kernel`]; it is
+//! not implemented yet.  [`sample_training_data`] and [`GpuNeuralSdf::eval_batch`]
 //! are real and stay.
 //!
 //! # Pipeline

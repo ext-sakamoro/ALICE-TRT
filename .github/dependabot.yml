@@ -1,10 +1,9 @@
-# Dependabot 設定 (feedback_dependabot_major_bump_initial_wave 準拠)
+# Dependabot: GitHub Actions only, major bumps excluded (they need a manual review)
 #
-# 注: root cargo entry は意図的に削除 (= [[feedback_dependabot_cargo_sibling_path_deps]])
-# 理由: root Cargo.toml に sibling path dep (= path = "../ALICE-Xxxx") が存在し、
-#       dependabot は sibling repo を checkout しないため
-#       path_dependencies_not_reachable で fail する
-#       root 直接の cargo dep update は手動 `cargo update -p <name>` で対応
+# There is no root cargo entry: Cargo.toml declares sibling path dependencies
+# (path = "../ALICE-Xxxx") that Dependabot does not check out, so a cargo update
+# job fails with path_dependencies_not_reachable. Cargo dependencies are
+# updated by hand with `cargo update -p <name>`.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -18,4 +17,3 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
-

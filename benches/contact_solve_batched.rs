@@ -200,7 +200,7 @@ fn bench_random_graph(c: &mut Criterion) {
         // chromatic-number ceiling.
         let n_bodies = n_constraints / 5 + 10;
         let (positions, inv_masses, constraints) =
-            build_random_graph(n_bodies, n_constraints, 0xA11CE_DEAD_BEEF);
+            build_random_graph(n_bodies, n_constraints, 0x000A_11CE_DEAD_BEEF);
 
         group.bench_with_input(
             BenchmarkId::new("sequential", n_constraints),

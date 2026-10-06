@@ -68,6 +68,12 @@ pub struct NeuralUpscaler {
     pub total_inference_us: u64,
 }
 
+impl Default for NeuralUpscaler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NeuralUpscaler {
     pub fn new() -> Self {
         Self {
@@ -78,7 +84,6 @@ impl NeuralUpscaler {
 
     /// Process an upscale request (returns metadata; actual pixel data via View)
     pub fn upscale(&mut self, req: &UpscaleRequest) -> UpscaleResult {
-        let (iw, ih) = internal_resolution(req.output_width, req.output_height, req.quality);
         // Estimate inference time: ~1us per 1000 output pixels
         let total_pixels = req.output_width as u64 * req.output_height as u64;
         let inference_us = (total_pixels / 1000).max(1) as u32;

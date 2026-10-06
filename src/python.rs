@@ -4,6 +4,10 @@
 //!
 //! Author: Moroya Sakamoto
 
+// The `#[pymethods]` expansion of pyo3 0.22 converts `PyErr` into itself for
+// methods returning `PyResult`; the lint fires on generated code.
+#![allow(clippy::useless_conversion)]
+
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -24,7 +28,7 @@ impl PyGpuDevice {
     fn new() -> PyResult<Self> {
         crate::GpuDevice::new()
             .map(|d| Self { inner: d })
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(PyRuntimeError::new_err)
     }
 
     /// GPUアダプタ情報

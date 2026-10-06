@@ -12,7 +12,7 @@ Total stubs: 2
 
 ## Details
 
-### `/Users/ys/ALICE-TRT/src/physics_bridge.rs:1317` — SilentOk
+### `src/physics_bridge.rs:1317` — SilentOk
 
 - ID: `019f3cf8-8991-7461-929c-a0e80539ad20`
 - Severity: Critical
@@ -20,7 +20,7 @@ Total stubs: 2
 - Crate: alice-trt
 - Relocations: 3 (line drift detected)
 
-### `/Users/ys/ALICE-TRT/src/physics_bridge.rs:2463` — SilentOk
+### `src/physics_bridge.rs:2463` — SilentOk
 
 - ID: `019f3cf8-8991-7461-929c-a0fb74d7beea`
 - Severity: Critical

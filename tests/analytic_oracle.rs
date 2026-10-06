@@ -1,5 +1,5 @@
 //! Analytic oracles — closed-form checks for the GPU laws in ALICE-TRT
-//! (CLAUDE.md § 解析解突合テスト規律, 2026-09-17).
+//! (2026-09-17).
 //!
 //! Every expected value is a closed form or an f64 reference computed in this
 //! file; nothing is produced by the crate function under test.  The GPU is
@@ -409,7 +409,7 @@ fn view_bridge_internal_resolution_is_output_times_render_scale() {
 
 #[cfg(feature = "sdf")]
 #[test]
-#[ignore = "GpuNeuralSdf::fit は未実装 (2026-09-17 まで固定 +1/−1/0 pattern を『fit』と称して返していた、今は todo! で fail fast) — Backlog ALICE-TRT の fit 実装 (alice-train STE) 後に ignore を外す"]
+#[ignore = "GpuNeuralSdf::fit は未実装 (2026-09-17 まで固定 +1/−1/0 pattern を『fit』と称して返していた、今は todo! で fail fast) — fit 実装 (alice-train STE) 後に ignore を外す"]
 fn neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius() {
     use alice_sdf::prelude::{SdfNode, Vec3};
     use alice_trt::sdf_bridge::{GpuNeuralSdf, NeuralSdfConfig};

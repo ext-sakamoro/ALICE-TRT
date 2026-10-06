@@ -2,6 +2,12 @@
 name = "alice-trt"
 version = "3.2.0"
 edition = "2021"
+# Compiled with exactly this toolchain in CI (ci.yml job `msrv`); the floor is set
+# by the `alice-ml` path dependency (const `Vec::len`, stable since 1.87).
+rust-version = "1.87"
+# MSRV-aware resolution: a fresh lockfile prefers dependency versions that
+# support `rust-version` (Cargo.lock is not committed for this library).
+resolver = "3"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 description = "GPU Ternary Inference Engine - Don't move data. Move the law."
 license = "AGPL-3.0 OR LicenseRef-Commercial"

@@ -1,0 +1,98 @@
+name: Security & Hygiene
+
+# - RustSec advisories (cargo audit), weekly as well as on dependency changes
+# - licence / advisory / source policy (cargo deny, deny.toml)
+# - unused dependencies (cargo machete)
+#
+# The ignored advisories are listed with their reason in deny.toml; the
+# `cargo audit` ignore list below is kept identical.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'src/**'
+      - 'build.rs'
+      - 'deny.toml'
+      - 'scripts/strip_sibling_deps.sh'
+      - '.github/actions/**'
+      - '.github/workflows/security-audit.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'src/**'
+      - 'build.rs'
+      - 'deny.toml'
+      - 'scripts/strip_sibling_deps.sh'
+      - '.github/actions/**'
+      - '.github/workflows/security-audit.yml'
+  schedule:
+    # Mondays 09:00 UTC: new advisories appear without a commit here
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "5"
+
+jobs:
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Cargo.lock is not committed; resolve it the way a fresh build would
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile
+      - name: Run cargo audit
+        run: |
+          cargo audit \
+            --deny yanked \
+            --ignore RUSTSEC-2025-0020 \
+            --ignore RUSTSEC-2026-0177 \
+            --ignore RUSTSEC-2024-0436
+
+  deny:
+    name: cargo deny (licences, advisories, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
+      - uses: dtolnay/rust-toolchain@stable
+      # installed directly: cargo-deny-action runs in a container that mounts
+      # only the workspace, so the sibling path dependencies are not visible
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Run cargo deny check all
+        run: cargo deny --all-features check all
+
+  unused-deps:
+    name: cargo machete (unused dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - name: Run cargo machete
+        run: cargo machete

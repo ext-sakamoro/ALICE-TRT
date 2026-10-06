@@ -2352,8 +2352,8 @@ mod solver_bridge {
                 warm_start_factor: Fix128,
                 w_sum_epsilon: Fix128,
             ) {
-                for i in 0..constraints.len() {
-                    let c = constraints[i];
+                for slot in constraints.iter_mut() {
+                    let c = *slot;
                     if c.contact.depth <= Fix128::ZERO {
                         continue;
                     }
@@ -2370,7 +2370,7 @@ mod solver_bridge {
                     if dlambda <= Fix128::ZERO {
                         continue;
                     }
-                    constraints[i].cached_lambda = c.cached_lambda + dlambda;
+                    slot.cached_lambda = c.cached_lambda + dlambda;
                     let correction = c.contact.normal * dlambda;
                     let ca = correction * (ma_inv * inv_w_sum);
                     let cb = correction * (mb_inv * inv_w_sum);
@@ -2473,7 +2473,7 @@ mod solver_bridge {
         /// in-place `cached_lambda` accumulation across successive
         /// dispatches. This is the byte-exact contract that lets
         /// higher-level orchestrators call `send_contact_constraints`
-        /// + `send_body_state` once at the start of a substep and
+        /// and `send_body_state` once at the start of a substep and
         /// then loop `dispatch_contact_solve_iteration` for
         /// `config.iterations` iterations (mirroring the CPU
         /// `substep` loop) without re-uploading between iterations.

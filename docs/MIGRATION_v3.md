@@ -186,4 +186,3 @@ If a future field addition breaks Send or Sync, this test fails at compile time.
 
 - `CHANGELOG.md` §[3.0.0] — full release notes with commit hash, test count, and CI matrix status.
 - alice-physics `CHANGELOG.md` §[0.11.0] — coordinated companion release.
-- `~/claude-config/memory/project_alice_trt_roadmap_post_v2_7_1.md` §Tier S — the original design brief that this release delivers.

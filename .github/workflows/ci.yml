@@ -9,6 +9,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job that builds the crate first clones the sibling path dependencies
+# with .github/actions/sibling-deps (ALICE-ML always, ALICE-Physics when the
+# job builds `physics` / `physics-solver`) and removes alice-sdf / alice-db from
+# Cargo.toml (scripts/strip_sibling_deps.sh). The `sdf`, `db` and `cuda`
+# features are therefore not built in CI (`cuda` needs nvcc).
+#
+# scripts/preflight.sh runs the same commands locally.
+
 jobs:
   fmt:
     name: Format
@@ -22,7 +30,7 @@ jobs:
         run: cargo fmt -- --check
 
   actionlint:
-    name: actionlint (workflow YAML 検証)
+    name: actionlint (workflow YAML)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -31,6 +39,111 @@ jobs:
         with:
           fail_level: error
           reporter: github-check
+
+  # public documents: no development-process vocabulary, device names or
+  # private names; CHANGELOG version headings and [Unreleased] categories well
+  # formed. Run on every OS so a locale or path difference in the checker
+  # itself shows up here rather than as a silent pass.
+  docs-lint:
+    name: Docs lint (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Docs lint (tests)
+        run: python scripts/test_docs_lint.py
+      - name: Docs lint (public documents, CHANGELOG structure)
+        run: python scripts/docs_lint.py --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: clippy
+      # pyo3 0.22 (feature `python`) supports CPython up to 3.13
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (default features, all targets)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (every feature CI builds, all targets)
+        run: cargo clippy --all-targets --features "ffi,python,view,voice,fix128-arithmetic,physics-solver" -- -D warnings
+
+  # Tests whose modules never create a GPU device (constraint graph colouring,
+  # WGSL source checks, the view / voice bridges) plus the doctests. They run on
+  # every OS independently of the adapter the runner exposes.
+  cpu-test:
+    name: Test without a GPU (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'false'
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (device-free modules, zero executed is red)
+        shell: bash
+        # quoted: a bare `::` makes YAML read the line as a mapping
+        run: 'bash scripts/cargo_test_nonzero.sh --lib --features "view,voice" -- constraint_graph:: kernel:: view_bridge:: voice_bridge::'
+      - name: Doctests (zero executed is red)
+        shell: bash
+        run: bash scripts/cargo_test_nonzero.sh --doc --features "ffi,view,voice"
+
+  # The declared `rust-version` is compiled with exactly that toolchain.
+  # Cargo.lock is not committed and `resolver = "3"` makes the fresh resolution
+  # prefer dependency versions that support it. Bump `rust-version` and the
+  # toolchain below in the same commit.
+  msrv:
+    name: MSRV (rust-version = 1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
+      - uses: dtolnay/rust-toolchain@1.87
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check on MSRV (lib, default features)
+        run: cargo +1.87 check --lib
+      - name: cargo check on MSRV (lib, every feature CI builds except python)
+        run: cargo +1.87 check --lib --features "ffi,view,voice,fix128-arithmetic,physics-solver"
+
+  doc:
+    name: Doc (RUSTDOCFLAGS=-Dwarnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc (no-deps, default features)
+        run: cargo doc --lib --no-deps
+        env:
+          RUSTDOCFLAGS: "-Dwarnings"
+      - name: cargo doc (no-deps, every feature CI builds except python)
+        run: cargo doc --lib --no-deps --features "ffi,view,voice,fix128-arithmetic,physics-solver"
+        env:
+          RUSTDOCFLAGS: "-Dwarnings"
 
   fix128-gpu-matrix:
     name: Fix128 GPU (${{ matrix.os }})
@@ -44,10 +157,8 @@ jobs:
 
       - name: Install Rust toolchain (pinned to rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.92.0
-        with:
-          components: clippy
 
-      - name: Install Vulkan / Mesa (Linux only — enables lavapipe software adapter)
+      - name: Install Vulkan / Mesa (Linux only, provides the lavapipe software adapter)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
@@ -66,104 +177,60 @@ jobs:
             target
           key: ${{ matrix.os }}-cargo-fix128-${{ hashFiles('Cargo.toml') }}
 
-      - name: Clone ALICE-ML (unconditional path dep used by src/weights.rs)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd ..
-          git clone --depth 1 https://github.com/ext-sakamoro/ALICE-ML.git
-
-      - name: Strip optional path deps from Cargo.toml (CI does not need them)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # `alice-physics` / `alice-sdf` / `alice-db` are declared as
-          # `path = "../ALICE-XX", optional = true` for local
-          # development. Each pulls a transitive tree of path deps
-          # (alice-db → alice-zip → ...) that CI cannot reasonably
-          # clone. Since `--features fix128-arithmetic` alone does
-          # not activate any of these three, we strip their declarations
-          # from Cargo.toml before build. The GPU matrix job is
-          # scoped to fix128 tests, so this narrows the CI surface
-          # rather than the tested surface.
-          #
-          # `sed -i.bak` is portable across BSD (macOS) and GNU (Linux).
-          # Remove the three optional declaration lines.
-          sed -i.bak '/^alice-physics = {/d; /^alice-sdf = {/d; /^alice-db = {/d' Cargo.toml
-          # Feature entries that reference the stripped crates must
-          # also go, otherwise cargo will complain about unknown deps.
-          sed -i.bak '/^physics = \["dep:alice-physics"/d' Cargo.toml
-          sed -i.bak '/^sdf = \["dep:alice-sdf"/d' Cargo.toml
-          sed -i.bak '/^db = \["dep:alice-db"/d' Cargo.toml
-          sed -i.bak '/^physics-solver = /d' Cargo.toml
-          rm -f Cargo.toml.bak
-          echo "--- stripped Cargo.toml [dependencies] ---"
-          grep -E "^(alice-|\[)" Cargo.toml || true
+      # this lane builds `fix128-arithmetic` alone, without alice-physics
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'false'
 
       - name: Build (fix128-arithmetic)
         run: cargo build --lib --features fix128-arithmetic
 
-      - name: Test — Fix128 CPU reference (always runs, no GPU dep)
+      - name: Test — Fix128 CPU reference (no GPU)
         run: cargo test --lib --features fix128-arithmetic fix128::tests::fix128_gpu_
-        # 11 CPU-only fixture tests (const / from_raw / add / sub / mul).
 
-      - name: Test — WGSL shader source symbol coverage (always runs, no GPU dep)
+      - name: Test — WGSL shader source symbol coverage (no GPU)
         run: cargo test --lib --features fix128-arithmetic fix128::tests::wgsl_
-        # 4 shader-source presence tests + naga compile checks (compile
-        # tests skip themselves when no adapter is available).
 
-      - name: Test — Fix128 GPU dispatch (all platforms — full 29 tests)
+      - name: Test — Fix128 GPU dispatch
         run: cargo test --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1
 
-      # 解析解 oracle (tests/analytic_oracle.rs): GPU 三値 matvec / 2 層 forward の整数閉形式、
-      # Fix128 GPU の dyadic 閉形式、voice / view bridge の閉形式 (CLAUDE.md § 解析解突合テスト規律)
-      # device 不在は fail (skip しない)
+      # Closed-form oracles (tests/analytic_oracle.rs): GPU ternary matvec and
+      # two-layer forward against integer closed forms, Fix128 GPU arithmetic
+      # against dyadic closed forms, voice / view bridges against closed forms.
+      # A missing adapter is a failure, not a skip.
+      #
+      # Known failure: on windows-latest (DX12 WARP software adapter) the test
+      # process crashes with STATUS_ACCESS_VIOLATION inside
+      # `gpu_ternary_matvec_is_the_exact_integer_dot_product_on_both_kernels`
+      # (since this step was added). The Fix128 GPU dispatch step above passes on
+      # the same adapter. The step stays gating; README "Validation and known
+      # defects" records the defect.
       - name: Test — analytic oracles (GPU + fix128 + voice / view bridges)
         run: cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --test-threads=1
-        # v0.8.1 candidate 1: eliminated `@builtin(workgroup_id)` from
-        # FIX128_DOT_WGSL Phase 1 shader by deriving the workgroup
-        # index from `global_invocation_id`. This test step will
-        # verify whether the WARP STATUS_ACCESS_VIOLATION was caused
-        # by the multi-builtin declaration pattern that WARP DXIL
-        # transpile mishandled. If Windows still crashes, subsequent
-        # candidates will target the 2-buffer bind group layout
-        # (Phase 2) and the sequential dispatch pattern.
 
+  # Byte-exact CPU-GPU goldens of the physics-solver pipeline (Morton sort, BVH
+  # build, find_pairs, sphere-sphere contact, PGS contact solve sequential and
+  # batched, PhysicsWorld step_with_bridge) on Metal, Vulkan lavapipe and DX12
+  # WARP.
+  #
+  # Known failure: on windows-latest (DX12 WARP) the test process exits with
+  # code 2173 inside `fix128::tests::wgpu_bvh_build_matches_cpu_golden` (since
+  # the BVH build kernel was added in v2.3.0). The lane is gating; README
+  # "Validation and known defects" records the defect.
   fix128-physics-solver-matrix:
-    # v2.8.1 (Tier B): 3-platform byte-exact CPU-GPU physics-solver
-    # golden lane. Extends the fix128-gpu-matrix job by keeping the
-    # `physics-solver` feature (and its `alice-physics` path dep) so
-    # the byte-exact CPU-GPU goldens for the Phase 3 pipeline
-    # (Morton sort / BVH build / find_pairs / sphere-sphere contact /
-    # PGS contact solve sequential + v2.8.0 batched / PhysicsWorld
-    # step_with_bridge) all run on Metal / Vulkan lavapipe / DX12 WARP
-    # instead of Mac M2 local only.
     name: Fix128 GPU + physics-solver goldens (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Windows DX12 WARP has a pre-existing v2.3.0 issue where
-    # `wgpu_bvh_build_matches_cpu_golden` crashes with exit code 2173
-    # inside the WARP DXIL translator. Tier B's goal is to establish
-    # 3-platform byte-exact CPU-GPU validation for the physics-solver
-    # golden surface: macOS Metal and Ubuntu Vulkan lavapipe already
-    # green at v2.8.1, and Windows crashes independently of v2.8.0.
-    # Marking the Windows lane `continue-on-error` records the failure
-    # without gating the overall CI status. Fixing the WARP crash is
-    # tracked as a follow-up (v2.8.2 or later, likely a shader-level
-    # tweak to the BVH build kernel identified during Phase 3 §3).
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain (pinned to rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.92.0
-        with:
-          components: clippy
 
-      - name: Install Vulkan / Mesa (Linux only — enables lavapipe software adapter)
+      - name: Install Vulkan / Mesa (Linux only, provides the lavapipe software adapter)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
@@ -182,45 +249,16 @@ jobs:
             target
           key: ${{ matrix.os }}-cargo-physics-solver-${{ hashFiles('Cargo.toml') }}
 
-      - name: Clone ALICE-ML (unconditional path dep used by src/weights.rs)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd ..
-          git clone --depth 1 https://github.com/ext-sakamoro/ALICE-ML.git
-
-      - name: Clone ALICE-Physics (path dep required by physics-solver feature)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd ..
-          git clone --depth 1 https://github.com/ext-sakamoro/ALICE-Physics.git
-
-      - name: Strip alice-sdf / alice-db path deps (not needed for physics-solver goldens)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Keep alice-physics + physics + physics-solver features. Only
-          # drop alice-sdf / alice-db (unrelated to the goldens) so CI
-          # does not need to clone them.
-          sed -i.bak '/^alice-sdf = {/d; /^alice-db = {/d' Cargo.toml
-          sed -i.bak '/^sdf = \["dep:alice-sdf"/d' Cargo.toml
-          sed -i.bak '/^db = \["dep:alice-db"/d' Cargo.toml
-          rm -f Cargo.toml.bak
-          echo "--- stripped Cargo.toml [dependencies] ---"
-          grep -E "^(alice-|\[)" Cargo.toml || true
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
 
       - name: Build (fix128-arithmetic + physics-solver)
         run: cargo build --lib --features fix128-arithmetic,physics-solver
 
-      - name: Test — physics-solver byte-exact CPU-GPU goldens (all platforms)
+      # The full lib suite with physics-solver enabled. Tests that create a
+      # `GpuDevice` return early when the runner exposes no adapter; every
+      # runner in this matrix has one (Metal / lavapipe / WARP), so the goldens
+      # execute and fail on any byte difference.
+      - name: Test — physics-solver byte-exact CPU-GPU goldens
         run: cargo test --lib --features fix128-arithmetic,physics-solver -- --nocapture --test-threads=1
-        # Runs the full 221-test lib suite with physics-solver enabled.
-        # Tests that construct a `GpuDevice` bail out gracefully with
-        # `Ok(d) => d, Err(_) => return` on CI runners without a working
-        # adapter, so the surface is bounded to what the runner can
-        # actually validate. On working adapters (Mac Metal / Ubuntu
-        # Vulkan lavapipe / Windows DX12 WARP) the byte-exact CPU-GPU
-        # goldens for Phase 2/3 kernels + v2.8.0 batched PGS contact
-        # solve execute and fail hard on divergence.
-

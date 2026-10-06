@@ -1,0 +1,32 @@
+name: Sibling path dependencies
+description: >-
+  Clone the ALICE sibling crates that Cargo.toml declares as path dependencies
+  next to the checkout, and strip the ones this job does not build.
+inputs:
+  physics:
+    description: "'true' to clone ALICE-Physics (physics / physics-solver features); 'false' strips them"
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Clone ALICE-ML (unconditional path dependency)
+      shell: bash
+      run: |
+        set -euo pipefail
+        git clone --depth 1 https://github.com/ext-sakamoro/ALICE-ML.git ../ALICE-ML
+    - name: Clone ALICE-Physics (physics / physics-solver features)
+      if: inputs.physics == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        git clone --depth 1 https://github.com/ext-sakamoro/ALICE-Physics.git ../ALICE-Physics
+    - name: Strip the path dependencies this job does not build
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.physics }}" = "true" ]; then
+          bash scripts/strip_sibling_deps.sh
+        else
+          bash scripts/strip_sibling_deps.sh --drop-physics
+        fi

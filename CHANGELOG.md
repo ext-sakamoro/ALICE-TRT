@@ -16,14 +16,23 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ## [Unreleased]
 
-### Changed
-- **License: `AGPL-3.0` → `AGPL-3.0 OR LicenseRef-Commercial` (dual-licensed、2026-09-27)** AGPL 側の条件は変更なし (既存 AGPL 利用者への影響ゼロ)、商用という選択肢が追加されただけ SPDX が AGPL 単独だと cargo-deny / FOSSA / SBOM に「商用オプションなし」と見えるため宣言を dual に 変更点: SPDX / `LICENSE` → `LICENSE-AGPL` rename / `LICENSE-COMMERCIAL.md` (商用トリガー 6 条件 = クローズド製品・商用 SaaS・エッジ・ファームウェア配布・plugin 再配布・プラットフォーム NDA・保証、社内利用は AGPL 側で無償と明記) / README の選択肢表 商用窓口は法人 `contact@extoria.co.jp`
-
 ### Added
-- `tests/analytic_oracle.rs` — 閉形式 oracle 5 本 + ignore 1 (CLAUDE.md § 解析解突合テスト規律、2026-09-17): GPU 三値 matvec が simple / tiled 両 kernel で整数閉形式に exact、scaled kernel は γ 倍、`matmul_batch` の各行が `matvec` と bit 一致、ReLU、2 層 ReLU network の f64 閉形式、packed byte 数と圧縮率の閉形式 (`⌈in/32⌉` padding 込み)、Fix128 GPU add / sub / mul / div / sqrt / dot の dyadic 有理数 bit 一致 (0.5·0.25 = 0.125、1/4、√0.25 = 0.5、Σ i(i+1) = 91 520) + √2 / 1/3 を 1e-12、voice bridge の純音閉形式 (RMS = A/√2、ZCR = 2f/sr、centroid = ½、HTK mel 逆変換)、view bridge の解像度 CI の Fix128 GPU matrix job で実行 (device 不在は fail)
+
+- `NeuralUpscaler` に `Default` 実装 (`new()` と同じ)
+- `.github/workflows/security-audit.yml` (`cargo audit` / `cargo deny` / `cargo machete`、依存の変更時と週 1 回) と `deny.toml` 無視する advisory は pyo3 0.22 の 2 件 (feature `python` のみ、pyo3 の更新で解消) と wgpu-hal 経由の `paste` (unmaintained) で、理由を `deny.toml` に記載
+- `scripts/docs_lint.py` + `scripts/test_docs_lint.py`: 公開文書の語彙 (開発運用の語彙、機材名、非公開の名前) と CHANGELOG の版見出しを検査 CI の 3 OS と preflight で実行し、比較件数 0 は失敗
+- `scripts/cargo_test_nonzero.sh`: `cargo test` の実行件数が 0 なら失敗にする wrapper
+- `tests/analytic_oracle.rs` — 閉形式 oracle 5 本 + ignore 1 (2026-09-17): GPU 三値 matvec が simple / tiled 両 kernel で整数閉形式に exact、scaled kernel は γ 倍、`matmul_batch` の各行が `matvec` と bit 一致、ReLU、2 層 ReLU network の f64 閉形式、packed byte 数と圧縮率の閉形式 (`⌈in/32⌉` padding 込み)、Fix128 GPU add / sub / mul / div / sqrt / dot の dyadic 有理数 bit 一致 (0.5·0.25 = 0.125、1/4、√0.25 = 0.5、Σ i(i+1) = 91 520) + √2 / 1/3 を 1e-12、voice bridge の純音閉形式 (RMS = A/√2、ZCR = 2f/sr、centroid = ½、HTK mel 逆変換)、view bridge の解像度 CI の Fix128 GPU matrix job で実行 (device 不在は fail)
 
 ### Changed
-- **`sdf_bridge::GpuNeuralSdf::fit` は `todo!` で fail fast** (仮実装の露呈、CLAUDE.md § 仮実装完了偽装の禁止): 2026-09-17 まで「fit a ternary neural network」と doc しながら training data を捨て、固定 `+1/−1/0` pattern と hash random projection で network を組んで返していた (sphere の oracle で RMS 誤差 ≈ 半径、`tests/analytic_oracle.rs` の ignore test に記録) 偽 builder 2 関数を削除、module doc に status 明記 fit 実装 (alice-train STE → `GpuTernaryWeight::from_kernel`) は Backlog
+
+- **CI**: `ci.yml` に clippy (`-D warnings`、既定 feature と CI が build する全 feature の 2 通り、all targets)、GPU を使わない unit test と doctest の 3 OS job (実行件数 0 は失敗)、MSRV job、rustdoc (`-D warnings`)、docs lint の 3 OS job を追加 既存の GPU matrix 2 lane は維持し、sibling path 依存の clone と strip を `.github/actions/sibling-deps` + `scripts/strip_sibling_deps.sh` に集約 Windows DX12 WARP の goldens lane に付いていた `continue-on-error` を外した Windows DX12 WARP の既知の crash 2 件 (analytic oracle の `STATUS_ACCESS_VIOLATION`、`wgpu_bvh_build_matches_cpu_golden` の exit code 2173) は README の「既知の不具合」に記載し、CI では red のまま見える
+- **`scripts/preflight.sh`**: `ci.yml` と同じ command と引数で再構成 `--quick` でも GPU を使わない lib test と doctest を実行する
+- **README**: `README.ja.md` を `README_JP.md` に rename し、英日を同じ節構成 (インストール / 使用例 / 含まれるもの / feature / 検証と既知の不具合 / 性能 / MSRV / ビルドとテスト / 関連 crate / ライセンス) に再構成 本文中の古い版数と test 件数を削除、使用例は crate doc の例と同一にした 性能表の測定機は機材クラスで記載
+- **`rust-version = "1.87"`** (下限は path 依存の alice-ml が使う const `Vec::len`) と `resolver = "3"` を Cargo.toml に追加
+- clippy `-D warnings` を通すための書き換え (挙動の変更なし): `size_of_val` への置換、test 内 loop の `iter_mut` 化、doc の list 誤認の修正、bench の 16 進 literal の桁区切り、`view_bridge::NeuralUpscaler::upscale` の未使用の計算の削除、pyo3 0.22 の `#[pymethods]` 展開に対する `clippy::useless_conversion` の module 単位の許可、rustdoc の intra-doc link 1 件
+- **License: `AGPL-3.0` → `AGPL-3.0 OR LicenseRef-Commercial` (dual-licensed、2026-09-27)** AGPL 側の条件は変更なし (既存 AGPL 利用者への影響ゼロ)、商用という選択肢が追加されただけ SPDX が AGPL 単独だと cargo-deny / FOSSA / SBOM に「商用オプションなし」と見えるため宣言を dual に 変更点: SPDX / `LICENSE` → `LICENSE-AGPL` rename / `LICENSE-COMMERCIAL.md` (商用トリガー 6 条件 = クローズド製品・商用 SaaS・エッジ・ファームウェア配布・plugin 再配布・プラットフォーム NDA・保証、社内利用は AGPL 側で無償と明記) / README の選択肢表 商用窓口は法人 `contact@extoria.co.jp`
+- **`sdf_bridge::GpuNeuralSdf::fit` は `todo!` で fail fast** (未実装を明示): 2026-09-17 まで「fit a ternary neural network」と doc しながら training data を捨て、固定 `+1/−1/0` pattern と hash random projection で network を組んで返していた (sphere の oracle で RMS 誤差 ≈ 半径、`tests/analytic_oracle.rs` の ignore test に記録) 偽 builder 2 関数を削除、module doc に status 明記 fit 実装 (alice-train STE → `GpuTernaryWeight::from_kernel`) は未対応
 
 ## [3.2.0] - 2026-09-15
 
@@ -73,7 +82,7 @@ New public API:
 - `pub const alice_trt::fix128::FIX128_BALL_SOCKET_JOINT_SOLVE_WGSL: &str` — the full standalone WGSL module.
 - `pub struct alice_trt::fix128::BallSocketJointGpu` (128-byte `#[repr(C)] bytemuck::Pod`) — mirror of `alice_physics::joint::BallJoint`.
 - `pub fn alice_trt::fix128::dispatch_fix128_ball_socket_joint_solve(device, joints, positions, rotations, inv_masses, dt) -> Vec<Vec3FixGpu>` — Rust orchestrator; used both by golden tests and by the `TrtSolverAdapter::dispatch_joint_solve_iteration` trait impl.
-- `impl GpuSolverBridge for TrtSolverAdapter` overrides for `send_joints` / `send_body_rotations` / `dispatch_joint_solve_iteration` (v0.12.0 trait extension on alice-physics). `send_joints` filters to `Joint::Ball` variants and **panics fail-fast** on `Hinge` / `Fixed` / `Slider` / `Spring` / `D6` / `ConeTwist` per the CLAUDE.md 「仮実装完了偽装の禁止ルール」 — silent skip would ship a bridge that produces wrong physics without complaining. Callers with mixed joint types detach the bridge before `step` or wait for the coordinated variant releases (see `docs/PHASE_4_DESIGN.md` roadmap).
+- `impl GpuSolverBridge for TrtSolverAdapter` overrides for `send_joints` / `send_body_rotations` / `dispatch_joint_solve_iteration` (v0.12.0 trait extension on alice-physics). `send_joints` filters to `Joint::Ball` variants and **panics fail-fast** on `Hinge` / `Fixed` / `Slider` / `Spring` / `D6` / `ConeTwist` as an intentional fail-fast — silent skip would ship a bridge that produces wrong physics without complaining. Callers with mixed joint types detach the bridge before `step` or wait for the coordinated variant releases (see `docs/PHASE_4_DESIGN.md` roadmap).
 
 ### Byte-exact CPU-GPU goldens (3 new)
 
@@ -176,7 +185,7 @@ The v2.8.0 CHANGELOG previewed this trade-off: the v0.10.0 helper-method pattern
 
 ### Added — 3-platform byte-exact CPU-GPU physics-solver golden CI lane (Tier B)
 
-New `fix128-physics-solver-matrix` job in `.github/workflows/ci.yml` extends 3-platform verification (macos-latest Metal / ubuntu-latest Vulkan lavapipe / windows-latest DX12 WARP) to the full `--features fix128-arithmetic,physics-solver` byte-exact CPU-GPU golden surface. Prior to this release the physics-solver goldens (`fix128::tests::wgpu_morton_sort_matches_cpu_golden`, `fix128::tests::wgpu_sphere_sphere_contact_matches_cpu_golden`, and all `physics_bridge::solver_bridge::tests::*matches_cpu*` / `*matches_sequential*` / `*byte_exact*` tests) only ran on Mac M2 local; CI stripped the `physics-solver` feature to avoid cloning the `alice-physics` path dep.
+New `fix128-physics-solver-matrix` job in `.github/workflows/ci.yml` extends 3-platform verification (macos-latest Metal / ubuntu-latest Vulkan lavapipe / windows-latest DX12 WARP) to the full `--features fix128-arithmetic,physics-solver` byte-exact CPU-GPU golden surface. Prior to this release the physics-solver goldens (`fix128::tests::wgpu_morton_sort_matches_cpu_golden`, `fix128::tests::wgpu_sphere_sphere_contact_matches_cpu_golden`, and all `physics_bridge::solver_bridge::tests::*matches_cpu*` / `*matches_sequential*` / `*byte_exact*` tests) only ran locally (arm64 laptop GPU, Metal); CI stripped the `physics-solver` feature to avoid cloning the `alice-physics` path dep.
 
 The new job clones `alice-physics` sibling unconditionally, drops only the unrelated `alice-sdf` / `alice-db` optional path deps from `Cargo.toml`, and runs `cargo test --lib --features fix128-arithmetic,physics-solver -- --nocapture --test-threads=1`. Tests that construct a `GpuDevice` bail out gracefully on runners without a working adapter (`Ok(d) => d, Err(_) => return`), so the surface is bounded to what each runner can validate; on working adapters the byte-exact goldens fail hard on divergence.
 
@@ -215,7 +224,7 @@ Added `#[cfg(feature = "physics-solver")]` tests in `physics_bridge::solver_brid
 
 Total lib tests: **218 → 221** (all pass, zero regression against pre-v2.8.0 baseline).
 
-### Benchmarks (Mac M2 Metal, 4 PGS iterations per timed sample)
+### Benchmarks (arm64 laptop GPU via Metal, 4 PGS iterations per timed sample)
 
 New `benches/contact_solve_batched.rs` compares sequential vs batched throughput on two topologies (chain / random-graph) at N ∈ {100, 1000, 10000}:
 
@@ -238,7 +247,7 @@ Sequential path is dispatch-overhead-dominated up to N ≈ 1000, then scales rou
 
 ### Roadmap
 
-Tier A entry in `~/claude-config/memory/project_alice_trt_roadmap_post_v2_7_1.md` is now shipped. Remaining tiers unchanged: Tier B CI improvement (3-platform byte-exact CPU-GPU golden lane), Tier C Phase 4 (6DOF joints on GPU), Tier S v3.0.0 (Arc<GpuDevice> auto-routing, user demand only).
+Tier A of the post-v2.7.1 roadmap is now shipped. Remaining tiers unchanged: Tier B CI improvement (3-platform byte-exact CPU-GPU golden lane), Tier C Phase 4 (6DOF joints on GPU), Tier S v3.0.0 (Arc<GpuDevice> auto-routing, user demand only).
 
 ## [2.7.1] - 2026-07-07
 
@@ -337,7 +346,7 @@ Total 215 lib tests (previously 212), all pass on macOS Metal.
 
 ### Design doc
 
-- **`docs/PHASE_3_DESIGN.md` §2.8** — full v2.7.0 scope: `GpuSolverBridge` trait extension rationale, `panic!` default vs silent no-op discussion (with the CLAUDE.md silent-Ok(()) prohibition rule as the tie-breaker), `TrtSolverAdapter` state fields, trait-object usage example, CPU golden strategy, and v2.8.0 `PhysicsWorld` wire-through deferral rationale (lifetime + `Send + Sync` bound analysis complications).
+- **`docs/PHASE_3_DESIGN.md` §2.8** — full v2.7.0 scope: `GpuSolverBridge` trait extension rationale, `panic!` default vs silent no-op discussion (a no-op default that reports success for work never done was the deciding argument against), `TrtSolverAdapter` state fields, trait-object usage example, CPU golden strategy, and v2.8.0 `PhysicsWorld` wire-through deferral rationale (lifetime + `Send + Sync` bound analysis complications).
 
 ### Backwards compatibility
 
@@ -521,7 +530,7 @@ Fully additive vs v2.3.0. No API changes. The v2.3.0 `dispatch_fix128_bvh_build`
 
 Third implementation release of the Phase 3 GPU BVH pipeline. Ships the single-workgroup single-thread iterative port of `alice_physics::bvh::LinearBvh::build_recursive`, byte-identical to the CPU reference on the 3-platform CI matrix (Metal / Vulkan lavapipe / DX12 WARP). Additive-only; the v2.2.0 public surface remains stable.
 
-- **`FIX128_BVH_BUILD_WGSL` — full impl** (new WGSL constant). Single `@compute @workgroup_size(1)` entry `fix128_bvh_build_main` iteratively drives `build_recursive` via an explicit 128-slot continuation-passing-style `Frame` stack in workgroup memory. Each frame runs through three phases: (0) compute AABB union + leaf/internal decision, (1) after LEFT child returns, push RIGHT with inherited escape, (2) after RIGHT returns, write parent's `first_child_or_prim` + linear O(subtree_size) sweep to backfill placeholder escapes. Position-independent `LEFT_ESCAPE_PLACEHOLDER = 0u` mirrors the ALICE-Physics `dede78c` correctness fix — see [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md) §3.1 and the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill §11.4 for the discipline this preserves.
+- **`FIX128_BVH_BUILD_WGSL` — full impl** (new WGSL constant). Single `@compute @workgroup_size(1)` entry `fix128_bvh_build_main` iteratively drives `build_recursive` via an explicit 128-slot continuation-passing-style `Frame` stack in workgroup memory. Each frame runs through three phases: (0) compute AABB union + leaf/internal decision, (1) after LEFT child returns, push RIGHT with inherited escape, (2) after RIGHT returns, write parent's `first_child_or_prim` + linear O(subtree_size) sweep to backfill placeholder escapes. Position-independent `LEFT_ESCAPE_PLACEHOLDER = 0u` mirrors the ALICE-Physics `dede78c` correctness fix — see [`docs/PHASE_3_DESIGN.md`](docs/PHASE_3_DESIGN.md) §3.1 for the discipline this preserves.
 - **New public Rust struct `BvhNodeGpu`** (`#[repr(C)]`, 32 bytes): byte-layout mirror of `alice_physics::bvh::BvhNode`. Ships `from_physics(&BvhNode) -> BvhNodeGpu` for byte-exact test fixtures, plus `escape_idx()` / `prim_count()` accessors that unpack the `prim_count_escape` word identically to the CPU node.
 - **New public Rust struct `AabbI32Gpu`** (`#[repr(C)]`, 24 bytes): pre-quantised i32 AABB input to the build kernel. `from_physics_primitive(&BvhPrimitive)` applies the same `aabb_to_i32_min` (floor) / `aabb_to_i32_max` (ceil) rule as the CPU host; by monotonicity of floor/ceil the pre-quantised i32 fold is byte-exact equivalent to the CPU Fix128 fold + late quantisation. Both structs are gated behind `feature = "physics-solver"` because they consume the `alice_physics` types.
 - **New public Rust function** `dispatch_fix128_bvh_build(device, sorted_codes, sorted_indices, sorted_aabbs) -> Vec<BvhNodeGpu>`: full orchestrator. Uploads the three parallel input arrays (produced by v2.2.0's sort + host-side i32 pre-quantisation), dispatches at `(1, 1, 1)` workgroups, and reads back the actual node count from a separate atomic counter before trimming the output buffer to the tree's real size. Debug builds additionally invoke a private `debug_verify_escape_forward_impl` on the readback, which mirrors ALICE-Physics `LinearBvh::debug_verify_escape_forward` byte-exactly and panics on any backward or self-referential escape pointer.
@@ -579,7 +588,7 @@ Total 200 lib tests (previously 199), all pass on macOS Metal. The 3-platform CI
 
 ### Perf note
 
-The single-thread scatter runs at ~O(N) inside one workgroup. At N = 64 (the v2.2.0 golden fixture) the whole 8-pass sort completes in well under 1ms on M2 Metal. Parallel scatter with per-thread rank via input prefix sum is a v2.2.x optimisation; the correctness-first choice ships first so v2.3.0 BVH build can start integrating against a stable byte-exact contract immediately.
+The single-thread scatter runs at ~O(N) inside one workgroup. At N = 64 (the v2.2.0 golden fixture) the whole 8-pass sort completes in well under 1ms on an arm64 laptop GPU (Metal). Parallel scatter with per-thread rank via input prefix sum is a v2.2.x optimisation; the correctness-first choice ships first so v2.3.0 BVH build can start integrating against a stable byte-exact contract immediately.
 
 ### Next up (Phase 3 continuation)
 
@@ -1320,7 +1329,7 @@ The following surface is committed to remain source-compatible until v2.0.0:
 
 | Platform | Backend | fix128 (29) | physics-solver | Wall time |
 |----------|---------|:-----------:|:--------------:|----------:|
-| macos-latest | Metal (Apple M3) | ✓ | ✓ | fast |
+| macos-latest | Metal (arm64 runner) | ✓ | ✓ | fast |
 | ubuntu-latest | Vulkan (lavapipe SW) | ✓ | ✓ | fast |
 | windows-latest | DX12 (WARP SW) | ✓ | ✓ | fast |
 
@@ -1478,7 +1487,7 @@ Windows WARP is now fully verified for `add` / `sub` / `mul` / `dot` on all fixt
 
 ### Roadmap for v0.8.2+
 
-- criterion benchmark for measured speedup on Apple M3 Metal (deferred candidate)
+- criterion benchmark for measured speedup on the arm64 Metal runner (deferred candidate)
 - ALICE-Physics `GpuSolverBridge` live wiring (PGS iteration path)
 
 ### Backwards compatibility
@@ -1506,14 +1515,14 @@ The `wgpu 23 → 24` upgrade was originally motivated by the DX12 WARP `STATUS_A
 
 The determinism proofs are still verified on:
 
-- **Metal (Apple M3)** — full 29-test suite including `wgpu_dot_large_10000_matches_cpu_golden` (K = 3 workgroups)
+- **Metal (arm64 runner)** — full 29-test suite including `wgpu_dot_large_10000_matches_cpu_golden` (K = 3 workgroups)
 - **Vulkan (lavapipe software)** — full 29-test suite
 
 Together these cover the WGSL → MSL / SPIR-V transpile matrix. DXIL is verified for `add` / `sub` / `mul` (17 tests).
 
 ### Roadmap for v0.8.1+
 
-- criterion benchmark for measured speedup on Apple M3 Metal (deferred candidate)
+- criterion benchmark for measured speedup on the arm64 Metal runner (deferred candidate)
 - ALICE-Physics `GpuSolverBridge` live wiring (PGS iteration path)
 
 ### Backwards compatibility
@@ -1579,7 +1588,7 @@ Together these cover the WGSL → MSL / SPIR-V transpile matrix. DXIL is verifie
 ### Roadmap for v0.7.1+
 
 - Multi-workgroup dot for `N ≫ 4096` (Phase 3: cross-workgroup index-ordered final serial via second dispatch)
-- `criterion` benchmark for measured speedup on Apple M3 Metal
+- `criterion` benchmark for measured speedup on the arm64 Metal runner
 - Real hardware CI (self-hosted runner or GitHub-hosted GPU tier)
 
 ### Backwards compatibility

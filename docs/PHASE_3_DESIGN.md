@@ -138,7 +138,7 @@ The CPU `build_recursive` is a recursive function that produces a depth-first pr
 
 - **Single workgroup, single thread** (`@workgroup_size(1)`, dispatched with `dispatch_workgroups(1, 1, 1)`) — the entire build runs sequentially in one invocation. This eliminates every cross-thread ordering hazard that could break byte-exact parity: no `atomicAdd` for node insertion, no cross-workgroup scan for subtree sizes, no thread-local speculative construction. The node buffer's write order is exactly the CPU's `nodes.push()` order.
 - **Explicit stack in `var<function>` array** — WGSL has no recursion; we simulate `build_recursive` with a `Frame` struct that records `{ start, end, escape_idx, phase, node_idx, mid, left_idx, left_size }` and a fixed-size stack (`MAX_STACK_DEPTH = 128`). Each frame has three phases: (0) initial visit (compute AABB, possibly push leaf and return), (1) after left child returns (save `left_size`, push right child frame), (2) after right child returns (write parent's `first_child_or_prim`, sweep left subtree for placeholder backfill, pop frame). Return values propagate via a single u32 "return register" written by the popping frame and read by the parent frame in phase 1 or 2.
-- **`LEFT_ESCAPE_PLACEHOLDER = 0u`** — identical to the CPU convention. Index 0 is always the tree root; escape pointers strictly move forward; no legitimate escape target is ever 0. The GPU port MUST NOT use a position-dependent placeholder like `left_idx + 1` (see §3.1 and skill §11.4).
+- **`LEFT_ESCAPE_PLACEHOLDER = 0u`** — identical to the CPU convention. Index 0 is always the tree root; escape pointers strictly move forward; no legitimate escape target is ever 0. The GPU port MUST NOT use a position-dependent placeholder like `left_idx + 1` (see §3.1).
 - **Subtree-size return + linear sweep** — the popping frame writes `1 + left_size + right_size` (internal) or `1` (leaf) into the return register. When phase 2 completes, the caller sweeps `nodes[left_idx..left_idx + left_size]` in a single `for` loop, replacing every `escape_idx() == LEFT_ESCAPE_PLACEHOLDER` node with the real `right_idx = left_idx + left_size`. No leftmost-spine recursion; no `old_escape == root + 1` matching.
 
 The alternative (parallel top-down BVH construction via Karras-style hierarchical linear BVH with atomic index generation) is 10-100x faster on large inputs but requires fresh determinism analysis and would ship as v2.3.x optimisation. The v2.3.0 correctness-first choice lets v2.4.0 (find_pairs) integrate against a stable byte-exact contract from day one.
@@ -193,7 +193,7 @@ The byte-exact assert compares the raw byte slices via `bytemuck::cast_slice`. N
 
 - **Pile** (32 primitives): tightly packed spheres at slightly offset positions in a 4×4×2 pile. Exercises balanced Morton splits + escape pointer chaining through several levels. Mirrors the `stage_breakdown_collider` bench fixture that surfaced the `dede78c` correctness fix.
 - **Uniform grid** (27 primitives): 3×3×3 lattice on integer coordinates. Exercises the "highest differing bit" split path across three cardinal axes and forces balanced tree depth.
-- **Degenerate all-colocated** (16 primitives): all AABBs at the origin. Exercises the `first_code == last_code` branch of `find_split` (falls back to `(start + end) / 2`) plus the AABB-union no-op path. This is the same degenerate configuration that stress-tests the CPU recursion for placeholder collision (skill §11.4).
+- **Degenerate all-colocated** (16 primitives): all AABBs at the origin. Exercises the `first_code == last_code` branch of `find_split` (falls back to `(start + end) / 2`) plus the AABB-union no-op path. This is the same degenerate configuration that stress-tests the CPU recursion for placeholder collision (§3.1).
 
 Fixture sizes ≤ 32 are chosen so the whole tree fits comfortably inside the stack depth budget (max recursion depth ≈ 5 for balanced N=32) and the byte-exact readback stays well under the 200KB / dispatch limit imposed by lavapipe.
 
@@ -226,7 +226,7 @@ The CPU `find_pairs` iterates each primitive in `bvh.primitives` order and calls
 - **Single workgroup, single thread** (`@workgroup_size(1)`, dispatched with `dispatch_workgroups(1, 1, 1)`) — the outer `for &prim_i in &self.primitives` loop runs sequentially on one invocation, and every inner tree walk shares that single thread's atomic emission counter. This is the same correctness-first choice as v2.3.0 and v2.2.0's scatter kernel: eliminates every cross-thread ordering hazard that could break byte-exact parity.
 - **Stackless traversal via escape pointers** — the inner query mirrors the CPU `query_callback` byte-for-byte: `idx = 0`; loop while `idx != ESCAPE_NONE && idx < node_count`; on AABB-hit-and-leaf emit each primitive and jump to `escape_idx()`; on AABB-hit-and-internal descend to `first_child_or_prim`; on AABB-miss skip via `escape_idx()`. Because the CPU passes `self.bounds` (the world AABB) as the query, every `intersects_i32` check passes and the walk visits every internal + leaf node in flat-array order. The escape pointer is still exercised on the leaf → next-sibling transition.
 - **`atomicAdd`-based pair emission** — pair output uses `atomicAdd(&counters[0], 1u)` to reserve a slot in `pairs_out`. The single-thread dispatch means only one invocation ever increments the counter, so `atomicAdd` is functionally equivalent to a plain increment; the atomic wrapper is kept for buffer-layout consistency with other Phase 3 kernels and to make future v2.4.x parallelisation a drop-in change. The `prim_i < prim_j` filter is applied at emission time (same as the CPU), so total emissions equal the final unique-pair count (no duplicates possible).
-- **Debug cycle guard (§11.4)** — per-primitive visit counter is capped at `2 * node_count`. On overflow, the kernel sets `atomicStore(&counters[1], 1u)` and breaks the current inner loop (production behaviour matches CPU: unbounded loop would OOM, we prefer graceful truncation + Rust-side panic). The Rust adapter reads `counters[1]` under `#[cfg(debug_assertions)]` and panics if non-zero. This is the mechanism the [design doc §3.1](#31-gpu-bvh-construction--114-discipline-applied) mandates for every Phase 3 traversal kernel.
+- **Debug cycle guard (§3.1)** — per-primitive visit counter is capped at `2 * node_count`. On overflow, the kernel sets `atomicStore(&counters[1], 1u)` and breaks the current inner loop (production behaviour matches CPU: unbounded loop would OOM, we prefer graceful truncation + Rust-side panic). The Rust adapter reads `counters[1]` under `#[cfg(debug_assertions)]` and panics if non-zero. This is the mechanism the [design doc §3.1](#31-gpu-bvh-construction--114-discipline-applied) mandates for every Phase 3 traversal kernel.
 
 The alternative (per-primitive parallel dispatch — one thread per outer-loop iteration) is a v2.4.x optimisation. It requires each thread to reserve a contiguous output range via prefix-sum on the per-primitive pair count, which is a two-dispatch pattern. The v2.4.0 correctness-first choice is single-thread; parallel dispatch lands additively once the byte-exact contract is locked.
 
@@ -283,7 +283,7 @@ Under `#[cfg(debug_assertions)]`, the Rust adapter reads `counters[1]` and panic
 {
     assert!(
         cycle_overflow == 0,
-        "BVH find_pairs cycle guard triggered: traversal visited > 2 * node_count nodes for at least one primitive. This indicates a malformed tree with backward escape pointers (skill §11.4)."
+        "BVH find_pairs cycle guard triggered: traversal visited > 2 * node_count nodes for at least one primitive. This indicates a malformed tree with backward escape pointers (§3.1)."
     );
 }
 ```
@@ -583,7 +583,7 @@ The v0.9.0 release of `alice-physics` extends the `GpuSolverBridge` trait with f
 - `recv_contact_constraints(&self, constraints: &mut [ContactConstraint])` — read back the post-solve `cached_lambda` warm-start state.
 - `recv_body_positions(&self, positions: &mut [[Fix128; 3]])` — read back the post-solve body positions.
 
-Every new method ships with a `panic!("...not implemented by this GpuSolverBridge backend")` default implementation. Silent no-op defaults (e.g., `fn ... {}`) were considered and rejected — they violate the ALICE-* silent-Ok(()) prohibition rule that CLAUDE.md documents (fake-success masking), and they would silently drop contact solve work on pre-v0.9 backends that don't override, leaving the caller with unchanged state that looks like a "no contacts fired" case. `panic!` surfaces the missing capability as a fail-fast bug the moment a caller tries to route contact solve through a backend that doesn't support it.
+Every new method ships with a `panic!("...not implemented by this GpuSolverBridge backend")` default implementation. Silent no-op defaults (e.g., `fn ... {}`) were considered and rejected — they would report success for work that was never done (fake-success masking), and they would silently drop contact solve work on pre-v0.9 backends that don't override, leaving the caller with unchanged state that looks like a "no contacts fired" case. `panic!` surfaces the missing capability as a fail-fast bug the moment a caller tries to route contact solve through a backend that doesn't support it.
 
 Backward compatibility is 100% source-compatible with v0.8.x: existing `GpuSolverBridge` implementations (including the `StubBridge` test type in alice-physics tests and any external backend) compile unchanged. The new methods only affect callers that opt in to the contact solve pipeline stage.
 
@@ -711,7 +711,7 @@ Every stage passes a byte-exact CPU-GPU golden on Metal / Vulkan lavapipe / DX12
 
 ## §3 Determinism Invariants
 
-Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogued in the [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) skill:
+Every Phase 3 kernel MUST avoid the five routes by which a fixed-point solver loses cross-platform determinism:
 
 1. **Broad-phase precision** — every AABB stays in Fix128Gpu space. No f32 intermediate for AABB overlap tests.
 2. **CORDIC / sqrt** — Newton-Raphson from v1.4.1 already ships; kernel callers use the byte-exact primitive.
@@ -719,7 +719,7 @@ Every Phase 3 kernel MUST preserve the five determinism-breaking routes catalogu
 4. **Rollback snapshot delta** — no new state on the GPU that isn't derivable from the CPU-side `PhysicsWorld` snapshot. GPU buffers are re-derived from state each frame.
 5. **Thread / workgroup traversal order** — the BVH build's escape pointer placement (§3.1 below) is position-independent and single-dispatch. Any parallelisation is deferred to a later kernel with fresh determinism analysis.
 
-### 3.1 GPU BVH construction — §11.4 discipline applied
+### 3.1 GPU BVH construction — escape-pointer discipline
 
 The July 2026 ALICE-Physics CPU BVH fix ([`dede78c`](https://github.com/ext-sakamoro/ALICE-Physics/commit/dede78c)) established the canonical reference implementation for escape-pointer BVH construction:
 
@@ -801,7 +801,7 @@ Kernel-specific CI gates:
 
 - **v2.1.0** (this session or next) — Fix128 AABB helpers + Morton code kernel + golden test. Additive; existing surface unchanged.
 - **v2.2.0** — Morton-based deterministic sort kernel + golden.
-- **v2.3.0** — GPU BVH build. Heaviest kernel; may split into v2.3.0 (build_recursive equivalent) and v2.3.1 (escape pointer sweep). §11.4 discipline applied throughout.
+- **v2.3.0** — GPU BVH build. Heaviest kernel; may split into v2.3.0 (build_recursive equivalent) and v2.3.1 (escape pointer sweep). §3.1 discipline applied throughout.
 - **v2.4.0** — GPU BVH find_pairs. Debug cycle guard on the adapter path.
 - **v2.5.0** — Sphere-sphere narrow-phase contact.
 - **v2.6.0** — GPU PGS contact solve + `TrtSolverAdapter` opt-in for the full pipeline.
@@ -832,5 +832,5 @@ New decisions get logged here with a date and rationale.
 - Companion roadmap: [`../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md`](../../ALICE-Physics/docs/GPU_OFFLOAD_ROADMAP.md)
 - CPU BVH implementation: [`../../ALICE-Physics/src/bvh.rs`](../../ALICE-Physics/src/bvh.rs)
 - CPU BVH July 2026 correctness fix: ALICE-Physics commit `dede78c`
-- Determinism discipline: [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md) §11.4
+- Determinism invariants: §3 above
 - Precedent releases: v1.4.2 (rigid rod on-device sqrt/div), v1.5.1 (batched dispatch), v1.6.0 (default flip), v2.0.0 (formal Phase 2 wrap).

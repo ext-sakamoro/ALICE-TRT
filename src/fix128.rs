@@ -30,10 +30,9 @@
 //! single-thread dispatches for sequence-order-sensitive stages
 //! (Morton scatter, BVH build / find_pairs, sphere-sphere contact),
 //! and using `atomicAdd` only for slot reservation into
-//! pre-allocated output buffers (not for reductions). See the
-//! [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md)
-//! skill §1 経路 3 (SIMD / subgroup reduce ordering) and §1 経路 5
-//! (thread traversal ordering) for the reference reasoning.
+//! pre-allocated output buffers (not for reductions). See
+//! `docs/PHASE_3_DESIGN.md` §3, routes 3 (SIMD / subgroup reduce ordering) and 5
+//! (thread traversal ordering), for the reference reasoning.
 //!
 //! # Feature
 //!
@@ -2671,9 +2670,7 @@ fn fix128_pgs_project_distance_batched_main(
 /// primitives; no cross-lane state, no comparison shortcuts on
 /// negative-zero. Consumers that use `aabb_union` on a colour-parallel
 /// dispatch must still enforce workgroup traversal order at the CPU
-/// side (see [determinism-lockstep §1 経路 5][skill]).
-///
-/// [skill]: https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md
+/// side (see `docs/PHASE_3_DESIGN.md` §3, route 5).
 ///
 /// # Layout
 ///
@@ -3517,7 +3514,7 @@ fn fix128_morton_sort_scatter_main() {
 /// per-thread rank via input prefix sum is a v2.2.x optimisation. At
 /// N ≤ 10000 (the current BVH broad-phase working set) the
 /// single-thread scatter dominates the frame budget but still fits
-/// well inside the target 60Hz step budget on M2 Metal — see the
+/// well inside the target 60Hz step budget on an arm64 laptop GPU (Metal) — see the
 /// v2.2.0 CHANGELOG for measurements.
 ///
 /// # Panics
@@ -3841,12 +3838,11 @@ pub fn dispatch_fix128_morton_sort(
 /// depth-first pre-order sequence of `BvhNodeGpu` records **byte-identical**
 /// to the CPU reference `LinearBvh::build(primitives).nodes`.
 ///
-/// # Discipline — §3.1 / skill §11.4
+/// # Discipline — `docs/PHASE_3_DESIGN.md` §3.1
 ///
 /// The build MUST preserve the four correctness invariants established by
 /// ALICE-Physics `dede78c` (2026-07-06 correctness fix; see
-/// [`deterministic-physics-lockstep-discipline`](https://github.com/ext-sakamoro/claude-config/blob/main/claude-skills/deterministic-physics-lockstep-discipline/SKILL.md)
-/// §11.4):
+/// `docs/PHASE_3_DESIGN.md` §3.1):
 ///
 /// 1. **Position-independent placeholder** — `LEFT_ESCAPE_PLACEHOLDER = 0u`.
 ///    Index 0 is always the tree root; escape pointers strictly move forward;
@@ -4198,7 +4194,7 @@ fn fix128_bvh_build_main() {
 
         // Linear sweep of the LEFT subtree, replacing every placeholder
         // escape with the real right_idx. Position-independent, single
-        // O(subtree_size) pass — the §11.4 discipline in action.
+        // O(subtree_size) pass — the §3.1 discipline in action.
         let end_of_left = left_idx + left_size;
         for (var slot: u32 = left_idx; slot < end_of_left; slot = slot + 1u) {
             let pce     = nodes_out[slot].prim_count_escape;
@@ -4654,7 +4650,7 @@ pub fn dispatch_fix128_bvh_build(
 /// strictly-greater node index. Backward escape pointers form cycles in
 /// stackless traversal and drive `find_pairs` into unbounded push loops
 /// (the 5 GB / n=50 pile SIGKILL that motivated the ALICE-Physics
-/// `dede78c` correctness fix — see skill §11.4).
+/// `dede78c` correctness fix — see `docs/PHASE_3_DESIGN.md` §3.1).
 ///
 /// Mirrors ALICE-Physics `LinearBvh::debug_verify_escape_forward`
 /// byte-exactly, including the vestigial `esc == ESCAPE_NONE` check
@@ -4708,7 +4704,7 @@ fn debug_verify_escape_forward_impl(nodes: &[BvhNodeGpu]) -> bool {
 ///     loop:
 ///         if idx == ESCAPE_NONE_24 or idx >= node_count: break
 ///         visits += 1
-///         if visits > 2 * node_count:              # §11.4 cycle guard
+///         if visits > 2 * node_count:              # §3.1 cycle guard
 ///             atomicStore(&counters[1], 1u); break
 ///         if intersects_node(idx, q):
 ///             if is_leaf(idx):
@@ -4724,7 +4720,7 @@ fn debug_verify_escape_forward_impl(nodes: &[BvhNodeGpu]) -> bool {
 ///             idx = escape
 /// ```
 ///
-/// # Discipline — §11.4 cycle guard
+/// # Discipline — §3.1 cycle guard
 ///
 /// Per-primitive visit counter is capped at `2 * node_count`. On
 /// overflow, the kernel sets `atomicStore(&counters[1], 1u)` and breaks
@@ -4934,7 +4930,7 @@ fn fix128_bvh_find_pairs_main() {
 /// # Debug invariant
 ///
 /// Under `#[cfg(debug_assertions)]` the adapter asserts that
-/// `counters[1] == 0` on readback — a non-zero flag means the §11.4
+/// `counters[1] == 0` on readback — a non-zero flag means the §3.1
 /// cycle guard fired for at least one primitive, which indicates a
 /// malformed tree with backward escape pointers that slipped past
 /// v2.3.0's `debug_verify_escape_forward` check.
@@ -5164,7 +5160,7 @@ pub fn dispatch_fix128_bvh_find_pairs(
     {
         assert!(
             cycle_overflow == 0,
-            "BVH find_pairs cycle guard triggered: at least one primitive's traversal exceeded 2 * node_count node visits. This indicates a malformed tree with backward escape pointers (skill §11.4)."
+            "BVH find_pairs cycle guard triggered: at least one primitive's traversal exceeded 2 * node_count node visits. This indicates a malformed tree with backward escape pointers (docs/PHASE_3_DESIGN.md §3.1)."
         );
     }
     #[cfg(not(debug_assertions))]
@@ -6660,7 +6656,7 @@ fn fix128_pgs_contact_solve_main() {
 ///
 /// # Determinism contract
 ///
-/// Colour buckets are produced by [`ConstraintGraph::greedy_color`]
+/// Colour buckets are produced by [`ConstraintGraph::greedy_color`](crate::constraint_graph::ConstraintGraph::greedy_color)
 /// which walks constraint indices in ascending order and uses only
 /// [`Vec`] (no `HashMap`, no thread-local state). The colour bucket
 /// content is therefore bit-identical across platforms and rustc
@@ -7391,9 +7387,8 @@ pub fn dispatch_fix128_pgs_contact_solve(
     device.submit(encoder);
     device.poll_wait();
 
-    let constraints_bytes: u64 =
-        (constraint_count * core::mem::size_of::<ContactConstraintGpu>()) as u64;
-    let positions_bytes: u64 = (positions.len() * core::mem::size_of::<Vec3FixGpu>()) as u64;
+    let constraints_bytes: u64 = core::mem::size_of_val(constraints) as u64;
+    let positions_bytes: u64 = core::mem::size_of_val(positions) as u64;
     let raw_constraints = device.read_buffer(&buf_constraints, constraints_bytes);
     let raw_positions = device.read_buffer(&buf_positions, positions_bytes);
 
@@ -7680,9 +7675,8 @@ pub fn dispatch_fix128_pgs_contact_solve_batched(
     // function anyway) but documents the lifetime intent.
     drop(color_buffers);
 
-    let constraints_bytes: u64 =
-        (constraint_count * core::mem::size_of::<ContactConstraintGpu>()) as u64;
-    let positions_bytes: u64 = (positions.len() * core::mem::size_of::<Vec3FixGpu>()) as u64;
+    let constraints_bytes: u64 = core::mem::size_of_val(constraints) as u64;
+    let positions_bytes: u64 = core::mem::size_of_val(positions) as u64;
     let raw_constraints = device.read_buffer(&buf_constraints, constraints_bytes);
     let raw_positions = device.read_buffer(&buf_positions, positions_bytes);
 
@@ -9396,7 +9390,7 @@ pub fn dispatch_fix128_ball_socket_joint_solve(
     device.submit(encoder);
     device.poll_wait();
 
-    let positions_bytes: u64 = (positions.len() * core::mem::size_of::<Vec3FixGpu>()) as u64;
+    let positions_bytes: u64 = core::mem::size_of_val(positions) as u64;
     let raw_positions = device.read_buffer(&buf_positions, positions_bytes);
     bytemuck::cast_slice(&raw_positions).to_vec()
 }
@@ -9415,9 +9409,9 @@ pub fn dispatch_fix128_ball_socket_joint_solve(
 ///
 /// # Determinism
 /// - Workgroup size is fixed at 64, dispatched in ascending
-///   `global_invocation_id` order (skill §1 経路 5).
+///   `global_invocation_id` order (`docs/PHASE_3_DESIGN.md` §3, route 5).
 /// - No `atomicAdd` / subgroup reductions are used inside the shader
-///   (skill §1 経路 3); each output index is computed by a single
+///   (`docs/PHASE_3_DESIGN.md` §3, route 3); each output index is computed by a single
 ///   thread from a single pair of inputs.
 /// - Rust-side `bytemuck::cast_slice` preserves the little-endian
 ///   `#[repr(C)] { hi: i64, lo: u64 }` layout, so the shader sees the
@@ -9804,7 +9798,7 @@ impl<'a> Fix128WgpuKernel<'a> {
 
     /// Dispatch the Fix128 `dot` kernel — computes `Σ a[i] × b[i]`
     /// via a two-phase multi-workgroup pipeline that preserves
-    /// canonical index order (determinism contract §1 経路 3).
+    /// canonical index order (`docs/PHASE_3_DESIGN.md` §3, route 3).
     ///
     /// # Pipeline
     ///
@@ -9977,8 +9971,8 @@ impl Fix128GpuKernel for Fix128WgpuKernel<'_> {
 /// Backends implementing this trait own a compute pipeline that
 /// materialises the four operations below. Element ordering of both
 /// inputs and the output slice must be preserved (index `i` in the
-/// output corresponds to inputs at index `i`) to satisfy the skill
-/// §1 経路 5 traversal-order contract.
+/// output corresponds to inputs at index `i`) to satisfy the
+/// traversal-order contract (`docs/PHASE_3_DESIGN.md` §3, route 5).
 ///
 /// # Slice length contract
 ///
@@ -11492,7 +11486,7 @@ mod tests {
         assert!(FIX128_BVH_BUILD_WGSL.contains("nodes_out"));
         assert!(FIX128_BVH_BUILD_WGSL.contains("node_count_out"));
         assert!(FIX128_BVH_BUILD_WGSL.contains("array<atomic<u32>, 1>"));
-        // Placeholder discipline constants (§3.1 / skill §11.4).
+        // Placeholder discipline constants (`docs/PHASE_3_DESIGN.md` §3.1).
         assert!(FIX128_BVH_BUILD_WGSL.contains("LEFT_ESCAPE_PLACEHOLDER: u32 = 0u"));
         assert!(FIX128_BVH_BUILD_WGSL.contains("ESCAPE_MASK_24"));
         // Continuation stack + helpers.
@@ -11530,7 +11524,7 @@ mod tests {
 
     /// Byte-exact GPU-CPU golden for the v2.3.0 BVH build kernel.
     ///
-    /// Exercises three fixtures that surface the §3.1 / skill §11.4
+    /// Exercises three fixtures that surface the `docs/PHASE_3_DESIGN.md` §3.1
     /// discipline requirements:
     ///
     /// 1. **Pile (32 primitives)** — tightly-packed spheres in a 4x4x2
@@ -11546,7 +11540,7 @@ mod tests {
     ///    `find_split` (falls back to `(start + end) / 2`) plus the
     ///    single-AABB world bounds. This is the same degenerate
     ///    configuration that stress-tests the CPU recursion for
-    ///    placeholder collision (skill §11.4).
+    ///    placeholder collision (`docs/PHASE_3_DESIGN.md` §3.1).
     ///
     /// For every fixture the CPU reference `LinearBvh::build(...).nodes`
     /// is compared byte-for-byte to the GPU output, and additionally the
@@ -11722,7 +11716,7 @@ mod tests {
         assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("fn node_prim_count"));
         assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("fn node_is_leaf"));
         assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("fn intersects_world"));
-        // §11.4 cycle guard identifiers.
+        // §3.1 cycle guard identifiers.
         assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("max_visits"));
         assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("2u * node_count"));
         assert!(FIX128_BVH_FIND_PAIRS_WGSL.contains("atomicStore(&counters[1]"));
@@ -12328,8 +12322,8 @@ mod tests {
             warm_start_factor: PhysicsFix128,
             w_sum_epsilon: PhysicsFix128,
         ) {
-            for i in 0..constraints.len() {
-                let c = constraints[i];
+            for slot in constraints.iter_mut() {
+                let c = *slot;
                 if c.contact.depth <= PhysicsFix128::ZERO {
                     continue;
                 }
@@ -12346,7 +12340,7 @@ mod tests {
                 if dlambda <= PhysicsFix128::ZERO {
                     continue;
                 }
-                constraints[i].cached_lambda = c.cached_lambda + dlambda;
+                slot.cached_lambda = c.cached_lambda + dlambda;
                 let correction = c.contact.normal * dlambda;
                 let ca = correction * (ma_inv * inv_w_sum);
                 let cb = correction * (mb_inv * inv_w_sum);

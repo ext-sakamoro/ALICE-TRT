@@ -56,7 +56,7 @@ Precomputing `dt_sq = dt * dt` on the CPU saves one Fix128 mul per joint inside 
 
 ### Non-Ball joint variants
 
-`TrtSolverAdapter::send_joints` **panics** with a "not implemented" message when the joint list contains any variant other than `Joint::Ball`. This is intentional fail-fast per the CLAUDE.md「仮実装完了偽装の禁止ルール」 — silent skip would ship a bridge that produces wrong physics without complaining. Callers with mixed joint types should either:
+`TrtSolverAdapter::send_joints` **panics** with a "not implemented" message when the joint list contains any variant other than `Joint::Ball`. This is an intentional fail-fast — silent skip would ship a bridge that produces wrong physics without complaining. Callers with mixed joint types should either:
 
 1. Detach the bridge (`world.take_gpu_solver_bridge()`) before calling `step`, so joint solve falls back to CPU which handles all variants; or
 2. Wait for the coordinated minor releases that add each variant's GPU kernel (see roadmap below).
@@ -132,4 +132,3 @@ Each variant follows the same v3.1.0 pattern: WGSL kernel byte-exact vs the CPU 
 - `CHANGELOG.md` §[3.1.0] — release notes with commit hashes and test counts.
 - alice-physics `CHANGELOG.md` §[0.12.0] — coordinated trait extension.
 - `docs/MIGRATION_v3.md` — v2 → v3 migration guide (Arc<GpuDevice> refactor from v3.0.0 — unchanged in v3.1.0).
-- `~/claude-config/memory/project_alice_trt_roadmap_post_v2_7_1.md` §Tier C — the original design brief that motivates Phase 4.
