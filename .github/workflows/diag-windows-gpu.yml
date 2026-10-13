@@ -1,0 +1,50 @@
+name: diag windows gpu
+
+# Diagnostic-only run (not for main): isolates which GPU test kills the test
+# process on windows-latest and prints the real exit status in hex.
+on:
+  push:
+    branches: ['ci/20261013-trt-windows-gpu-diag']
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUST_BACKTRACE: full
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
+      - name: Build tests
+        run: |
+          cargo test --no-run --test analytic_oracle --features fix128-arithmetic,voice,view
+          cargo test --no-run --lib --features fix128-arithmetic,physics-solver
+      - name: Each analytic_oracle test in its own process
+        continue-on-error: true
+        run: |
+          $names = cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --list --format terse 2>$null |
+            Where-Object { $_ -match ': test$' } | ForEach-Object { $_ -replace ': test$','' }
+          "tests: $($names.Count)"
+          foreach ($n in $names) {
+            cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --exact $n --nocapture --test-threads=1 *> "out-$($n -replace '[:]','_').log"
+            $code = $LASTEXITCODE
+            "{0}  exit={1} (0x{2:X8})" -f $n, $code, ([uint32]([int64]$code -band 0xFFFFFFFF))
+          }
+      - name: The full analytic_oracle binary, as CI runs it
+        continue-on-error: true
+        run: |
+          cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --nocapture --test-threads=1
+          "exit={0} (0x{1:X8})" -f $LASTEXITCODE, ([uint32]([int64]$LASTEXITCODE -band 0xFFFFFFFF))
+      - name: The BVH build golden alone
+        continue-on-error: true
+        run: |
+          cargo test --lib --features fix128-arithmetic,physics-solver -- --exact fix128::tests::wgpu_bvh_build_matches_cpu_golden --nocapture --test-threads=1
+          "exit={0} (0x{1:X8})" -f $LASTEXITCODE, ([uint32]([int64]$LASTEXITCODE -band 0xFFFFFFFF))
+      - name: Per-test logs (tail)
+        if: always()
+        run: Get-ChildItem out-*.log | ForEach-Object { "=== $($_.Name)"; Get-Content $_ -Tail 40 }
