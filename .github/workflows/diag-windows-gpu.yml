@@ -1,0 +1,40 @@
+name: diag windows gpu (bvh)
+
+# Diagnostic-only run (not for main): the BVH build golden on the windows-latest
+# adapter with wgpu logging, the backtrace and the process exit status.
+on:
+  push:
+    branches: ['ci/20261013-trt-bvh-diag']
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUST_BACKTRACE: full
+      RUST_LOG: wgpu_core=info,wgpu_hal=info,naga=warn
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
+      - name: Build tests
+        run: cargo test --no-run --lib --features fix128-arithmetic,physics-solver
+      - name: BVH build golden alone
+        continue-on-error: true
+        run: |
+          cargo test --lib --features fix128-arithmetic,physics-solver -- --exact fix128::tests::wgpu_bvh_build_matches_cpu_golden --nocapture --test-threads=1 *> bvh.log
+          "exit=$LASTEXITCODE (0x{0:X})" -f [long]$LASTEXITCODE
+          Get-Content bvh.log -Tail 120
+      - name: Other physics-solver goldens one by one
+        continue-on-error: true
+        run: |
+          $names = cargo test --lib --features fix128-arithmetic,physics-solver -- --list --format terse 2>$null |
+            Where-Object { $_ -match '^fix128::tests::wgpu_.*: test$' } | ForEach-Object { $_ -replace ': test$','' }
+          foreach ($n in $names) {
+            cargo test --lib --features fix128-arithmetic,physics-solver -- --exact $n --test-threads=1 *> $null
+            "$n exit=$LASTEXITCODE"
+          }
