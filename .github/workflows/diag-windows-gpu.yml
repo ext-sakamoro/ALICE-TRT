@@ -46,6 +46,15 @@ jobs:
               "$op $sz exit=$LASTEXITCODE last=$last"
             }
           }
+      - name: Tiled kernel variants, one process each
+        continue-on-error: true
+        run: |
+          cargo test --no-run --test diag_tiled
+          foreach ($v in 'v1','v2','v3','v5','minimal') {
+            $env:TRT_DIAG_VARIANT=$v
+            $last = (cargo test --test diag_tiled -- --nocapture 2>&1 | Select-String '\[diag\]' | Select-Object -Last 1)
+            "$v exit=$LASTEXITCODE last=$last"
+          }
       - name: The full analytic_oracle binary, as CI runs it
         continue-on-error: true
         run: |
