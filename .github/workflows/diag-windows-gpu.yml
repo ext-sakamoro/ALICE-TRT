@@ -1,0 +1,30 @@
+name: diag windows gpu (tiled fix)
+
+# Diagnostic-only run (not for main): the windows-latest commands of the two
+# Fix128 GPU jobs on the tiled-kernel fix, with the exit status printed.
+on:
+  push:
+    branches: ['ci/20261013-trt-tiled-barrier-diag']
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'true'
+      - name: analytic oracles (as the Fix128 GPU job runs them)
+        continue-on-error: true
+        run: |
+          cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --test-threads=1
+          "exit=$LASTEXITCODE"
+      - name: Fix128 GPU dispatch (lib)
+        continue-on-error: true
+        run: |
+          cargo test --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1
+          "exit=$LASTEXITCODE"
