@@ -60,6 +60,10 @@ jobs:
         run: python scripts/test_docs_lint.py
       - name: Docs lint (public documents, CHANGELOG structure)
         run: python scripts/docs_lint.py --check
+      - name: WGSL barrier lint (tests)
+        run: python scripts/test_wgsl_barrier_lint.py
+      - name: WGSL barrier lint (no return before a workgroup barrier)
+        run: python scripts/wgsl_barrier_lint.py
 
   clippy:
     name: Clippy
@@ -198,13 +202,9 @@ jobs:
       # two-layer forward against integer closed forms, Fix128 GPU arithmetic
       # against dyadic closed forms, voice / view bridges against closed forms.
       # A missing adapter is a failure, not a skip.
-      #
-      # Known failure: on windows-latest (DX12 WARP software adapter) the test
-      # process crashes with STATUS_ACCESS_VIOLATION inside
-      # `gpu_ternary_matvec_is_the_exact_integer_dot_product_on_both_kernels`
-      # (since this step was added). The Fix128 GPU dispatch step above passes on
-      # the same adapter. The step stays gating; README "Validation and known
-      # defects" records the defect.
+      # On windows-latest this runs on the DX12 WARP adapter, which faulted on
+      # the tiled matvec kernel while it returned before its workgroup barriers;
+      # scripts/wgsl_barrier_lint.py keeps that shape out of every kernel.
       - name: Test — analytic oracles (GPU + fix128 + voice / view bridges)
         run: cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --test-threads=1
 

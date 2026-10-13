@@ -54,6 +54,10 @@ step "ci.yml / docs-lint"
 python3 scripts/test_docs_lint.py
 python3 scripts/docs_lint.py --check
 
+step "ci.yml / wgsl-barrier-lint"
+python3 scripts/test_wgsl_barrier_lint.py
+python3 scripts/wgsl_barrier_lint.py
+
 step "ci.yml / clippy (default features, all targets)"
 cargo +1.92.0 clippy --all-targets -- -D warnings
 

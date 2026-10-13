@@ -173,12 +173,6 @@ dependencies that CI does not check out).
 
 Known defects:
 
-- **Windows DX12 WARP: the analytic oracle process crashes.** In the
-  `Fix128 GPU (windows-latest)` job, `tests/analytic_oracle.rs` terminates with
-  `STATUS_ACCESS_VIOLATION` inside
-  `gpu_ternary_matvec_is_the_exact_integer_dot_product_on_both_kernels`. The
-  Fix128 GPU unit tests pass on the same adapter. The job is red until this is
-  fixed.
 - **Windows DX12 WARP: the BVH build golden crashes.** In the
   `Fix128 GPU + physics-solver goldens (windows-latest)` job, the test process
   exits with code 2173 inside `fix128::tests::wgpu_bvh_build_matches_cpu_golden`

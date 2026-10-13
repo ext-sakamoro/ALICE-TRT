@@ -116,10 +116,13 @@ fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wgid: vec3<u32>,
 ) {
+    // No early return before the workgroup barriers below: every invocation of
+    // the workgroup must reach each `workgroupBarrier()`. An out-of-range
+    // workgroup reads nothing, contributes 0 and skips the guarded write
+    // (an early `return` here faults on the DX12 WARP adapter even though the
+    // condition is uniform across the workgroup).
     let row = wgid.x;
-    if (row >= params.out_features) {
-        return;
-    }
+    let row_in_bounds = row < params.out_features;
 
     let tid = lid.x;
     var local_acc: f32 = 0.0;
@@ -128,7 +131,7 @@ fn main(
     // Strided column processing: thread i handles columns i, i+256, i+512, ...
     var col = tid;
     loop {
-        if (col >= params.in_features) {
+        if (!row_in_bounds || col >= params.in_features) {
             break;
         }
 
@@ -163,8 +166,8 @@ fn main(
         stride = stride / 2u;
     }
 
-    // Thread 0 writes final result
-    if (tid == 0u) {
+    // Thread 0 writes final result (in-range rows only)
+    if (tid == 0u && row_in_bounds) {
         output[row] = partial_sums[0] * params.scale;
     }
 }

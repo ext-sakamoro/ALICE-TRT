@@ -18,6 +18,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Added
 
+- `scripts/wgsl_barrier_lint.py` + `scripts/test_wgsl_barrier_lint.py`: compute kernel の entry point で、最後の workgroup barrier より前に `return` / `discard` が無いことを検査 (`.wgsl` と `src/` の Rust 文字列内の WGSL) CI と preflight で実行し、entry point 0 件は失敗
 - `NeuralUpscaler` に `Default` 実装 (`new()` と同じ)
 - `.github/workflows/security-audit.yml` (`cargo audit` / `cargo deny` / `cargo machete`、依存の変更時と週 1 回) と `deny.toml` 無視する advisory は pyo3 0.22 の 2 件 (feature `python` のみ、pyo3 の更新で解消) と wgpu-hal 経由の `paste` (unmaintained) で、理由を `deny.toml` に記載
 - `scripts/docs_lint.py` + `scripts/test_docs_lint.py`: 公開文書の語彙 (開発運用の語彙、機材名、非公開の名前) と CHANGELOG の版見出しを検査 CI の 3 OS と preflight で実行し、比較件数 0 は失敗
@@ -33,6 +34,11 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 - clippy `-D warnings` を通すための書き換え (挙動の変更なし): `size_of_val` への置換、test 内 loop の `iter_mut` 化、doc の list 誤認の修正、bench の 16 進 literal の桁区切り、`view_bridge::NeuralUpscaler::upscale` の未使用の計算の削除、pyo3 0.22 の `#[pymethods]` 展開に対する `clippy::useless_conversion` の module 単位の許可、rustdoc の intra-doc link 1 件
 - **License: `AGPL-3.0` → `AGPL-3.0 OR LicenseRef-Commercial` (dual-licensed、2026-09-27)** AGPL 側の条件は変更なし (既存 AGPL 利用者への影響ゼロ)、商用という選択肢が追加されただけ SPDX が AGPL 単独だと cargo-deny / FOSSA / SBOM に「商用オプションなし」と見えるため宣言を dual に 変更点: SPDX / `LICENSE` → `LICENSE-AGPL` rename / `LICENSE-COMMERCIAL.md` (商用トリガー 6 条件 = クローズド製品・商用 SaaS・エッジ・ファームウェア配布・plugin 再配布・プラットフォーム NDA・保証、社内利用は AGPL 側で無償と明記) / README の選択肢表 商用窓口は法人 `contact@extoria.co.jp`
 - **`sdf_bridge::GpuNeuralSdf::fit` は `todo!` で fail fast** (未実装を明示): 2026-09-17 まで「fit a ternary neural network」と doc しながら training data を捨て、固定 `+1/−1/0` pattern と hash random projection で network を組んで返していた (sphere の oracle で RMS 誤差 ≈ 半径、`tests/analytic_oracle.rs` の ignore test に記録) 偽 builder 2 関数を削除、module doc に status 明記 fit 実装 (alice-train STE → `GpuTernaryWeight::from_kernel`) は未対応
+
+### Fixed
+
+- tiled 三値 matvec kernel (`in_features` ≥ 1024 で使う) が workgroup barrier の前で `return` しており、DX12 WARP adapter で test process ごと異常終了していた 全 invocation が barrier に到達する形に直し、範囲外の workgroup は 0 を寄与して書き込みだけを止める (Metal / Vulkan では結果は変わらない)
+
 
 ## [3.2.0] - 2026-09-15
 
