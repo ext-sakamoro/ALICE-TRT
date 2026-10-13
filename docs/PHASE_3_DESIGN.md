@@ -122,9 +122,9 @@ The GPU test dispatches 8 passes (or 7 with the top-bit guard), reads back the s
 
 The fixture size for the v2.2.0 golden is **64 primitives** — small enough to hand-verify and large enough to exceed the workgroup size (64) so cross-workgroup ordering is exercised.
 
-#### Skeleton in v2.1.x (this session)
+#### Skeleton in v2.1.x
 
-The `FIX128_MORTON_SORT_WGSL` constant lands in this session as a **skeleton preview** — struct definitions + bindings + a no-op smoke entry point, with the impl body marked `// TODO(v2.2.0-impl)`. Naga validation passes; no `#[deprecated]` attribute; no adapter integration. External `Fix128GpuKernel` implementers can start compiling against the binding-layout contract now and swap in the v2.2.0 impl body when it ships.
+The `FIX128_MORTON_SORT_WGSL` constant lands in v2.1.x as a **skeleton preview** — struct definitions + bindings + a no-op smoke entry point, with the impl body marked `// TODO(v2.2.0-impl)`. Naga validation passes; no `#[deprecated]` attribute; no adapter integration. External `Fix128GpuKernel` implementers can start compiling against the binding-layout contract now and swap in the v2.2.0 impl body when it ships.
 
 The version stays at 2.1.0 — a skeleton is not a functional promise, so no MINOR bump. The `Unreleased` section of `CHANGELOG.md` documents the skeleton so the v2.2.0 release notes can pick up the diff cleanly.
 
@@ -799,7 +799,7 @@ Kernel-specific CI gates:
 
 ## §7 Release Cadence
 
-- **v2.1.0** (this session or next) — Fix128 AABB helpers + Morton code kernel + golden test. Additive; existing surface unchanged.
+- **v2.1.0** — Fix128 AABB helpers + Morton code kernel + golden test. Additive; existing surface unchanged.
 - **v2.2.0** — Morton-based deterministic sort kernel + golden.
 - **v2.3.0** — GPU BVH build. Heaviest kernel; may split into v2.3.0 (build_recursive equivalent) and v2.3.1 (escape pointer sweep). §3.1 discipline applied throughout.
 - **v2.4.0** — GPU BVH find_pairs. Debug cycle guard on the adapter path.
