@@ -1,8 +1,8 @@
 //! Diagnostic-only (not for main): variants of the tiled ternary matvec kernel,
 //! one per process via TRT_DIAG_VARIANT, to find which construct faults.
 
-use alice_trt::prelude::*;
 use alice_trt::kernel::TERNARY_MATVEC_TILED_SHADER as V1;
+use alice_trt::prelude::*;
 use std::io::Write;
 
 fn step(s: &str) {
@@ -54,7 +54,11 @@ fn variant(name: &str) -> String {
 fn diag_tiled_variant() {
     let name = std::env::var("TRT_DIAG_VARIANT").unwrap();
     if name != "v1" && name != "minimal" {
-        assert_ne!(variant(&name), V1, "variant {name} did not change the kernel");
+        assert_ne!(
+            variant(&name),
+            V1,
+            "variant {name} did not change the kernel"
+        );
     }
     let (out, inp) = (3u32, 1024u32);
     let words = inp.div_ceil(32);
@@ -77,7 +81,9 @@ fn diag_tiled_variant() {
         cache: None,
     });
     let x: Vec<f32> = (0..inp).map(|i| (i % 7) as f32 - 3.0).collect();
-    let plus: Vec<u32> = (0..out * words).map(|i| 0x5555_5555u32.rotate_left(i)).collect();
+    let plus: Vec<u32> = (0..out * words)
+        .map(|i| 0x5555_5555u32.rotate_left(i))
+        .collect();
     let minus: Vec<u32> = plus.iter().map(|p| !p & 0x0F0F_0F0F).collect();
     let params: [u32; 8] = [inp, out, words, 1.0f32.to_bits(), 1, 0, 0, 0];
     let b_in = dev.create_buffer_init("in", bytemuck::cast_slice(&x));
@@ -86,17 +92,37 @@ fn diag_tiled_variant() {
     let b_out = dev.create_buffer_empty("out", u64::from(out) * 4);
     let b_par = dev.create_uniform_buffer("par", bytemuck::cast_slice(&params));
     let layout = pipe.get_bind_group_layout(0);
-    let all = [(0u32, &b_in), (1, &b_p), (2, &b_m), (3, &b_out), (4, &b_par)];
-    let used: &[u32] = if name == "minimal" { &[3] } else { &[0, 1, 2, 3, 4] };
+    let all = [
+        (0u32, &b_in),
+        (1, &b_p),
+        (2, &b_m),
+        (3, &b_out),
+        (4, &b_par),
+    ];
+    let used: &[u32] = if name == "minimal" {
+        &[3]
+    } else {
+        &[0, 1, 2, 3, 4]
+    };
     let entries: Vec<wgpu::BindGroupEntry> = all
         .iter()
         .filter(|(b, _)| used.contains(b))
-        .map(|(b, buf)| wgpu::BindGroupEntry { binding: *b, resource: buf.as_entire_binding() })
+        .map(|(b, buf)| wgpu::BindGroupEntry {
+            binding: *b,
+            resource: buf.as_entire_binding(),
+        })
         .collect();
-    let bg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries });
+    let bg = d.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &layout,
+        entries: &entries,
+    });
     let mut enc = d.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
         pass.set_pipeline(&pipe);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(out, 1, 1);
