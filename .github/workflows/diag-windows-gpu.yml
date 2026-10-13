@@ -32,19 +32,30 @@ jobs:
           "tests: $($names.Count)"
           foreach ($n in $names) {
             cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --exact $n --nocapture --test-threads=1 *> "out-$($n -replace '[:]','_').log"
-            $code = $LASTEXITCODE
-            "{0}  exit={1} (0x{2:X8})" -f $n, $code, ([uint32]([int64]$code -band 0xFFFFFFFF))
+            "$n  exit=$LASTEXITCODE"
+          }
+      - name: Ternary shapes x ops, one process each
+        continue-on-error: true
+        run: |
+          cargo test --no-run --test diag_ternary
+          foreach ($op in 'matvec','batch') {
+            foreach ($sz in '4x8','37x100','16x1024','3x2048','129x1100','32x32','1x1023','1x1024') {
+              $o,$i = $sz.Split('x')
+              $env:TRT_DIAG_OUT=$o; $env:TRT_DIAG_INP=$i; $env:TRT_DIAG_OP=$op
+              $last = (cargo test --test diag_ternary -- --nocapture 2>&1 | Select-String '\[diag\]' | Select-Object -Last 1)
+              "$op $sz exit=$LASTEXITCODE last=$last"
+            }
           }
       - name: The full analytic_oracle binary, as CI runs it
         continue-on-error: true
         run: |
           cargo test --test analytic_oracle --features fix128-arithmetic,voice,view -- --nocapture --test-threads=1
-          "exit={0} (0x{1:X8})" -f $LASTEXITCODE, ([uint32]([int64]$LASTEXITCODE -band 0xFFFFFFFF))
+          "exit=$LASTEXITCODE"
       - name: The BVH build golden alone
         continue-on-error: true
         run: |
           cargo test --lib --features fix128-arithmetic,physics-solver -- --exact fix128::tests::wgpu_bvh_build_matches_cpu_golden --nocapture --test-threads=1
-          "exit={0} (0x{1:X8})" -f $LASTEXITCODE, ([uint32]([int64]$LASTEXITCODE -band 0xFFFFFFFF))
+          "exit=$LASTEXITCODE"
       - name: Per-test logs (tail)
         if: always()
         run: Get-ChildItem out-*.log | ForEach-Object { "=== $($_.Name)"; Get-Content $_ -Tail 40 }
