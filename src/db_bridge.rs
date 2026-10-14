@@ -5,6 +5,7 @@
 //! Author: Moroya Sakamoto
 
 use alice_db::AliceDB;
+use std::io;
 
 /// Inference metric record
 #[derive(Debug, Clone)]
@@ -59,36 +60,51 @@ impl TrtDbStore {
     }
 
     /// Store an inference record keyed by model_hash + timestamp
-    pub fn store_record(&mut self, record: &InferenceRecord) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error when the blob write fails.
+    pub fn store_record(&mut self, record: &InferenceRecord) -> io::Result<()> {
         let mut key = [0u8; 24];
         key[0..16].copy_from_slice(&record.model_hash);
         key[16..24].copy_from_slice(&record.timestamp_ms.to_be_bytes());
-        self.db.put(&key, &record.to_bytes());
+        self.db.put_blob(&key, &record.to_bytes())?;
         self.total_records += 1;
+        Ok(())
     }
 
-    /// Query records by model hash and time range
-    pub fn query_by_model(&self, model_hash: &[u8; 16], from_ms: u64) -> Vec<InferenceRecord> {
-        let mut start = [0u8; 24];
-        start[0..16].copy_from_slice(model_hash);
-        start[16..24].copy_from_slice(&from_ms.to_be_bytes());
-        let mut end = [0u8; 24];
-        end[0..16].copy_from_slice(model_hash);
-        end[16..24].copy_from_slice(&u64::MAX.to_be_bytes());
-        self.db
-            .range(&start, &end)
+    /// Query records of a model with `timestamp_ms >= from_ms`, in ascending
+    /// timestamp order
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error when the blob scan fails.
+    pub fn query_by_model(
+        &self,
+        model_hash: &[u8; 16],
+        from_ms: u64,
+    ) -> io::Result<Vec<InferenceRecord>> {
+        Ok(self
+            .db
+            .scan_blob_prefix(model_hash)?
+            .into_iter()
             .filter_map(|(_k, v)| InferenceRecord::from_bytes(&v))
-            .collect()
+            .filter(|r| r.timestamp_ms >= from_ms)
+            .collect())
     }
 
     /// Compute average latency for a model in a time window
-    pub fn avg_latency_us(&self, model_hash: &[u8; 16], from_ms: u64) -> Option<f64> {
-        let records = self.query_by_model(model_hash, from_ms);
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error when the blob scan fails.
+    pub fn avg_latency_us(&self, model_hash: &[u8; 16], from_ms: u64) -> io::Result<Option<f64>> {
+        let records = self.query_by_model(model_hash, from_ms)?;
         if records.is_empty() {
-            return None;
+            return Ok(None);
         }
         let sum: u64 = records.iter().map(|r| r.latency_us as u64).sum();
-        Some(sum as f64 / records.len() as f64)
+        Ok(Some(sum as f64 / records.len() as f64))
     }
 }
 
@@ -116,5 +132,49 @@ mod tests {
     #[test]
     fn test_record_too_short() {
         assert!(InferenceRecord::from_bytes(&[0; 10]).is_none());
+    }
+
+    fn store() -> TrtDbStore {
+        let cfg = alice_db::StorageConfig::default();
+        TrtDbStore::new(AliceDB::in_memory(cfg).unwrap())
+    }
+
+    fn rec(hash: u8, ts: u64, latency_us: u32) -> InferenceRecord {
+        InferenceRecord {
+            model_hash: [hash; 16],
+            timestamp_ms: ts,
+            latency_us,
+            batch_size: 1,
+            throughput_fps: 1.0,
+        }
+    }
+
+    #[test]
+    fn test_store_and_query_round_trip_filters_model_and_time() {
+        let mut s = store();
+        s.store_record(&rec(1, 300, 30)).unwrap();
+        s.store_record(&rec(1, 100, 10)).unwrap();
+        s.store_record(&rec(1, 200, 20)).unwrap();
+        s.store_record(&rec(2, 150, 999)).unwrap();
+        assert_eq!(s.total_records, 4);
+
+        let all = s.query_by_model(&[1; 16], 0).unwrap();
+        let ts: Vec<u64> = all.iter().map(|r| r.timestamp_ms).collect();
+        assert_eq!(ts, vec![100, 200, 300]);
+
+        let tail = s.query_by_model(&[1; 16], 200).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert!(s.query_by_model(&[3; 16], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_avg_latency_closed_form() {
+        let mut s = store();
+        assert_eq!(s.avg_latency_us(&[1; 16], 0).unwrap(), None);
+        for (ts, l) in [(100, 10), (200, 20), (300, 60)] {
+            s.store_record(&rec(1, ts, l)).unwrap();
+        }
+        assert_eq!(s.avg_latency_us(&[1; 16], 0).unwrap(), Some(30.0));
+        assert_eq!(s.avg_latency_us(&[1; 16], 200).unwrap(), Some(40.0));
     }
 }

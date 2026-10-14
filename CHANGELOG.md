@@ -27,6 +27,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Changed
 
+- `db_bridge` (feature `db`) を ALICE-DB 0.5 の API に合わせた: 記録は `put_blob`、検索は `scan_blob_prefix` (model hash を prefix にし、`timestamp_ms >= from_ms` で絞る) `store_record` / `query_by_model` / `avg_latency_us` は storage error を握りつぶさず `io::Result` で返す (旧 API は存在しない `put(&[u8], &[u8])` / `range` を呼んでおり `--features db` は compile できなかった) 兄弟 ALICE-DB 0.5.0 で往復と平均 latency の closed form test を追加
 - **CI**: `ci.yml` に clippy (`-D warnings`、既定 feature と CI が build する全 feature の 2 通り、all targets)、GPU を使わない unit test と doctest の 3 OS job (実行件数 0 は失敗)、MSRV job、rustdoc (`-D warnings`)、docs lint の 3 OS job を追加 既存の GPU matrix 2 lane は維持し、sibling path 依存の clone と strip を `.github/actions/sibling-deps` + `scripts/strip_sibling_deps.sh` に集約 Windows DX12 WARP の goldens lane に付いていた `continue-on-error` を外した Windows DX12 WARP の既知の crash 2 件 (analytic oracle の `STATUS_ACCESS_VIOLATION`、`wgpu_bvh_build_matches_cpu_golden` の exit code 2173) は README の「既知の不具合」に記載し、CI では red のまま見える
 - **`scripts/preflight.sh`**: `ci.yml` と同じ command と引数で再構成 `--quick` でも GPU を使わない lib test と doctest を実行する
 - **README**: `README.ja.md` を `README_JP.md` に rename し、英日を同じ節構成 (インストール / 使用例 / 含まれるもの / feature / 検証と既知の不具合 / 性能 / MSRV / ビルドとテスト / 関連 crate / ライセンス) に再構成 本文中の古い版数と test 件数を削除、使用例は crate doc の例と同一にした 性能表の測定機は機材クラスで記載
