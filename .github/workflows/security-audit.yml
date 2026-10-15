@@ -64,7 +64,9 @@ jobs:
             --deny yanked \
             --ignore RUSTSEC-2025-0020 \
             --ignore RUSTSEC-2026-0177 \
-            --ignore RUSTSEC-2024-0436
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2026-0235 \
+            --ignore RUSTSEC-2025-0141
 
   deny:
     name: cargo deny (licences, advisories, bans, sources)

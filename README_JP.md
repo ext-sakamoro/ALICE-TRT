@@ -58,8 +58,8 @@ git clone https://github.com/ext-sakamoro/ALICE-TRT.git
 alice-trt = { path = "../ALICE-TRT" }
 ```
 
-`physics` / `physics-solver`、`sdf`、`db` feature はさらに `../ALICE-Physics`、
-`../ALICE-SDF`、`../ALICE-DB` を必要とする
+`physics` / `physics-solver`、`sdf` feature はさらに `../ALICE-Physics`、
+`../ALICE-SDF` を必要とする `db` feature は crates.io の `alice-db` 0.5 を使う
 
 ## 使用例
 
@@ -132,7 +132,7 @@ API の全体は生成ドキュメント (`cargo doc --open`) にある 物理 p
 | `cuda` | CUDA backend | NVIDIA CUDA Toolkit (`nvcc`) |
 | `physics` | `GpuPhysicsController` | `../ALICE-Physics` |
 | `sdf` | Neural SDF bridge | `../ALICE-SDF` |
-| `db` | ALICE-DB への推論 metrics | `../ALICE-DB` |
+| `db` | ALICE-DB への推論 metrics | `alice-db` 0.5 (crates.io) |
 | `view` | View helper | |
 | `voice` | Voice 特徴量 helper | |
 | `fix128-arithmetic` | Fix128 GPU kernel | |
@@ -156,13 +156,18 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) が検査するもの
   dyadic な閉形式と一致、view / voice helper が式と一致 GPU adapter が無い場合は
   skip でなく失敗にする
   <!-- claim-test: gpu_ternary_matvec_is_the_exact_integer_dot_product_on_both_kernels -->
+- **`db` bridge** ([src/db_bridge.rs](src/db_bridge.rs)、Linux / macOS / Windows):
+  disk 上の ALICE-DB に書いた record が reopen 後に bit 一致で読める、2 つの
+  model hash が混ざらない、query が timestamp 昇順 (0 と `u64::MAX` を含む) で
+  返り `from_ms` を含む
+  <!-- claim-test: round_trip_is_bit_equal_after_reopen -->
 - Linux / macOS / Windows での device を使わない unit test と doctest、
   `-D warnings` の clippy と rustdoc、MSRV の build、
   [security-audit.yml](.github/workflows/security-audit.yml) の `cargo audit` /
   `cargo deny` / `cargo machete`
 
 CI で build しないもの: `cuda` feature と TensorRT plugin (NVIDIA の runner が無い)、
-`sdf` / `db` feature (依存先の crate がさらに CI で checkout しない path 依存を持つ)
+`sdf` feature (依存先の crate がさらに CI で checkout しない path 依存を持つ)
 
 既知の不具合
 
@@ -180,9 +185,6 @@ CI で build しないもの: `cuda` feature と TensorRT plugin (NVIDIA の run
   なネットワークを返していた oracle
   `neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius` は fit が実装される
   まで `#[ignore]`
-- **`db` feature は現在の ALICE-DB に対して compile できない**
-  (`src/db_bridge.rs` が ALICE-DB に既に無い `range` method と `put` の signature
-  を使っている)
 - **`TrtSolverAdapter::assert_bit_exact_vs_cpu` は実行時に何も比較せず**
   `Ok(())` を返す バイト完全一致の根拠は上記の golden test
 - `TrtSolverAdapter::send_joints` は `Joint::Ball` のみ対応し、それ以外の joint

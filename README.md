@@ -61,8 +61,9 @@ git clone https://github.com/ext-sakamoro/ALICE-TRT.git
 alice-trt = { path = "../ALICE-TRT" }
 ```
 
-The `physics` / `physics-solver`, `sdf` and `db` features additionally need
-`../ALICE-Physics`, `../ALICE-SDF` and `../ALICE-DB`.
+The `physics` / `physics-solver` and `sdf` features additionally need
+`../ALICE-Physics` and `../ALICE-SDF`. The `db` feature takes `alice-db` 0.5
+from crates.io.
 
 ## Example
 
@@ -136,7 +137,7 @@ Design notes for the physics pipeline are in
 | `cuda` | CUDA backend | NVIDIA CUDA Toolkit (`nvcc`) |
 | `physics` | `GpuPhysicsController` | `../ALICE-Physics` |
 | `sdf` | Neural SDF bridge | `../ALICE-SDF` |
-| `db` | Inference metrics in ALICE-DB | `../ALICE-DB` |
+| `db` | Inference metrics in ALICE-DB | `alice-db` 0.5 (crates.io) |
 | `view` | View helpers | |
 | `voice` | Voice feature helpers | |
 | `fix128-arithmetic` | Fix128 GPU kernels | |
@@ -162,14 +163,20 @@ What CI checks ([.github/workflows/ci.yml](.github/workflows/ci.yml)):
   closed forms, and the view / voice helpers match their formulas. A missing GPU
   adapter fails these tests instead of skipping them.
   <!-- claim-test: gpu_ternary_matvec_is_the_exact_integer_dot_product_on_both_kernels -->
+- **`db` bridge** in [src/db_bridge.rs](src/db_bridge.rs) on Linux, macOS and
+  Windows: records written to an on-disk ALICE-DB read back bit-equal after
+  reopening, two model hashes stay separate, queries return ascending
+  timestamps (including 0 and `u64::MAX`) and `from_ms` is an inclusive lower
+  bound.
+  <!-- claim-test: round_trip_is_bit_equal_after_reopen -->
 - Device-free unit tests and doctests on Linux, macOS and Windows; clippy with
   `-D warnings`; rustdoc with `-D warnings`; the MSRV build; and, in
   [security-audit.yml](.github/workflows/security-audit.yml), `cargo audit`,
   `cargo deny` and `cargo machete`.
 
 Not built in CI: the `cuda` feature and the TensorRT plugin (no NVIDIA runner),
-and the `sdf` / `db` features (their sibling crates pull further path
-dependencies that CI does not check out).
+and the `sdf` feature (its sibling crate pulls further path dependencies that
+CI does not check out).
 
 Known defects:
 
@@ -182,9 +189,6 @@ Known defects:
   version returned a network unrelated to the SDF; the oracle
   `neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius` is `#[ignore]`d
   until fitting exists.
-- **The `db` feature does not compile against the current ALICE-DB**
-  (`src/db_bridge.rs` uses a `range` method and a `put` signature that ALICE-DB
-  no longer has).
 - **`TrtSolverAdapter::assert_bit_exact_vs_cpu` does not compare anything at run
   time** and returns `Ok(())`; the byte-exact property rests on the golden tests
   above.

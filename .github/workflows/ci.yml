@@ -11,9 +11,10 @@ env:
 
 # Every job that builds the crate first clones the sibling path dependencies
 # with .github/actions/sibling-deps (ALICE-ML always, ALICE-Physics when the
-# job builds `physics` / `physics-solver`) and removes alice-sdf / alice-db from
-# Cargo.toml (scripts/strip_sibling_deps.sh). The `sdf`, `db` and `cuda`
-# features are therefore not built in CI (`cuda` needs nvcc).
+# job builds `physics` / `physics-solver`) and removes alice-sdf from
+# Cargo.toml (scripts/strip_sibling_deps.sh). The `sdf` and `cuda` features
+# are therefore not built in CI (`cuda` needs nvcc). alice-db is resolved from
+# crates.io, so the `db` feature is built, linted and tested.
 #
 # scripts/preflight.sh runs the same commands locally.
 
@@ -84,7 +85,7 @@ jobs:
       - name: Clippy (default features, all targets)
         run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (every feature CI builds, all targets)
-        run: cargo clippy --all-targets --features "ffi,python,view,voice,fix128-arithmetic,physics-solver" -- -D warnings
+        run: cargo clippy --all-targets --features "ffi,python,view,voice,fix128-arithmetic,physics-solver,db" -- -D warnings
 
   # Tests whose modules never create a GPU device (constraint graph colouring,
   # WGSL source checks, the view / voice bridges) plus the doctests. They run on
@@ -111,6 +112,31 @@ jobs:
         shell: bash
         run: bash scripts/cargo_test_nonzero.sh --doc --features "ffi,view,voice"
 
+  # The `db` bridge (src/db_bridge.rs) over the blob store of alice-db, which
+  # is resolved from crates.io. No GPU device is created. It runs on every OS
+  # because alice-db writes files (blob WAL, lock file) through
+  # platform-specific code.
+  db-test:
+    name: DB bridge (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sibling-deps
+        with:
+          physics: 'false'
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (lib, db)
+        run: cargo check --lib --features db
+      - name: Test db bridge (zero executed is red)
+        shell: bash
+        # quoted: a bare `::` makes YAML read the line as a mapping
+        run: 'bash scripts/cargo_test_nonzero.sh --lib --features db -- db_bridge::'
+
   # The declared `rust-version` is compiled with exactly that toolchain.
   # Cargo.lock is not committed and `resolver = "3"` makes the fresh resolution
   # prefer dependency versions that support it. Bump `rust-version` and the
@@ -128,7 +154,7 @@ jobs:
       - name: cargo check on MSRV (lib, default features)
         run: cargo +1.87 check --lib
       - name: cargo check on MSRV (lib, every feature CI builds except python)
-        run: cargo +1.87 check --lib --features "ffi,view,voice,fix128-arithmetic,physics-solver"
+        run: cargo +1.87 check --lib --features "ffi,view,voice,fix128-arithmetic,physics-solver,db"
 
   doc:
     name: Doc (RUSTDOCFLAGS=-Dwarnings)
@@ -145,7 +171,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-Dwarnings"
       - name: cargo doc (no-deps, every feature CI builds except python)
-        run: cargo doc --lib --no-deps --features "ffi,view,voice,fix128-arithmetic,physics-solver"
+        run: cargo doc --lib --no-deps --features "ffi,view,voice,fix128-arithmetic,physics-solver,db"
         env:
           RUSTDOCFLAGS: "-Dwarnings"
 

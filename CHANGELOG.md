@@ -27,6 +27,9 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Changed
 
+- **依存**: `alice-db` を path 依存 (`../ALICE-DB`) から crates.io の `0.5` (`default-features = false`、`features = ["fs"]`) に変更 CI は `alice-db` を strip しなくなり、`db` feature を build する
+- **CI**: `ci.yml` に `db-test` job (3 OS、`cargo check --lib --features db` と `db_bridge::` の test、実行件数 0 は失敗) を追加 clippy / rustdoc / MSRV の feature 集合に `db` を追加 `scripts/preflight.sh` にも同じ step を追加
+- **security-audit**: `alice-db` が依存 graph に入ったため、`deny.toml` に `alice-db` の AGPL 例外を追加し、RUSTSEC-2026-0235 (rkyv 0.7 の Rc / Arc archive 検証、alice-db が archive する型は Rc / Arc を持たず非該当) と RUSTSEC-2025-0141 (bincode 1.3 unmaintained) を無視 (`cargo audit` の無視 list も同じ)
 - **CI**: `ci.yml` に clippy (`-D warnings`、既定 feature と CI が build する全 feature の 2 通り、all targets)、GPU を使わない unit test と doctest の 3 OS job (実行件数 0 は失敗)、MSRV job、rustdoc (`-D warnings`)、docs lint の 3 OS job を追加 既存の GPU matrix 2 lane は維持し、sibling path 依存の clone と strip を `.github/actions/sibling-deps` + `scripts/strip_sibling_deps.sh` に集約 Windows DX12 WARP の goldens lane に付いていた `continue-on-error` を外した Windows DX12 WARP の既知の crash 2 件 (analytic oracle の `STATUS_ACCESS_VIOLATION`、`wgpu_bvh_build_matches_cpu_golden` の exit code 2173) は README の「既知の不具合」に記載し、CI では red のまま見える
 - **`scripts/preflight.sh`**: `ci.yml` と同じ command と引数で再構成 `--quick` でも GPU を使わない lib test と doctest を実行する
 - **README**: `README.ja.md` を `README_JP.md` に rename し、英日を同じ節構成 (インストール / 使用例 / 含まれるもの / feature / 検証と既知の不具合 / 性能 / MSRV / ビルドとテスト / 関連 crate / ライセンス) に再構成 本文中の古い版数と test 件数を削除、使用例は crate doc の例と同一にした 性能表の測定機は機材クラスで記載
@@ -37,6 +40,8 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Fixed
 
+- **`db` feature が alice-db 0.5 に対して compile できなかった** (`cargo check --features db` が 4 error) `src/db_bridge.rs` は alice-db のどの版にも無い byte key の `put` / `range` を呼んでいた blob API (`put_blob` / `get_blob` / `scan_blob_prefix`) に書き直した key は `model_hash` 16 byte + `timestamp_ms` の big-endian 8 byte、値は従来どおり 34 byte の `InferenceRecord` (little-endian) `query_by_model` は model hash の prefix scan に `timestamp_ms >= from_ms` の filter を掛け、timestamp 昇順で返す (`u64::MAX` を含む) 旧 code は一度も compile できなかったので、旧形式で保存されたデータは存在しない
+- `TrtDbStore::store_record` / `query_by_model` / `avg_latency_us` は `io::Result` を返す (alice-db の I/O error を握りつぶさない) 値が decode できない record、key と値の timestamp が食い違う record は `InvalidData`
 - tiled 三値 matvec kernel (`in_features` ≥ 1024 で使う) が workgroup barrier の前で `return` しており、DX12 WARP adapter で test process ごと異常終了していた 全 invocation が barrier に到達する形に直し、範囲外の workgroup は 0 を寄与して書き込みだけを止める (Metal / Vulkan では結果は変わらない)
 
 
