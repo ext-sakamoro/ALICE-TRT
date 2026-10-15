@@ -58,6 +58,14 @@ jobs:
       # Cargo.lock is not committed; resolve it the way a fresh build would
       - name: Generate Cargo.lock
         run: cargo generate-lockfile
+      # RUSTSEC-2026-0235 (rkyv 0.7 Rc/Arc archive validation): rkyv is reached
+      # only through alice-db (`db` feature), whose archived types
+      # (SegmentMetadata / DataSegment / ModelType / DataType) hold no Rc / Arc,
+      # so the advisory does not apply. This crate neither depends on rkyv nor
+      # archives anything; scripts/no_direct_rkyv.py (ci.yml docs-lint and
+      # preflight) fails as soon as either changes. The root fix is alice-db
+      # moving off rkyv 0.7 (pending); the entry goes when that release is
+      # consumed.
       - name: Run cargo audit
         run: |
           cargo audit \

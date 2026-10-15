@@ -65,6 +65,10 @@ jobs:
         run: python scripts/test_wgsl_barrier_lint.py
       - name: WGSL barrier lint (no return before a workgroup barrier)
         run: python scripts/wgsl_barrier_lint.py
+      - name: No direct rkyv use (tests)
+        run: python scripts/test_no_direct_rkyv.py
+      - name: No direct rkyv use (the RUSTSEC-2026-0235 ignore depends on it)
+        run: python scripts/no_direct_rkyv.py
 
   clippy:
     name: Clippy
