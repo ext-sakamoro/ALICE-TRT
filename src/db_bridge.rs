@@ -415,6 +415,8 @@ mod tests {
         store.store_record(&rec(8, 1, 10)).unwrap();
         // a key under the prefix that is not 24 bytes is not a record
         store.db.put_blob(&[8; 20], b"other").unwrap();
+        // longer than a record key is not a record either
+        store.db.put_blob(&[8; 30], b"longer").unwrap();
         assert_eq!(timestamps(&store.query_by_model(&m, 0).unwrap()), vec![1]);
         // a record key whose value does not decode is an error, not a skip
         store.db.put_blob(&record_key(&m, 2), &[0; 10]).unwrap();
@@ -425,6 +427,14 @@ mod tests {
         store
             .db
             .put_blob(&record_key(&m, 3), &rec(8, 4, 10).to_bytes())
+            .unwrap();
+        let err = store.query_by_model(&m, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // a value whose model hash disagrees with its key is an error too
+        store.db.delete_blob(&record_key(&m, 3)).unwrap();
+        store
+            .db
+            .put_blob(&record_key(&m, 5), &rec(9, 5, 10).to_bytes())
             .unwrap();
         let err = store.query_by_model(&m, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
