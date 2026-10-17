@@ -153,9 +153,8 @@ mod tests {
 
     #[test]
     fn test_gpu_controller_creation() {
-        let device = match GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return, // No GPU available
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         // 6 → 4 → 3 network
@@ -1502,9 +1501,8 @@ mod solver_bridge {
         /// coordinate byte-for-byte (Fix128 hi/lo pair unchanged).
         #[test]
         fn trt_solver_adapter_zero_iter_round_trips() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -1553,9 +1551,8 @@ mod solver_bridge {
         /// byte. Skips when no GPU adapter is available.
         #[test]
         fn trt_solver_adapter_10_iter_matches_cpu_reference() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -1657,9 +1654,8 @@ mod solver_bridge {
         /// in both positions AND velocities (velocities now mutate).
         #[test]
         fn trt_solver_adapter_gravity_matches_cpu_reference() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -1748,9 +1744,8 @@ mod solver_bridge {
         /// byte-for-byte on every slot.
         #[test]
         fn trt_solver_adapter_floor_constraint_matches_cpu_reference() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -1852,9 +1847,8 @@ mod solver_bridge {
         /// apply split preserves ecosystem bit-exactness end-to-end.
         #[test]
         fn trt_solver_adapter_distance_constraint_matches_cpu_reference() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -1917,9 +1911,8 @@ mod solver_bridge {
         /// vector is bit-exact regardless of order.
         #[test]
         fn trt_solver_adapter_multi_distance_constraint_matches_cpu_reference() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -1980,9 +1973,8 @@ mod solver_bridge {
         /// `has_distance_constraints` mirrors it as a boolean.
         #[test]
         fn distance_constraint_count_and_has_predicate_track_installations() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -2013,9 +2005,8 @@ mod solver_bridge {
         /// is still fully supported via `set_parallel_dispatch(false)`.)
         #[test]
         fn parallel_dispatch_default_on_and_toggles() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -2038,9 +2029,8 @@ mod solver_bridge {
         /// asserts position-slot byte equality.
         #[test]
         fn parallel_dispatch_disjoint_matches_sequential_byte_for_byte() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 
@@ -2106,9 +2096,8 @@ mod solver_bridge {
         /// the coloring reorders constraints across insertion order.
         #[test]
         fn trt_solver_adapter_parallel_dispatch_matches_colored_cpu_reference() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 
@@ -2214,9 +2203,8 @@ mod solver_bridge {
         /// target rest length.
         #[test]
         fn parallel_dispatch_chain_produces_finite_positions() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 
@@ -2267,9 +2255,8 @@ mod solver_bridge {
         /// clear is applied).
         #[test]
         fn trt_solver_adapter_clear_distance_constraints_disables_projection() {
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -2320,9 +2307,8 @@ mod solver_bridge {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::ContactConstraint;
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return, // Headless CI, skip.
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -2494,9 +2480,8 @@ mod solver_bridge {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::ContactConstraint;
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -2587,9 +2572,8 @@ mod solver_bridge {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::{PhysicsWorld, RigidBody};
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -2684,9 +2668,8 @@ mod solver_bridge {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::{PhysicsWorld, RigidBody};
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -2746,9 +2729,8 @@ mod solver_bridge {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::{PhysicsWorld, RigidBody};
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
@@ -2860,9 +2842,8 @@ mod solver_bridge {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::ContactConstraint;
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 
@@ -2974,9 +2955,8 @@ mod solver_bridge {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::ContactConstraint;
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 
@@ -3085,9 +3065,8 @@ mod solver_bridge {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::ContactConstraint;
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 
@@ -3273,9 +3252,8 @@ mod solver_bridge {
             use alice_physics::joint::BallJoint;
             use alice_physics::math::{Fix128, QuatFix, Vec3Fix};
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 
@@ -3348,9 +3326,8 @@ mod solver_bridge {
             use alice_physics::joint::BallJoint;
             use alice_physics::math::{Fix128, QuatFix, Vec3Fix};
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 
@@ -3420,9 +3397,8 @@ mod solver_bridge {
             use alice_physics::joint::BallJoint;
             use alice_physics::math::{Fix128, QuatFix, Vec3Fix};
 
-            let device = match crate::device::GpuDevice::new() {
-                Ok(d) => d,
-                Err(_) => return,
+            let Some(device) = crate::device::test_device() else {
+                return;
             };
             let device = std::sync::Arc::new(device);
 

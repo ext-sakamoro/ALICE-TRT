@@ -225,8 +225,11 @@ jobs:
       - name: Test — WGSL shader source symbol coverage (no GPU)
         run: cargo test --lib --features fix128-arithmetic fix128::tests::wgsl_
 
-      - name: Test — Fix128 GPU dispatch
-        run: cargo test --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1
+      # TRT_REQUIRE_GPU (set by the wrapper): a missing adapter fails the run,
+      # and the wrapper fails when no test acquired a device or any test skipped.
+      - name: Test — Fix128 GPU dispatch (adapter required, zero devices is red)
+        shell: bash
+        run: bash scripts/cargo_test_gpu.sh --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1
 
       # Closed-form oracles (tests/analytic_oracle.rs): GPU ternary matvec and
       # two-layer forward against integer closed forms, Fix128 GPU arithmetic
@@ -243,10 +246,10 @@ jobs:
   # batched, PhysicsWorld step_with_bridge) on Metal, Vulkan lavapipe and DX12
   # WARP.
   #
-  # Known failure: on windows-latest (DX12 WARP) the test process exits with
-  # code 2173 inside `fix128::tests::wgpu_bvh_build_matches_cpu_golden` (since
-  # the BVH build kernel was added in v2.3.0). The lane is gating; README
-  # "Validation and known defects" records the defect.
+  # On windows-latest (DX12 WARP) the BVH build kernel's frame loop must stay
+  # free of `continue` (the adapter dropped the stores of a `continue` region
+  # and the loop never ended); `wgsl_bvh_build_frame_loop_has_no_continue`
+  # guards that loop.
   fix128-physics-solver-matrix:
     name: Fix128 GPU + physics-solver goldens (${{ matrix.os }})
     strategy:
@@ -286,9 +289,17 @@ jobs:
       - name: Build (fix128-arithmetic + physics-solver)
         run: cargo build --lib --features fix128-arithmetic,physics-solver
 
-      # The full lib suite with physics-solver enabled. Tests that create a
-      # `GpuDevice` return early when the runner exposes no adapter; every
-      # runner in this matrix has one (Metal / lavapipe / WARP), so the goldens
-      # execute and fail on any byte difference.
-      - name: Test — physics-solver byte-exact CPU-GPU goldens
-        run: cargo test --lib --features fix128-arithmetic,physics-solver -- --nocapture --test-threads=1
+      # The full lib suite with physics-solver enabled. Every runner in this
+      # matrix has an adapter (Metal / lavapipe / WARP); TRT_REQUIRE_GPU (set by
+      # the wrapper) makes a missing one fail the run instead of skipping the
+      # goldens, and the wrapper fails when no test acquired a device or any
+      # test skipped.
+      - name: Test — physics-solver byte-exact CPU-GPU goldens (adapter required)
+        shell: bash
+        run: bash scripts/cargo_test_gpu.sh --lib --features fix128-arithmetic,physics-solver -- --nocapture --test-threads=1
+
+      # The requirement has teeth: with the adapter hidden the same kind of run
+      # must fail on the TRT_REQUIRE_GPU panic.
+      - name: Self-test — a hidden adapter fails the run
+        shell: bash
+        run: bash scripts/cargo_test_gpu.sh --self-test --lib --features fix128-arithmetic,physics-solver fix128::tests::wgpu_add_matches_cpu_golden -- --test-threads=1

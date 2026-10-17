@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn test_gpu_init() {
         // GPU may not be available in all test environments
-        if let Ok(device) = GpuDevice::new() {
+        if let Some(device) = crate::device::test_device() {
             assert!(!device.info().is_empty());
         } else {
             // No GPU available, skip
@@ -188,7 +188,9 @@ mod tests {
 
     #[test]
     fn test_simple_matvec() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let compute = TernaryCompute::new(&device);
 
@@ -209,7 +211,9 @@ mod tests {
 
     #[test]
     fn test_all_plus() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let compute = TernaryCompute::new(&device);
 
@@ -224,7 +228,9 @@ mod tests {
 
     #[test]
     fn test_all_minus() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let compute = TernaryCompute::new(&device);
 
@@ -239,7 +245,9 @@ mod tests {
 
     #[test]
     fn test_batch_matmul() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let compute = TernaryCompute::new(&device);
 
@@ -263,7 +271,9 @@ mod tests {
 
     #[test]
     fn test_relu() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let compute = TernaryCompute::new(&device);
 
@@ -280,7 +290,9 @@ mod tests {
 
     #[test]
     fn test_inference_engine() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let compute = TernaryCompute::new(&device);
 
@@ -307,7 +319,9 @@ mod tests {
 
     #[test]
     fn test_from_alice_ml_kernel() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let compute = TernaryCompute::new(&device);
 
@@ -325,7 +339,9 @@ mod tests {
 
     #[test]
     fn test_from_alice_ml_packed() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let compute = TernaryCompute::new(&device);
 
@@ -343,7 +359,9 @@ mod tests {
 
     #[test]
     fn test_compression_ratio() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
 
         let n = 1024;
         let values: Vec<i8> = (0..n * n).map(|i| (i % 3) as i8 - 1).collect();
@@ -358,7 +376,9 @@ mod tests {
 
     #[test]
     fn test_all_zeros_weights() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         // All-zero weight matrix: output should be all zeros
@@ -373,7 +393,9 @@ mod tests {
 
     #[test]
     fn test_identity_like_matvec() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         // "Identity-like" ternary: W = [[1,0,0],[0,1,0],[0,0,1]]
@@ -389,7 +411,9 @@ mod tests {
 
     #[test]
     fn test_scaled_weights() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         // W = [[1, 1]] with scale = 2.0
@@ -404,7 +428,9 @@ mod tests {
 
     #[test]
     fn test_weight_accessors() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 12], 3, 4);
         assert_eq!(w.out_features(), 3);
         assert_eq!(w.in_features(), 4);
@@ -414,7 +440,9 @@ mod tests {
 
     #[test]
     fn test_weight_display() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
         let s = format!("{w}");
         assert!(s.contains("GpuTernaryWeight"));
@@ -424,7 +452,9 @@ mod tests {
 
     #[test]
     fn test_single_element_matvec() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         // 1x1 matrix: W = [[1]], input = [42.0], output = [42.0]
@@ -438,7 +468,9 @@ mod tests {
 
     #[test]
     fn test_negative_input_values() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         // W = [[1, -1]], input = [-3.0, -5.0]
@@ -453,7 +485,9 @@ mod tests {
 
     #[test]
     fn test_relu_all_positive() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         let tensor = GpuTensor::from_f32(&device, &[1.0, 2.0, 3.0, 100.0], &[4]);
@@ -468,7 +502,9 @@ mod tests {
 
     #[test]
     fn test_relu_all_negative() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         let tensor = GpuTensor::from_f32(&device, &[-1.0, -2.0, -100.0], &[3]);
@@ -497,14 +533,18 @@ mod tests {
 
     #[test]
     fn test_device_display() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let s = format!("{device}");
         assert!(s.contains("ALICE-TRT"));
     }
 
     #[test]
     fn test_compute_display() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         let s = format!("{compute}");
         assert!(s.contains("TernaryCompute"));
@@ -517,7 +557,9 @@ mod tests {
 
     #[test]
     fn test_tiled_kernel_1024_cols() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // 1 output row, 1024 inputs: all +1 weights, all 1.0 inputs => sum = 1024
         let values: Vec<i8> = vec![1; 1024];
@@ -532,7 +574,9 @@ mod tests {
 
     #[test]
     fn test_tiled_kernel_minus_weights() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // 1 output row, 1024 inputs: all -1 weights, all 1.0 inputs => sum = -1024
         let values: Vec<i8> = vec![-1; 1024];
@@ -546,7 +590,9 @@ mod tests {
 
     #[test]
     fn test_matvec_4x4() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // W = identity-like 4x4
         #[rustfmt::skip]
@@ -568,7 +614,9 @@ mod tests {
 
     #[test]
     fn test_matvec_mixed_ternary_values() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // W = [[1, 0, -1]] (1 row, 3 cols)
         // x = [5.0, 9.0, 3.0]
@@ -582,7 +630,9 @@ mod tests {
 
     #[test]
     fn test_batch_size_1_equals_matvec() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // batch_size=1 matmul must equal matvec result
         let w_vals: &[i8] = &[1, -1, 0, 1];
@@ -603,7 +653,9 @@ mod tests {
 
     #[test]
     fn test_scaled_weights_half() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // W = [[1, 1]] scale=0.5 => (3+5)*0.5 = 4.0
         let weights = GpuTernaryWeight::from_ternary_scaled(&device, &[1, 1], 1, 2, 0.5);
@@ -615,7 +667,9 @@ mod tests {
 
     #[test]
     fn test_single_layer_none_activation_engine() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // Negative result must pass through unchanged with None activation
         let w = GpuTernaryWeight::from_ternary(&device, &[-1], 1, 1);
@@ -629,7 +683,9 @@ mod tests {
 
     #[test]
     fn test_engine_display_shows_layer_count() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let mut engine = GpuInferenceEngine::new();
         for _ in 0..3 {
             let w = GpuTernaryWeight::from_ternary(&device, &[1, 0, -1, 1], 2, 2);
@@ -641,7 +697,9 @@ mod tests {
 
     #[test]
     fn test_weight_memory_bytes_matches_formula() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         // 4 rows, 8 cols: words_per_row = ceil(8/32) = 1
         // memory = 4 * 1 * 4 * 2 = 32 bytes
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 32], 4, 8);
@@ -651,7 +709,9 @@ mod tests {
 
     #[test]
     fn test_relu_single_element_positive() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         let tensor = GpuTensor::from_f32(&device, &[5.5], &[1]);
         compute.relu_inplace(&device, &tensor);
@@ -661,7 +721,9 @@ mod tests {
 
     #[test]
     fn test_relu_single_element_zero() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         let tensor = GpuTensor::from_f32(&device, &[0.0], &[1]);
         compute.relu_inplace(&device, &tensor);
@@ -671,7 +733,9 @@ mod tests {
 
     #[test]
     fn test_words_per_row_64_cols() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         // 64 cols => ceil(64/32) = 2 words
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 64], 1, 64);
         assert_eq!(w.words_per_row(), 2);
@@ -679,7 +743,9 @@ mod tests {
 
     #[test]
     fn test_compression_ratio_large_matrix() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         // 512 rows x 512 cols: words_per_row = 16
         // fp32  = 512 * 512 * 4 = 1_048_576 bytes
         // bits  = 512 * 16 * 4 * 2 = 65_536 bytes
@@ -692,7 +758,9 @@ mod tests {
 
     #[test]
     fn test_forward_batch_two_layer_engine() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // 2-layer: 2->2->1, batch=2
         // W1 = [[1,1],[-1,1]], ReLU

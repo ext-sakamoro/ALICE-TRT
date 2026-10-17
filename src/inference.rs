@@ -258,7 +258,9 @@ mod tests {
 
     #[test]
     fn test_engine_add_layers_and_count() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let mut engine = GpuInferenceEngine::new();
         assert_eq!(engine.num_layers(), 0);
 
@@ -273,7 +275,9 @@ mod tests {
 
     #[test]
     fn test_engine_weight_bytes() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let mut engine = GpuInferenceEngine::new();
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 64], 8, 8);
         let single_bytes = w.memory_bytes();
@@ -284,7 +288,9 @@ mod tests {
 
     #[test]
     fn test_engine_equivalent_fp32() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let mut engine = GpuInferenceEngine::new();
         // 4x4 = 16 weights, FP32 = 16 * 4 = 64 bytes
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 16], 4, 4);
@@ -295,7 +301,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Engine has no layers")]
     fn test_engine_forward_empty_panics() {
-        let Ok(device) = GpuDevice::new() else {
+        let Some(device) = crate::device::test_device() else {
             panic!("Engine has no layers");
         };
         let compute = TernaryCompute::new(&device);
@@ -306,7 +312,9 @@ mod tests {
 
     #[test]
     fn test_engine_display_with_layers() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let mut engine = GpuInferenceEngine::new();
         let w = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
         engine.add_layer(w, Activation::ReLU);
@@ -317,7 +325,9 @@ mod tests {
 
     #[test]
     fn test_engine_forward_batch_single() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // W = [[1, -1], [0, 1]], batch_size = 1
         // input = [2.0, 3.0] => y = [-1.0, 3.0]
@@ -334,7 +344,9 @@ mod tests {
 
     #[test]
     fn test_engine_forward_batch_two_items() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // W = [[1, 1]], 1 output, 2 inputs, batch = 2
         // batch[0] = [1,2] => 3.0
@@ -352,7 +364,9 @@ mod tests {
 
     #[test]
     fn test_engine_three_layers() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // 3-layer: 2->2->2->1
         // L1: [[1,1],[-1,1]], ReLU
@@ -378,7 +392,9 @@ mod tests {
 
     #[test]
     fn test_engine_all_none_activations() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // Two None layers: negative values must not be clamped
         // W1 = [[-1,-1]], W2 = [[1]]
@@ -397,7 +413,9 @@ mod tests {
 
     #[test]
     fn test_engine_total_weight_bytes_two_layers() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let mut engine = GpuInferenceEngine::new();
         let w1 = GpuTernaryWeight::from_ternary(&device, &[1; 4], 2, 2);
         let w2 = GpuTernaryWeight::from_ternary(&device, &[1; 9], 3, 3);
@@ -410,7 +428,9 @@ mod tests {
 
     #[test]
     fn test_engine_equivalent_fp32_two_layers() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let mut engine = GpuInferenceEngine::new();
         // Layer 1: 2x2 = 4 weights => 16 bytes FP32
         let w1 = GpuTernaryWeight::from_ternary(&device, &[1; 4], 2, 2);
@@ -423,7 +443,9 @@ mod tests {
 
     #[test]
     fn test_engine_compression_ratio_non_empty() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let mut engine = GpuInferenceEngine::new();
         // 1 row, 256 cols => high compression
         let values: Vec<i8> = vec![1; 256];
@@ -435,7 +457,9 @@ mod tests {
 
     #[test]
     fn test_gpu_layer_new_constructs() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary(&device, &[1, 0, -1, 1], 2, 2);
         // GpuLayer::new is pub; ensure it constructs without panic
         let _layer = GpuLayer::new(w, Activation::ReLU);
@@ -443,7 +467,9 @@ mod tests {
 
     #[test]
     fn test_engine_single_layer_relu_clamps_negatives() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
         // W = [[-1,-1]], input = [2.0, 3.0] => -5 -> ReLU -> 0
         let w = GpuTernaryWeight::from_ternary(&device, &[-1, -1], 1, 2);
@@ -462,7 +488,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Engine has no layers")]
     fn test_engine_forward_batch_empty_panics() {
-        let Ok(device) = GpuDevice::new() else {
+        let Some(device) = crate::device::test_device() else {
             panic!("Engine has no layers");
         };
         let compute = TernaryCompute::new(&device);

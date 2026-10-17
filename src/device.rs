@@ -192,3 +192,37 @@ impl std::fmt::Display for GpuDevice {
         write!(f, "ALICE-TRT [{}]", self.info)
     }
 }
+
+/// The GPU device for a unit test that needs one.
+///
+/// Without an adapter the test is skipped (returns `None`) and a
+/// `[gpu] test skipped: no GPU adapter` line is printed. When the
+/// environment variable `TRT_REQUIRE_GPU` is set (the GPU jobs of CI set it),
+/// a missing adapter panics instead, so a runner that loses its adapter turns
+/// red rather than passing every GPU test as a skip. Every acquired device
+/// prints `[gpu] test device acquired`; CI counts these lines.
+///
+/// `TRT_TEST_FORCE_NO_ADAPTER` makes the adapter look missing; CI uses it to
+/// check that the requirement actually fails the run.
+#[cfg(test)]
+pub(crate) fn test_device() -> Option<GpuDevice> {
+    let result = if std::env::var_os("TRT_TEST_FORCE_NO_ADAPTER").is_some() {
+        Err("adapter hidden by TRT_TEST_FORCE_NO_ADAPTER".to_string())
+    } else {
+        GpuDevice::new()
+    };
+    match result {
+        Ok(device) => {
+            eprintln!("[gpu] test device acquired");
+            Some(device)
+        }
+        Err(e) => {
+            assert!(
+                std::env::var_os("TRT_REQUIRE_GPU").is_none(),
+                "TRT_REQUIRE_GPU is set but no GPU adapter is available: {e}"
+            );
+            eprintln!("[gpu] test skipped: no GPU adapter ({e})");
+            None
+        }
+    }
+}

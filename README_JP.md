@@ -148,7 +148,8 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) が検査するもの
   (Morton sort、BVH build、`find_pairs`、球-球 contact、PGS contact solve の逐次と
   batched、`step_with_bridge`) で、GPU の結果が ALICE-Physics の CPU の結果と
   bit 単位で一致すること Metal (macOS)、Vulkan lavapipe (Linux、software)、
-  DX12 WARP (Windows、software) の 3 adapter で実行する
+  DX12 WARP (Windows、software) の 3 adapter で実行する この job では adapter が
+  無いと失敗し、GPU device を 1 つも取得しなかった run も red にする
   <!-- claim-test: wgpu_pgs_contact_solve_matches_cpu_golden -->
 - **閉形式 oracle** ([tests/analytic_oracle.rs](tests/analytic_oracle.rs)): 両
   kernel の三値 matvec が整数内積に一致、scaled kernel は scale 倍、batched の各行
@@ -171,16 +172,6 @@ CI で build しないもの: `cuda` feature と TensorRT plugin (NVIDIA の run
 
 既知の不具合
 
-- **Windows DX12 WARP で analytic oracle の process が落ちる**
-  `Fix128 GPU (windows-latest)` job で `tests/analytic_oracle.rs` が
-  `gpu_ternary_matvec_is_the_exact_integer_dot_product_on_both_kernels` の中で
-  `STATUS_ACCESS_VIOLATION` により終了する 同じ adapter で Fix128 GPU の unit
-  test は通る 修正まで job は red
-- **Windows DX12 WARP で BVH build の golden が落ちる**
-  `Fix128 GPU + physics-solver goldens (windows-latest)` job で test process が
-  `fix128::tests::wgpu_bvh_build_matches_cpu_golden` の中で exit code 2173 で
-  終了する (BVH build kernel の追加時から) 修正まで job は red、Metal と Vulkan
-  lavapipe は通る
 - **`GpuNeuralSdf::fit` は未実装** `todo!` で panic する 以前の版は SDF と無関係
   なネットワークを返していた oracle
   `neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius` は fit が実装される

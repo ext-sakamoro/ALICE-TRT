@@ -477,7 +477,9 @@ mod tests {
 
     #[test]
     fn profile_forward_single_layer() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         let w = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
@@ -497,7 +499,9 @@ mod tests {
 
     #[test]
     fn profile_forward_two_layers() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         let w1 = GpuTernaryWeight::from_ternary(&device, &[1, 1, -1, 1], 2, 2);
@@ -516,7 +520,9 @@ mod tests {
 
     #[test]
     fn profile_forward_batch() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         let w = GpuTernaryWeight::from_ternary(&device, &[1, 1], 1, 2);
@@ -535,7 +541,9 @@ mod tests {
 
     #[test]
     fn profile_bottleneck_single_layer() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let compute = TernaryCompute::new(&device);
 
         let w = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);

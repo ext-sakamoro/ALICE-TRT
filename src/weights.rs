@@ -178,7 +178,9 @@ mod tests {
 
     #[test]
     fn test_weight_memory_bytes_2x2() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary(&device, &[1, -1, 0, 1], 2, 2);
         // words_per_row = ceil(2/32) = 1
         // memory_bytes  = 2 * 1 * 4 * 2 = 16
@@ -187,7 +189,9 @@ mod tests {
 
     #[test]
     fn test_weight_words_per_row_exact_32() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let values: Vec<i8> = vec![1; 32];
         let w = GpuTernaryWeight::from_ternary(&device, &values, 1, 32);
         // exactly 32 cols => 1 word
@@ -197,7 +201,9 @@ mod tests {
 
     #[test]
     fn test_weight_words_per_row_33_cols() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let values: Vec<i8> = vec![1; 33];
         let w = GpuTernaryWeight::from_ternary(&device, &values, 1, 33);
         // 33 cols => ceil(33/32) = 2 words
@@ -206,7 +212,9 @@ mod tests {
 
     #[test]
     fn test_weight_compression_ratio_1x1() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary(&device, &[1], 1, 1);
         // fp32 = 1*1*4 = 4 bytes; bitplane = 1*1*4*2 = 8 bytes
         // ratio = 4/8 = 0.5
@@ -216,7 +224,9 @@ mod tests {
 
     #[test]
     fn test_weight_compression_ratio_wide() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         // 1 row, 256 cols: words_per_row = 8
         let values: Vec<i8> = vec![1; 256];
         let w = GpuTernaryWeight::from_ternary(&device, &values, 1, 256);
@@ -229,14 +239,18 @@ mod tests {
 
     #[test]
     fn test_weight_scale_custom() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary_scaled(&device, &[1, -1, 0, 1], 2, 2, 2.5);
         assert!((w.scale() - 2.5).abs() < 1e-5, "scale = {}", w.scale());
     }
 
     #[test]
     fn test_weight_display_contains_dimensions() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary(&device, &[0; 6], 2, 3);
         let s = format!("{w}");
         assert!(s.contains("2x3"), "display = {s}");
@@ -246,7 +260,9 @@ mod tests {
 
     #[test]
     fn test_weight_display_contains_bytes() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary(&device, &[1; 4], 2, 2);
         let s = format!("{w}");
         assert!(s.contains("bytes VRAM"), "display = {s}");
@@ -254,14 +270,18 @@ mod tests {
 
     #[test]
     fn test_weight_scale_default_is_one() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let w = GpuTernaryWeight::from_ternary(&device, &[1, 0, -1, 1], 2, 2);
         assert!((w.scale() - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_weight_out_in_features_non_square() {
-        let Ok(device) = GpuDevice::new() else { return };
+        let Some(device) = crate::device::test_device() else {
+            return;
+        };
         let values: Vec<i8> = vec![1; 15];
         let w = GpuTernaryWeight::from_ternary(&device, &values, 3, 5);
         assert_eq!(w.out_features(), 3);

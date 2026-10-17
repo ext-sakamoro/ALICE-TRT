@@ -27,6 +27,8 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Changed
 
+- GPU を使う unit test は `device::test_device()` から device を取る 既定では adapter が無いと skip するが、`TRT_REQUIRE_GPU` が設定されていると panic する CI の GPU job (`Fix128 GPU` の dispatch と physics-solver golden) は `scripts/cargo_test_gpu.sh` 経由で実行し、adapter が無い・GPU device を 1 つも取得しなかった・skip が 1 件でもある場合は失敗にする adapter を隠した run が実際に失敗することを毎回の self-test で確認する (従来は adapter を失った runner で GPU test が全件 skip のまま green になりえた)
+- README / README_JP の既知の不具合から、修正済みの 2 件 (Windows DX12 WARP の BVH build golden の終了、analytic oracle の process 終了) を削除
 - `physics_bridge::TrtSolverAdapter` は alice-physics 4.0 の `GpuSolverBridge::semantics_id` を実装する (`alice_physics::PHYSICS_SEMANTICS_ID` を返す: kernel はこの crate が build される alice-physics の CPU solver を再現するので、その識別子で計算する) alice-physics の bridge の経路は、識別子の違う backend を拒否する (ALICE-Law G7) 試験の `step_with_bridge` は `Result` を受ける
 - CI: RUSTSEC-2026-0235 (rkyv 0.7) の無視に機械検査を付けた `scripts/no_direct_rkyv.py` (ALICE-Edge と byte 一致、試験 `scripts/test_no_direct_rkyv.py`) が、この crate の Cargo.toml が rkyv を依存に持つか、.rs が rkyv を使う・archive すると失敗する Docs lint の job (3 OS) と `scripts/preflight.sh` で走る rkyv は alice-db を通してだけ届き、alice-db が archive する型 (SegmentMetadata / DataSegment / ModelType / DataType) は Rc / Arc を持たない
 - **依存**: `alice-db` を path 依存 (`../ALICE-DB`) から crates.io の `0.5` (`default-features = false`、`features = ["fs"]`) に変更 CI は `alice-db` を strip しなくなり、`db` feature を build する

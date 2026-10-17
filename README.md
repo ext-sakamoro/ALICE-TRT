@@ -154,7 +154,8 @@ What CI checks ([.github/workflows/ci.yml](.github/workflows/ci.yml)):
   PGS contact solve sequential and batched, `step_with_bridge`): each GPU result
   must equal the ALICE-Physics CPU result bit for bit. They run on three
   adapters: Metal (macOS), Vulkan lavapipe (Linux, software) and DX12 WARP
-  (Windows, software).
+  (Windows, software). In these jobs a missing adapter fails the run, and a
+  run in which no test acquired a GPU device is red.
   <!-- claim-test: wgpu_pgs_contact_solve_matches_cpu_golden -->
 - **Closed-form oracles** in [tests/analytic_oracle.rs](tests/analytic_oracle.rs):
   ternary matvec on both kernels equals the integer dot product, the scaled
@@ -180,11 +181,6 @@ CI does not check out).
 
 Known defects:
 
-- **Windows DX12 WARP: the BVH build golden crashes.** In the
-  `Fix128 GPU + physics-solver goldens (windows-latest)` job, the test process
-  exits with code 2173 inside `fix128::tests::wgpu_bvh_build_matches_cpu_golden`
-  (present since the BVH build kernel was added). The job is red until this is
-  fixed; Metal and Vulkan lavapipe pass.
 - **`GpuNeuralSdf::fit` is not implemented.** It panics with `todo!`. An earlier
   version returned a network unrelated to the SDF; the oracle
   `neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius` is `#[ignore]`d

@@ -10259,9 +10259,8 @@ mod tests {
     /// Skips when no GPU adapter is available (headless CI).
     #[test]
     fn wgsl_mul_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         // `create_shader_module` panics on WGSL parse errors, which
         // is the strongest compile-time signal we get short of
@@ -10283,9 +10282,8 @@ mod tests {
     /// Skips when no GPU adapter is available (headless CI).
     #[test]
     fn wgpu_add_matches_cpu_golden() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return, // No GPU adapter — headless CI, skip.
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
 
@@ -10325,9 +10323,8 @@ mod tests {
     /// carry propagation.
     #[test]
     fn wgpu_sub_matches_cpu_golden() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
 
@@ -10375,9 +10372,8 @@ mod tests {
     ///      into the middle-lo output word)
     #[test]
     fn wgpu_mul_matches_cpu_golden() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
 
@@ -10443,9 +10439,8 @@ mod tests {
     #[cfg(feature = "physics-solver")]
     #[test]
     fn wgpu_div_matches_cpu_golden() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
 
@@ -10516,9 +10511,8 @@ mod tests {
     #[cfg(feature = "physics-solver")]
     #[test]
     fn wgpu_sqrt_matches_cpu_golden() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
 
@@ -10556,9 +10550,8 @@ mod tests {
     #[cfg(feature = "physics-solver")]
     #[test]
     fn wgpu_trait_sqrt_matches_inherent_sqrt() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let mut kernel = Fix128WgpuKernel::new(&device);
 
@@ -10578,9 +10571,8 @@ mod tests {
     #[cfg(feature = "physics-solver")]
     #[test]
     fn wgpu_trait_div_matches_inherent_div() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let mut kernel = Fix128WgpuKernel::new(&device);
 
@@ -10601,9 +10593,8 @@ mod tests {
     /// [`Fix128WgpuKernel::mul`] byte-for-byte.
     #[test]
     fn wgpu_trait_mul_matches_inherent_mul() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let mut kernel = Fix128WgpuKernel::new(&device);
 
@@ -10655,9 +10646,8 @@ mod tests {
     /// no GPU adapter is available (headless CI).
     #[test]
     fn wgsl_dot_final_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -10671,9 +10661,8 @@ mod tests {
     /// adapter is available (headless CI).
     #[test]
     fn wgsl_dot_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -10688,9 +10677,8 @@ mod tests {
     /// against the CPU golden `acc = acc.add(a[i].mul(b[i]))` loop.
     #[test]
     fn wgpu_dot_matches_cpu_golden() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
 
@@ -10758,9 +10746,8 @@ mod tests {
     /// serial final accumulate reproduces the canonical index order.
     #[test]
     fn wgpu_dot_parallel_100_matches_cpu_golden() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
 
@@ -10815,9 +10802,8 @@ mod tests {
     /// exercises the two-phase pipeline on WARP.
     #[test]
     fn wgpu_dot_large_10000_matches_cpu_golden() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
 
@@ -10852,9 +10838,8 @@ mod tests {
     /// Empty-input contract: dot returns `ZERO` without dispatching.
     #[test]
     fn wgpu_dot_zero_elements_returns_zero() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let kernel = Fix128WgpuKernel::new(&device);
         let result = kernel.dot(&[], &[]);
@@ -10866,9 +10851,8 @@ mod tests {
     /// [`Fix128WgpuKernel::dot`] byte-for-byte.
     #[test]
     fn wgpu_trait_dot_matches_inherent_dot() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let mut kernel = Fix128WgpuKernel::new(&device);
 
@@ -10896,9 +10880,8 @@ mod tests {
     /// [`Fix128WgpuKernel::add`] byte-for-byte.
     #[test]
     fn wgpu_trait_add_matches_inherent_add() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let mut kernel = Fix128WgpuKernel::new(&device);
 
@@ -10948,9 +10931,8 @@ mod tests {
     /// Skips when no GPU adapter is available (headless CI).
     #[test]
     fn wgsl_aabb_helpers_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -11025,9 +11007,8 @@ mod tests {
     /// (headless CI).
     #[test]
     fn wgsl_morton_code_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -11108,9 +11089,8 @@ mod tests {
             [v as u32, (v >> 32) as u32]
         }
 
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return, // Headless CI, skip.
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         // ---- Fixture 1: empty ----
@@ -11222,9 +11202,8 @@ mod tests {
     /// (headless CI).
     #[test]
     fn wgsl_morton_sort_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -11258,9 +11237,8 @@ mod tests {
         use alice_physics::collider::AABB;
         use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
 
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return, // Headless CI, skip
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         // Byte-for-byte conversion helpers between Fix128Gpu and
@@ -11569,9 +11547,8 @@ mod tests {
     /// available (headless CI).
     #[test]
     fn wgsl_bvh_build_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -11613,9 +11590,8 @@ mod tests {
         use alice_physics::collider::AABB;
         use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
 
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         /// Build one `BvhPrimitive` from an integer sphere centre and
@@ -11840,9 +11816,8 @@ mod tests {
     /// available (headless CI).
     #[test]
     fn wgsl_bvh_find_pairs_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -11876,9 +11851,8 @@ mod tests {
         use alice_physics::collider::AABB;
         use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
 
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         // Same primitive construction helper as the v2.3.0 golden.
@@ -12073,9 +12047,8 @@ mod tests {
     /// Skips when no GPU adapter is available (headless CI).
     #[test]
     fn wgsl_sphere_sphere_contact_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -12111,9 +12084,8 @@ mod tests {
         use alice_physics::collider::Contact;
         use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
 
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         // ---- Helper: replay CPU sphere-sphere block ----
@@ -12366,9 +12338,8 @@ mod tests {
     /// Skips when no GPU adapter is available (headless CI).
     #[test]
     fn wgsl_pgs_contact_solve_shader_compiles() {
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
         let _ = device
             .device()
@@ -12411,9 +12382,8 @@ mod tests {
         use alice_physics::math::{Fix128 as PhysicsFix128, Vec3Fix};
         use alice_physics::solver::ContactConstraint;
 
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         // W_SUM_EPSILON from alice_physics::solver, replicated here
@@ -12648,9 +12618,8 @@ mod tests {
         use alice_physics::math::Fix128 as PhysicsFix128;
         use alice_physics::math::QuatFix as PhysicsQuatFix;
 
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         let identity = PhysicsQuatFix::IDENTITY;
@@ -12717,9 +12686,8 @@ mod tests {
         use alice_physics::math::QuatFix as PhysicsQuatFix;
         use alice_physics::math::Vec3Fix as PhysicsVec3Fix;
 
-        let device = match crate::device::GpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => return,
+        let Some(device) = crate::device::test_device() else {
+            return;
         };
 
         let identity = PhysicsQuatFix::IDENTITY;
