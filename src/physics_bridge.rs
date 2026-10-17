@@ -1024,6 +1024,13 @@ mod solver_bridge {
     }
 
     impl GpuSolverBridge for TrtSolverAdapter {
+        /// The kernels reproduce the CPU solver of the alice-physics this crate is
+        /// built against, so the adapter computes under its identifier (alice-physics
+        /// refuses a backend whose identifier is not its own, ALICE-Law G7).
+        fn semantics_id(&self) -> [u8; 32] {
+            alice_physics::PHYSICS_SEMANTICS_ID
+        }
+
         fn send_island(&mut self, positions: &[[Fix128; 3]], velocities: &[[Fix128; 3]]) {
             self.positions.clear();
             for p in positions {
@@ -2453,6 +2460,9 @@ mod solver_bridge {
         fn gpu_solver_bridge_contact_solve_default_impl_panics() {
             struct MinimalBridge;
             impl GpuSolverBridge for MinimalBridge {
+                fn semantics_id(&self) -> [u8; 32] {
+                    alice_physics::PHYSICS_SEMANTICS_ID
+                }
                 fn send_island(&mut self, _p: &[[Fix128; 3]], _v: &[[Fix128; 3]]) {}
                 fn dispatch_iterations(&mut self, _iters: u32, _dt: Fix128) {}
                 fn recv_island(&self, _p: &mut [[Fix128; 3]], _v: &mut [[Fix128; 3]]) {}
@@ -2609,7 +2619,9 @@ mod solver_bridge {
 
             // Bridge-routed replica.
             let mut world_gpu = build_world();
-            world_gpu.step_with_bridge(&mut adapter, dt);
+            world_gpu
+                .step_with_bridge(&mut adapter, dt)
+                .expect("the adapter computes under this build's semantics");
 
             // Byte-exact match on bodies (positions + velocities).
             assert_eq!(
@@ -2698,7 +2710,9 @@ mod solver_bridge {
 
             for frame in 0..10 {
                 world_cpu.step(dt);
-                world_gpu.step_with_bridge(&mut adapter, dt);
+                world_gpu
+                    .step_with_bridge(&mut adapter, dt)
+                    .expect("the adapter computes under this build's semantics");
 
                 // Assert byte-exact match every frame.
                 for (i, (cpu_b, gpu_b)) in world_cpu
@@ -2761,7 +2775,9 @@ mod solver_bridge {
             let mut world_cpu = build_world();
             let mut world_gpu = build_world();
             world_cpu.step(dt);
-            world_gpu.step_with_bridge(&mut adapter, dt);
+            world_gpu
+                .step_with_bridge(&mut adapter, dt)
+                .expect("the adapter computes under this build's semantics");
 
             for (cpu_b, gpu_b) in world_cpu.bodies.iter().zip(world_gpu.bodies.iter()) {
                 assert_eq!(cpu_b.position.x.hi, gpu_b.position.x.hi);

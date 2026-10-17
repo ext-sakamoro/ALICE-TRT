@@ -27,6 +27,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Changed
 
+- `physics_bridge::TrtSolverAdapter` は alice-physics 4.0 の `GpuSolverBridge::semantics_id` を実装する (`alice_physics::PHYSICS_SEMANTICS_ID` を返す: kernel はこの crate が build される alice-physics の CPU solver を再現するので、その識別子で計算する) alice-physics の bridge の経路は、識別子の違う backend を拒否する (ALICE-Law G7) 試験の `step_with_bridge` は `Result` を受ける
 - CI: RUSTSEC-2026-0235 (rkyv 0.7) の無視に機械検査を付けた `scripts/no_direct_rkyv.py` (ALICE-Edge と byte 一致、試験 `scripts/test_no_direct_rkyv.py`) が、この crate の Cargo.toml が rkyv を依存に持つか、.rs が rkyv を使う・archive すると失敗する Docs lint の job (3 OS) と `scripts/preflight.sh` で走る rkyv は alice-db を通してだけ届き、alice-db が archive する型 (SegmentMetadata / DataSegment / ModelType / DataType) は Rc / Arc を持たない
 - **依存**: `alice-db` を path 依存 (`../ALICE-DB`) から crates.io の `0.5` (`default-features = false`、`features = ["fs"]`) に変更 CI は `alice-db` を strip しなくなり、`db` feature を build する
 - **CI**: `ci.yml` に `db-test` job (3 OS、`cargo check --lib --features db` と `db_bridge::` の test、実行件数 0 は失敗) を追加 clippy / rustdoc / MSRV の feature 集合に `db` を追加 `scripts/preflight.sh` にも同じ step を追加
