@@ -4137,76 +4137,70 @@ fn fix128_bvh_build_main() {
         let f_end    = stack[idx].end;
         let f_escape = stack[idx].escape_idx;
 
+        // One if / else if / else chain with no `continue`: the windows-latest
+        // adapter drops the stores of a second `if { ...; continue; }`
+        // region of this loop (the frame is never advanced and the loop
+        // does not terminate). Semantics are those of the frame machine:
+        // phase 0 = enter, 1 = left subtree done, 2 = right subtree done.
         if (phase == 0u) {
             let count_range = f_end - f_start;
             let aabb = compute_aabb_union(f_start, f_end);
-
             if (count_range <= leaf_max) {
                 push_leaf(aabb, f_start, count_range, f_escape);
                 return_reg = 1u;
                 sp = sp - 1u;
-                continue;
+            } else {
+                // Internal node: push with first_child = 0 (fixed in phase 2),
+                // inherit caller-supplied escape.
+                let node_idx = push_internal(aabb, 0u, f_escape);
+                let mid      = find_split(f_start, f_end);
+                let left_idx = node_ptr;
+                stack[idx].phase    = 1u;
+                stack[idx].node_idx = node_idx;
+                stack[idx].mid      = mid;
+                stack[idx].left_idx = left_idx;
+                // Push LEFT child with placeholder escape.
+                stack[sp].start      = f_start;
+                stack[sp].end        = mid;
+                stack[sp].escape_idx = LEFT_ESCAPE_PLACEHOLDER;
+                stack[sp].phase      = 0u;
+                sp = sp + 1u;
             }
-
-            // Internal node: push with first_child = 0 (fixed in phase 2),
-            // inherit caller-supplied escape.
-            let node_idx = push_internal(aabb, 0u, f_escape);
-            let mid      = find_split(f_start, f_end);
-            let left_idx = node_ptr;
-
-            stack[idx].phase    = 1u;
-            stack[idx].node_idx = node_idx;
-            stack[idx].mid      = mid;
-            stack[idx].left_idx = left_idx;
-
-            // Push LEFT child with placeholder escape.
-            stack[sp].start      = f_start;
-            stack[sp].end        = mid;
-            stack[sp].escape_idx = LEFT_ESCAPE_PLACEHOLDER;
-            stack[sp].phase      = 0u;
-            sp = sp + 1u;
-            continue;
-        }
-
-        if (phase == 1u) {
+        } else if (phase == 1u) {
             let left_size = return_reg;
             let mid       = stack[idx].mid;
             stack[idx].left_size = left_size;
             stack[idx].phase     = 2u;
-
             // Push RIGHT child, inheriting parent's escape.
             stack[sp].start      = mid;
             stack[sp].end        = f_end;
             stack[sp].escape_idx = f_escape;
             stack[sp].phase      = 0u;
             sp = sp + 1u;
-            continue;
-        }
+        } else {
+            // phase == 2u — RIGHT subtree done. Backfill placeholders + pop.
+            let right_size = return_reg;
+            let node_idx   = stack[idx].node_idx;
+            let left_idx   = stack[idx].left_idx;
+            let left_size  = stack[idx].left_size;
+            let right_idx  = left_idx + left_size;
+            nodes_out[node_idx].first_child_or_prim = left_idx;
 
-        // phase == 2u — RIGHT subtree done. Backfill placeholders + pop.
-        let right_size = return_reg;
-        let node_idx   = stack[idx].node_idx;
-        let left_idx   = stack[idx].left_idx;
-        let left_size  = stack[idx].left_size;
-        let right_idx  = left_idx + left_size;
-
-        nodes_out[node_idx].first_child_or_prim = left_idx;
-
-        // Linear sweep of the LEFT subtree, replacing every placeholder
-        // escape with the real right_idx. Position-independent, single
-        // O(subtree_size) pass — the §3.1 discipline in action.
-        let end_of_left = left_idx + left_size;
-        for (var slot: u32 = left_idx; slot < end_of_left; slot = slot + 1u) {
-            let pce     = nodes_out[slot].prim_count_escape;
-            let cur_esc = pce & ESCAPE_MASK_24;
-            if (cur_esc == LEFT_ESCAPE_PLACEHOLDER) {
-                let prim_count = pce >> 24u;
-                nodes_out[slot].prim_count_escape = (prim_count << 24u) | (right_idx & ESCAPE_MASK_24);
+            // Linear sweep of the LEFT subtree, replacing every placeholder
+            // escape with the real right_idx. Position-independent, single
+            // O(subtree_size) pass — the §3.1 discipline in action.
+            let end_of_left = left_idx + left_size;
+            for (var slot: u32 = left_idx; slot < end_of_left; slot = slot + 1u) {
+                let pce     = nodes_out[slot].prim_count_escape;
+                let cur_esc = pce & ESCAPE_MASK_24;
+                if (cur_esc == LEFT_ESCAPE_PLACEHOLDER) {
+                    let prim_count = pce >> 24u;
+                    nodes_out[slot].prim_count_escape = (prim_count << 24u) | (right_idx & ESCAPE_MASK_24);
+                }
             }
+            return_reg = 1u + left_size + right_size;
+            sp = sp - 1u;
         }
-
-        return_reg = 1u + left_size + right_size;
-        sp = sp - 1u;
     }
 
     atomicStore(&node_count_out[0], node_ptr);
@@ -11504,6 +11498,71 @@ mod tests {
         assert!(FIX128_BVH_BUILD_WGSL.contains("LEFT_ESCAPE_PLACEHOLDER"));
     }
 
+    /// Guard for the frame loop of `fix128_bvh_build_main` only: the loop
+    /// must stay one if / else if / else chain without `continue`. On the
+    /// windows-latest adapter the stores of a second `if { ...; continue; }`
+    /// region were dropped and the loop never terminated. This check does
+    /// not cover any other kernel.
+    #[test]
+    fn wgsl_bvh_build_frame_loop_has_no_continue() {
+        let src: String = FIX128_BVH_BUILD_WGSL
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = src
+            .find("fn fix128_bvh_build_main")
+            .expect("entry point fix128_bvh_build_main not found");
+        let body = &src[entry..];
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let word_at = |text: &str, w: &str| -> Vec<usize> {
+            text.match_indices(w)
+                .filter(|(i, _)| {
+                    let before = text[..*i].chars().next_back().is_none_or(|c| !is_word(c));
+                    let after = text[*i + w.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !is_word(c));
+                    before && after
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let loops = word_at(body, "loop");
+        assert_eq!(
+            loops.len(),
+            1,
+            "BVH build frame-loop guard: expected exactly 1 `loop` in fix128_bvh_build_main, found {}",
+            loops.len()
+        );
+        let open = loops[0] + body[loops[0]..].find('{').expect("loop without body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in body[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let loop_body = &body[open..=close.expect("unbalanced loop body")];
+        assert!(
+            loop_body.contains("phase == 1u"),
+            "BVH build frame-loop guard: the located loop is not the frame loop"
+        );
+        let continues = word_at(loop_body, "continue").len();
+        assert_eq!(
+            continues, 0,
+            "BVH build frame-loop guard (this loop only): `continue` must not appear in the frame loop, found {continues}"
+        );
+    }
+
     /// v2.3.0 BVH build kernel must compile as valid WGSL end-to-end.
     /// Runs the naga parser via `create_shader_module` and fails loudly
     /// on any syntax / type error. Skips when no GPU adapter is
@@ -11685,6 +11744,54 @@ mod tests {
             }
             assert_eq!(prims.len(), 16);
             check("degenerate colocated", prims);
+        }
+
+        // Tree depth of a CPU reference tree (left child = first_child,
+        // right child = escape of the left child).
+        fn depth(nodes: &[alice_physics::bvh::BvhNode], i: usize) -> usize {
+            let n = &nodes[i];
+            if n.prim_count_escape >> 24 != 0 {
+                return 1;
+            }
+            let left = n.first_child_or_prim as usize;
+            let right = (nodes[left].prim_count_escape & 0x00FF_FFFF) as usize;
+            1 + depth(nodes, left).max(depth(nodes, right))
+        }
+
+        // ---- Fixture 4: a single primitive (one leaf) ----
+        check("single primitive", vec![mk_prim(5, -3, 2, 1, 0)]);
+
+        // ---- Fixture 5: deep tree — boxes at x = 2^k along one axis, so
+        // every Morton split peels a short run off one end ----
+        {
+            let prims: Vec<BvhPrimitive> =
+                (0..48u32).map(|k| mk_prim(1i64 << k, 0, 0, 1, k)).collect();
+            let cpu = LinearBvh::build(prims.clone());
+            let d = depth(&cpu.nodes, 0);
+            assert!(
+                (8..128).contains(&d),
+                "deep fixture depth {d} (must be deep, and within the 128-frame stack)"
+            );
+            check("deep chain 2^k", prims);
+        }
+
+        // ---- Fixture 6: 4096 primitives at deterministic pseudo-random
+        // positions (64-bit LCG) ----
+        {
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) % 4096) as i64
+            };
+            let prims: Vec<BvhPrimitive> = (0..4096u32)
+                .map(|i| {
+                    let (x, y, z) = (next(), next(), next());
+                    mk_prim(x, y, z, 1, i)
+                })
+                .collect();
+            check("pseudo-random 4096", prims);
         }
     }
 

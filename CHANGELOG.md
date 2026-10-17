@@ -42,6 +42,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Fixed
 
+- GPU BVH build kernel (`FIX128_BVH_BUILD_WGSL`) の frame loop が windows-latest の GPU adapter (DX12 software) で終了せず、test process が約 60 秒後に exit code 2173 で落ちていた 原因は loop 内の 2 つ目の `if { ...; continue; }` 区画の store がこの adapter で反映されないこと (frame が進まず同じ 2 frame を往復する) frame loop を `continue` の無い if / else if / else 1 本に書き換えた (意味は不変) golden に 1 primitive / 深い木 (深さ 25) / 4096 primitive の fixture を追加し、frame loop に `continue` が戻らないことを WGSL の文字列で検査する test を追加 (この loop のみが対象)
 - **`db` feature が alice-db 0.5 に対して compile できなかった** (`cargo check --features db` が 4 error) `src/db_bridge.rs` は alice-db のどの版にも無い byte key の `put` / `range` を呼んでいた blob API (`put_blob` / `get_blob` / `scan_blob_prefix`) に書き直した key は `model_hash` 16 byte + `timestamp_ms` の big-endian 8 byte、値は従来どおり 34 byte の `InferenceRecord` (little-endian) `query_by_model` は model hash の prefix scan に `timestamp_ms >= from_ms` の filter を掛け、timestamp 昇順で返す (`u64::MAX` を含む) 旧 code は一度も compile できなかったので、旧形式で保存されたデータは存在しない
 - `TrtDbStore::store_record` / `query_by_model` / `avg_latency_us` は `io::Result` を返す (alice-db の I/O error を握りつぶさない) 値が decode できない record、key と値の timestamp が食い違う record は `InvalidData`
 - tiled 三値 matvec kernel (`in_features` ≥ 1024 で使う) が workgroup barrier の前で `return` しており、DX12 WARP adapter で test process ごと異常終了していた 全 invocation が barrier に到達する形に直し、範囲外の workgroup は 0 を寄与して書き込みだけを止める (Metal / Vulkan では結果は変わらない)
