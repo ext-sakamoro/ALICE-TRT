@@ -75,6 +75,11 @@ allow = ["AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later"]
 name = "alice-physics"
 allow = ["AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later"]
 
+# alice-physics 4.0 is a facade over alice-physics-core (same dual license)
+[[licenses.exceptions]]
+name = "alice-physics-core"
+allow = ["AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later"]
+
 # alice-db (feature `db`, crates.io) is AGPL-3.0-or-later; the exception names
 # that one crate only, and only the optional `db` feature pulls it in.
 [[licenses.exceptions]]
