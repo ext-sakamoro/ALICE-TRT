@@ -27,6 +27,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Changed
 
+- CI: `.github/actions/sibling-deps` は ALICE-ML / ALICE-Physics を action の env の 1 箇所 (`ML_REV` / `PHYSICS_REV`) に固定した commit から取る (以前は毎回 main で、同じ commit でも sibling の main が動くと結果が変わった) 固定の commit が取れなければ失敗し、GitHub Actions の外では止まる workflow は `ci/**` の branch でも走る
 - `alice-physics` の path 依存を `../ALICE-Physics` から `../ALICE-Physics/crates/alice-physics` に移した (ALICE-Physics 4.0 で repository の root の package は `alice-physics-core` になり、`alice-physics` は `crates/alice-physics` の窓口の crate になった 旧 path では cargo が `alice-physics` を見つけられない) `deny.toml` の license の例外に `alice-physics-core` を足した
 - GPU を使う unit test は `device::test_device()` から device を取る 既定では adapter が無いと skip するが、`TRT_REQUIRE_GPU` が設定されていると panic する CI の GPU job (`Fix128 GPU` の dispatch と physics-solver golden) は `scripts/cargo_test_gpu.sh` 経由で実行し、adapter が無い・GPU device を 1 つも取得しなかった・skip が 1 件でもある場合は失敗にする adapter を隠した run が実際に失敗することを毎回の self-test で確認する (従来は adapter を失った runner で GPU test が全件 skip のまま green になりえた)
 - README / README_JP の既知の不具合から、修正済みの 2 件 (Windows DX12 WARP の BVH build golden の終了、analytic oracle の process 終了) を削除

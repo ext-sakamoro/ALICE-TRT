@@ -1,26 +1,44 @@
 name: Sibling path dependencies
 description: >-
-  Clone the ALICE sibling crates that Cargo.toml declares as path dependencies
-  next to the checkout, and strip the ones this job does not build.
+  Fetch the ALICE sibling crates that Cargo.toml declares as path dependencies
+  next to the checkout, and strip the ones this job does not build. Each sibling
+  is fetched at the commit pinned in the env block below (the one place to change
+  them), so the same commit of this repo always builds against the same siblings;
+  a pinned commit that cannot be fetched fails the step.
 inputs:
   physics:
-    description: "'true' to clone ALICE-Physics (physics / physics-solver features); 'false' strips them"
+    description: "'true' to fetch ALICE-Physics (physics / physics-solver features); 'false' strips them"
     required: false
     default: "true"
 runs:
   using: composite
   steps:
-    - name: Clone ALICE-ML (unconditional path dependency)
+    - name: Fetch the pinned sibling path dependencies
       shell: bash
+      env:
+        PHYSICS: ${{ inputs.physics }}
+        # PHYSICS_REV is the same commit as the other ALICE-* repos pin
+        ML_REV: 5d45fb65de47a6a3b39a35f235a393ead8f2eb38
+        PHYSICS_REV: d3f56c03bad5507338cd88bedf78fd2ae62c1a68
       run: |
         set -euo pipefail
-        git clone --depth 1 https://github.com/ext-sakamoro/ALICE-ML.git ../ALICE-ML
-    - name: Clone ALICE-Physics (physics / physics-solver features)
-      if: inputs.physics == 'true'
-      shell: bash
-      run: |
-        set -euo pipefail
-        git clone --depth 1 https://github.com/ext-sakamoro/ALICE-Physics.git ../ALICE-Physics
+        # it rewrites ../ALICE-* checkouts, so never run it outside a CI workspace
+        if [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+          echo "refusing: sibling-deps rewrites ../ALICE-* and only runs in GitHub Actions" >&2
+          exit 1
+        fi
+        fetch() {  # fetch <dir> <url> <rev>
+          git init -q "$1"
+          git -C "$1" remote add origin "$2"
+          git -C "$1" fetch -q --depth 1 origin "$3"
+          git -C "$1" checkout -q --detach FETCH_HEAD
+          echo "$1 @ $(git -C "$1" rev-parse HEAD)"
+        }
+        # ALICE-ML is an unconditional path dependency
+        fetch ../ALICE-ML "https://github.com/ext-sakamoro/ALICE-ML.git" "$ML_REV"
+        if [ "$PHYSICS" = "true" ]; then
+          fetch ../ALICE-Physics "https://github.com/ext-sakamoro/ALICE-Physics.git" "$PHYSICS_REV"
+        fi
     - name: Strip the path dependencies this job does not build
       shell: bash
       run: |
