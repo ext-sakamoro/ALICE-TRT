@@ -9,7 +9,7 @@ name: Security & Hygiene
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/**']
     paths:
       - 'Cargo.toml'
       - 'src/**'
