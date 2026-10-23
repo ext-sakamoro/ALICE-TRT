@@ -6,6 +6,7 @@ The GPU tests hang when they create wgpu devices from parallel threads on NVIDIA
 (reproduced on an A6000 and a P5000; Apple Metal does not hang), so the wrapper, not each caller, holds the rule.
 A fake `cargo` on PATH records its arguments, so no build or GPU is needed."""
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts" / "cargo_test_gpu.sh"
+
+
+def bash() -> str:
+    """Git's bash on Windows (`bash` on PATH there can be the WSL launcher, which has no
+    distribution on the runners), the PATH one elsewhere."""
+    if os.name == "nt":
+        exec_path = subprocess.run(["git", "--exec-path"], check=True, capture_output=True, text=True).stdout.strip()
+        for up in (3, 2):
+            candidate = Path(exec_path).parents[up - 1] / "bin" / "bash.exe"
+            if candidate.is_file():
+                return str(candidate)
+        raise RuntimeError(f"no bash.exe of Git near {exec_path}")
+    found = shutil.which("bash")
+    if found is None:
+        raise RuntimeError("no bash on PATH")
+    return found
 
 FAKE_CARGO = """#!/bin/sh
 printf '%s\\n' "$@" > "$CARGO_ARGS_FILE"
@@ -36,8 +53,8 @@ class Wrapper(unittest.TestCase):
             (bin_ / "cargo").write_text(cargo, newline="\n")  # LF: a CRLF shebang does not run
             (bin_ / "cargo").chmod(0o755)
             record = Path(d) / "args"
-            env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}", "CARGO_ARGS_FILE": str(record)}
-            p = subprocess.run(["bash", str(WRAPPER), *args], capture_output=True, text=True, env=env, timeout=60)
+            env = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "CARGO_ARGS_FILE": str(record)}
+            p = subprocess.run([bash(), str(WRAPPER), *args], capture_output=True, text=True, env=env, timeout=60)
             got = record.read_text().splitlines() if record.exists() else None
             return p, got
 
