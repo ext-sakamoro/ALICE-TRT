@@ -33,7 +33,7 @@ class Wrapper(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             bin_ = Path(d) / "bin"
             bin_.mkdir()
-            (bin_ / "cargo").write_text(cargo)
+            (bin_ / "cargo").write_text(cargo, newline="\n")  # LF: a CRLF shebang does not run
             (bin_ / "cargo").chmod(0o755)
             record = Path(d) / "args"
             env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}", "CARGO_ARGS_FILE": str(record)}
