@@ -18,6 +18,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Added
 
+- `scripts/test_cargo_test_gpu.py`: `scripts/cargo_test_gpu.sh` が全ての実行に `--test-threads=1` を渡し、別の thread 数を cargo の前に拒むことを、引数を記録する偽の `cargo` で検査 CI と preflight で実行
 - `scripts/wgsl_barrier_lint.py` + `scripts/test_wgsl_barrier_lint.py`: compute kernel の entry point で、最後の workgroup barrier より前に `return` / `discard` が無いことを検査 (`.wgsl` と `src/` の Rust 文字列内の WGSL) CI と preflight で実行し、entry point 0 件は失敗
 - `NeuralUpscaler` に `Default` 実装 (`new()` と同じ)
 - `.github/workflows/security-audit.yml` (`cargo audit` / `cargo deny` / `cargo machete`、依存の変更時と週 1 回) と `deny.toml` 無視する advisory は pyo3 0.22 の 2 件 (feature `python` のみ、pyo3 の更新で解消) と wgpu-hal 経由の `paste` (unmaintained) で、理由を `deny.toml` に記載
@@ -27,6 +28,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Changed
 
+- `scripts/cargo_test_gpu.sh` は GPU test を常に直列で走らせる (`--test-threads=1` を付け、別の値は拒む) 並列の thread から wgpu の device を作ると NVIDIA の proprietary Vulkan driver で test が止まる (A6000 と P5000 で再現、Apple Metal では起きない) README と `device::test_device` の doc に記載
 - CI: `.github/actions/sibling-deps` は ALICE-ML / ALICE-Physics を action の env の 1 箇所 (`ML_REV` / `PHYSICS_REV`) に固定した commit から取る (以前は毎回 main で、同じ commit でも sibling の main が動くと結果が変わった) 固定の commit が取れなければ失敗し、GitHub Actions の外では止まる workflow は `ci/**` の branch でも走る
 - `alice-physics` の path 依存を `../ALICE-Physics` から `../ALICE-Physics/crates/alice-physics` に移した (ALICE-Physics 4.0 で repository の root の package は `alice-physics-core` になり、`alice-physics` は `crates/alice-physics` の窓口の crate になった 旧 path では cargo が `alice-physics` を見つけられない) `deny.toml` の license の例外に `alice-physics-core` を足した (alice-physics と alice-physics-core の例外は宣言どおり `AGPL-3.0-or-later` だけを許す `AGPL-3.0` / `AGPL-3.0-only` は外した: license が `-only` に変わったら cargo-deny が止める)
 - GPU を使う unit test は `device::test_device()` から device を取る 既定では adapter が無いと skip するが、`TRT_REQUIRE_GPU` が設定されていると panic する CI の GPU job (`Fix128 GPU` の dispatch と physics-solver golden) は `scripts/cargo_test_gpu.sh` 経由で実行し、adapter が無い・GPU device を 1 つも取得しなかった・skip が 1 件でもある場合は失敗にする adapter を隠した run が実際に失敗することを毎回の self-test で確認する (従来は adapter を失った runner で GPU test が全件 skip のまま green になりえた)

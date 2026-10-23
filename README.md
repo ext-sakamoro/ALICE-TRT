@@ -254,7 +254,12 @@ scripts/preflight.sh                        # every CI gate that runs locally
 ```
 
 GPU tests need an adapter; on Linux without a GPU, Mesa's lavapipe
-(`mesa-vulkan-drivers`) provides one. The TensorRT plugin is built separately:
+(`mesa-vulkan-drivers`) provides one. Run the GPU tests one thread at a time
+(`--test-threads=1`, as above): created from parallel threads, the wgpu
+devices hang the tests on NVIDIA's proprietary Vulkan driver (reproduced on an
+A6000 and a P5000; Apple Metal does not hang). `scripts/cargo_test_gpu.sh`,
+which CI and `scripts/preflight.sh` use, always serializes them and refuses
+another thread count. The TensorRT plugin is built separately:
 
 ```sh
 cd csrc && mkdir build && cd build

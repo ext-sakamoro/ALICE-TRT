@@ -9,6 +9,12 @@
 #   - zero tests passed.
 # Used by ci.yml and scripts/preflight.sh with the same arguments.
 #
+# Every run is serialized: the wrapper always passes `--test-threads=1` to the
+# test binaries and refuses a caller that asks for another thread count. The
+# GPU tests hang when they create wgpu devices from parallel threads on NVIDIA's
+# proprietary Vulkan driver (reproduced on an A6000 and a P5000; Apple Metal
+# does not hang), so the rule lives here rather than in each caller.
+#
 # usage: scripts/cargo_test_gpu.sh <cargo test arguments...>
 #        scripts/cargo_test_gpu.sh --self-test <cargo test arguments...>
 #   --self-test hides the adapter (TRT_TEST_FORCE_NO_ADAPTER=1) and passes only
@@ -20,6 +26,35 @@ if [ "${1:-}" = "--self-test" ]; then
   self_test=1
   shift
 fi
+# split the arguments at `--` into cargo's and the test binaries', and serialize the test binaries
+cargo_args=()
+test_args=()
+seen_sep=0
+for a in "$@"; do
+  if [ "$seen_sep" -eq 0 ] && [ "$a" = "--" ]; then
+    seen_sep=1
+  elif [ "$seen_sep" -eq 0 ]; then
+    cargo_args+=("$a")
+  else
+    test_args+=("$a")
+  fi
+done
+serial=0
+expect_count=0
+for a in ${test_args[@]+"${test_args[@]}"}; do
+  if [ "$expect_count" -eq 1 ]; then
+    [ "$a" = 1 ] || { echo "error: GPU tests run with --test-threads=1 only (got --test-threads $a)" >&2; exit 2; }
+    serial=1 expect_count=0
+    continue
+  fi
+  case "$a" in
+    --test-threads=1) serial=1 ;;
+    --test-threads=*) echo "error: GPU tests run with --test-threads=1 only (got $a)" >&2; exit 2 ;;
+    --test-threads) expect_count=1 ;;
+  esac
+done
+[ "$serial" -eq 1 ] || test_args+=("--test-threads=1")
+set -- ${cargo_args[@]+"${cargo_args[@]}"} -- "${test_args[@]}"
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 export TRT_REQUIRE_GPU=1

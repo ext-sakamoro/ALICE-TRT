@@ -59,6 +59,7 @@ python3 scripts/test_wgsl_barrier_lint.py
 python3 scripts/wgsl_barrier_lint.py
 python3 scripts/test_no_direct_rkyv.py
 python3 scripts/no_direct_rkyv.py
+python3 scripts/test_cargo_test_gpu.py
 
 step "ci.yml / clippy (default features, all targets)"
 cargo +1.92.0 clippy --all-targets -- -D warnings

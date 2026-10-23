@@ -243,7 +243,11 @@ scripts/preflight.sh                        # every CI gate that runs locally
 ```
 
 GPU test には adapter が要る GPU の無い Linux では Mesa の lavapipe
-(`mesa-vulkan-drivers`) が adapter になる TensorRT plugin は別に build する
+(`mesa-vulkan-drivers`) が adapter になる GPU test は 1 thread ずつ走らせる (上の
+`--test-threads=1`) 並列の thread から wgpu の device を作ると、NVIDIA の proprietary
+Vulkan driver で test が止まる (A6000 と P5000 で再現、Apple Metal では起きない)
+CI と `scripts/preflight.sh` が使う `scripts/cargo_test_gpu.sh` は常に直列化し、別の
+thread 数を拒む TensorRT plugin は別に build する
 
 ```sh
 cd csrc && mkdir build && cd build

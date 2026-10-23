@@ -204,6 +204,11 @@ impl std::fmt::Display for GpuDevice {
 ///
 /// `TRT_TEST_FORCE_NO_ADAPTER` makes the adapter look missing; CI uses it to
 /// check that the requirement actually fails the run.
+///
+/// Run the tests that take this device one thread at a time
+/// (`--test-threads=1`): devices created from parallel threads hang the tests
+/// on NVIDIA's proprietary Vulkan driver (A6000 and P5000; Apple Metal does
+/// not hang). `scripts/cargo_test_gpu.sh` always serializes them.
 #[cfg(test)]
 pub(crate) fn test_device() -> Option<GpuDevice> {
     let result = if std::env::var_os("TRT_TEST_FORCE_NO_ADAPTER").is_some() {
