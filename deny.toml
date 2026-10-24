@@ -65,7 +65,7 @@ allow = [
 # them only, not for third-party dependencies.
 [[licenses.exceptions]]
 name = "alice-trt"
-allow = ["AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later"]
+allow = ["LicenseRef-Proprietary"]
 
 [[licenses.exceptions]]
 name = "alice-ml"

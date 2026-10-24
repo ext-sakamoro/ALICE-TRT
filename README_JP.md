@@ -266,15 +266,6 @@ make -j"$(nproc)"
 
 ## ライセンス
 
-`AGPL-3.0 OR LicenseRef-Commercial`: デュアルライセンス、どちらかを選ぶ
+`LicenseRef-Proprietary` 条文は [LICENSE-Proprietary](LICENSE-Proprietary)
 
-| 選択肢 | 条件 | 使う場面 |
-|--------|------|----------|
-| **AGPL-3.0** | [LICENSE-AGPL](LICENSE-AGPL)、無償、報告義務なし | 自分のプロジェクトも AGPL 互換の OSS、または社内利用のみ |
-| **商用ライセンス** | [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)、有償、copyleft を外す | クローズドソース製品、商用 SaaS、エッジ / ファームウェア配布、plugin の再配布、ソース開示を禁じるプラットフォーム NDA |
-
-AGPL は強い copyleft で、`alice-trt` を link して配布またはサービス提供する製品、
-ファームウェア、サービスは AGPL で公開する必要がある これはオープンな
-エコシステムのための意図的な条件で、それができない場合のために商用ライセンスがある
-
-商用ライセンスの問い合わせ: <contact@extoria.co.jp>
+Enquiries: https://extoria.co.jp/
