@@ -8,7 +8,6 @@ English | [日本語](README_JP.md)
 
 [![CI](https://github.com/ext-sakamoro/ALICE-TRT/actions/workflows/ci.yml/badge.svg)](https://github.com/ext-sakamoro/ALICE-TRT/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.87-blue)](#minimum-supported-rust-version)
-[![License](https://img.shields.io/badge/license-AGPL--3.0%20OR%20Commercial-blue)](#license)
 
 Ternary weights `{-1, 0, +1}` are stored in VRAM as two bitplanes (2 bits per
 weight, 32 weights per `u32` word) and expanded to `{-1.0, 0.0, +1.0}` in

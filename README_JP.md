@@ -8,7 +8,6 @@
 
 [![CI](https://github.com/ext-sakamoro/ALICE-TRT/actions/workflows/ci.yml/badge.svg)](https://github.com/ext-sakamoro/ALICE-TRT/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.87-blue)](#最小サポート-rust-バージョン)
-[![License](https://img.shields.io/badge/license-AGPL--3.0%20OR%20Commercial-blue)](#ライセンス)
 
 三値重み `{-1, 0, +1}` は VRAM 上に 2 枚の bitplane (1 重み 2 bit、`u32` 1 word に
 32 重み) として置かれ、compute shader 内のレジスタで `{-1.0, 0.0, +1.0}` に展開

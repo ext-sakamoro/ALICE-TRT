@@ -60,9 +60,8 @@ allow = [
     "CC0-1.0",
 ]
 
-# This crate and its ALICE path dependencies are AGPL-3.0 (alice-trt is
-# additionally offered under a commercial licence); copyleft is allowed for
-# them only, not for third-party dependencies.
+# This crate and its ALICE path dependencies take their own licence exceptions;
+# the exceptions are for them only, not for third-party dependencies.
 [[licenses.exceptions]]
 name = "alice-trt"
 allow = ["LicenseRef-Proprietary"]
@@ -75,13 +74,13 @@ allow = ["AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later"]
 name = "alice-physics"
 allow = ["AGPL-3.0-or-later"]
 
-# alice-physics 4.0 is a facade over alice-physics-core (same dual license)
+# alice-physics 4.0 is a facade over alice-physics-core (same license)
 [[licenses.exceptions]]
 name = "alice-physics-core"
 allow = ["AGPL-3.0-or-later"]
 
-# alice-db (feature `db`, crates.io) is AGPL-3.0-or-later; the exception names
-# that one crate only, and only the optional `db` feature pulls it in.
+# alice-db (feature `db`, crates.io): the exception names that one crate only,
+# and only the optional `db` feature pulls it in.
 [[licenses.exceptions]]
 name = "alice-db"
 allow = ["AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later"]
