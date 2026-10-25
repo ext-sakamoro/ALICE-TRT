@@ -18,8 +18,8 @@ runs:
       env:
         PHYSICS: ${{ inputs.physics }}
         # PHYSICS_REV is the same commit as the other ALICE-* repos pin
-        ML_REV: 5d45fb65de47a6a3b39a35f235a393ead8f2eb38
-        PHYSICS_REV: d3f56c03bad5507338cd88bedf78fd2ae62c1a68
+        ML_REV: ec8a725c4c954a007b09cfed3b3aabebb7650524
+        PHYSICS_REV: 50a12e1b89aae8f26c80bce139cf9d173bfccb1d
       run: |
         set -euo pipefail
         # it rewrites ../ALICE-* checkouts, so never run it outside a CI workspace

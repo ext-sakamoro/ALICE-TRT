@@ -28,6 +28,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Changed
 - Licence: `AGPL-3.0` → `LicenseRef-Proprietary`
+- 依存: sibling の ALICE-ML を `ec8a725`、ALICE-Physics を `50a12e1` に (deny の例外は `LicenseRef-Proprietary`)
 
 - `scripts/cargo_test_gpu.sh` は GPU test を常に直列で走らせる (`--test-threads=1` を付け、別の値は拒む) 並列の thread から wgpu の device を作ると NVIDIA の proprietary Vulkan driver で test が止まる (A6000 と P5000 で再現、Apple Metal では起きない) README と `device::test_device` の doc に記載
 - CI: `.github/actions/sibling-deps` は ALICE-ML / ALICE-Physics を action の env の 1 箇所 (`ML_REV` / `PHYSICS_REV`) に固定した commit から取る (以前は毎回 main で、同じ commit でも sibling の main が動くと結果が変わった) 固定の commit が取れなければ失敗し、GitHub Actions の外では止まる workflow は `ci/**` の branch でも走る
