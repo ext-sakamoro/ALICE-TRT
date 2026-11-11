@@ -20,7 +20,7 @@ dependencies = [
 [[package]]
 name = "alice-db"
 version = "0.6.0"
-source = "git+https://github.com/ext-sakamoro/ALICE-DB?branch=main#54697bf516a4240dbc029124e6651b572f1d2286"
+source = "git+https://github.com/ext-sakamoro/ALICE-DB?branch=main#06cc2af6d2ed1c3722a906ec8169cdecb41beef0"
 dependencies = [
  "alice-det-math",
  "alice-serial",
@@ -42,7 +42,7 @@ dependencies = [
 [[package]]
 name = "alice-det-math"
 version = "0.6.1"
-source = "git+https://github.com/ext-sakamoro/ALICE-DetMath?branch=main#95934099bfe6aa31296633ac35b023ed74878791"
+source = "git+https://github.com/ext-sakamoro/ALICE-DetMath?branch=main#d80446ebce73c5c397f7df12435cf574460400bf"
 dependencies = [
  "bytemuck",
  "wide",
@@ -96,7 +96,7 @@ dependencies = [
 [[package]]
 name = "alice-serial"
 version = "0.2.0"
-source = "git+https://github.com/ext-sakamoro/ALICE-Serial?rev=16b34ebcaf3a195fe6500defb4d1e6002cb3d09d#16b34ebcaf3a195fe6500defb4d1e6002cb3d09d"
+source = "git+https://github.com/ext-sakamoro/ALICE-Serial?branch=main#16b34ebcaf3a195fe6500defb4d1e6002cb3d09d"
 
 [[package]]
 name = "alice-trt"
