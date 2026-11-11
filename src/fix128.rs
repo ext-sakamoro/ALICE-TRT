@@ -5169,7 +5169,11 @@ pub fn dispatch_fix128_bvh_find_pairs(
         let pair_bytes = (actual_pair_count * core::mem::size_of::<[u32; 2]>()) as u64;
         let raw = device.read_buffer(&buf_pairs, pair_bytes);
         let flat: &[u32] = bytemuck::cast_slice(&raw);
-        flat.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+        flat.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| (c[0], c[1]))
+            .collect()
     };
 
     // Host-side finaliser matches CPU find_pairs tail steps exactly.

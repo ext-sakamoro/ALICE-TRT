@@ -7,7 +7,7 @@ its solver on the GPU with byte-exact results.
 English | [日本語](README_JP.md)
 
 [![CI](https://github.com/ext-sakamoro/ALICE-TRT/actions/workflows/ci.yml/badge.svg)](https://github.com/ext-sakamoro/ALICE-TRT/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.87-blue)](#minimum-supported-rust-version)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](#minimum-supported-rust-version)
 
 Ternary weights `{-1, 0, +1}` are stored in VRAM as two bitplanes (2 bits per
 weight, 32 weights per `u32` word) and expanded to `{-1.0, 0.0, +1.0}` in
@@ -46,23 +46,15 @@ dominates and a CPU implementation such as ALICE-ML is faster (see
 
 ## Installation
 
-ALICE-TRT is not published on crates.io. It depends on
-[ALICE-ML](https://github.com/ext-sakamoro/ALICE-ML) through a path dependency,
-so check out both repositories side by side:
-
-```sh
-git clone https://github.com/ext-sakamoro/ALICE-ML.git
-git clone https://github.com/ext-sakamoro/ALICE-TRT.git
-```
+ALICE-TRT is not published on crates.io. Take it from git; its ALICE dependencies
+(ALICE-ML, and ALICE-Physics / ALICE-SDF / ALICE-DB for the `physics` /
+`physics-solver`, `sdf` and `db` features) come from their repositories' main
+branches by git, and the committed `Cargo.lock` pins the commits CI builds:
 
 ```toml
 [dependencies]
-alice-trt = { path = "../ALICE-TRT" }
+alice-trt = { git = "https://github.com/ext-sakamoro/ALICE-TRT", branch = "main" }
 ```
-
-The `physics` / `physics-solver` and `sdf` features additionally need
-`../ALICE-Physics` and `../ALICE-SDF`. The `db` feature takes `alice-db` 0.5
-from crates.io.
 
 ## Example
 
@@ -174,9 +166,7 @@ What CI checks ([.github/workflows/ci.yml](.github/workflows/ci.yml)):
   [security-audit.yml](.github/workflows/security-audit.yml), `cargo audit`,
   `cargo deny` and `cargo machete`.
 
-Not built in CI: the `cuda` feature and the TensorRT plugin (no NVIDIA runner),
-and the `sdf` feature (its sibling crate pulls further path dependencies that
-CI does not check out).
+Not built in CI: the `cuda` feature and the TensorRT plugin (no NVIDIA runner).
 
 Known defects:
 
@@ -237,7 +227,7 @@ INT8 1,048,576, ALICE-TRT 262,144 (1/16 of FP32).
 ## Minimum supported Rust version
 
 <!-- readme-sync: msrv -->
-Rust 1.87 (`rust-version` in Cargo.toml). The floor comes from the ALICE-ML path
+Rust 1.88 (`rust-version` in Cargo.toml). The floor comes from the ALICE-SDF
 dependency. CI compiles the library with exactly this toolchain; the
 development toolchain is pinned to 1.92.0 in `rust-toolchain.toml`.
 

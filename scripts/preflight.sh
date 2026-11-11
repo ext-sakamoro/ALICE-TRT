@@ -9,16 +9,11 @@
 #   --quick  every static gate + the device-free lib tests (cpu-test job)
 #
 # Steps CI runs that this script does not reproduce:
-#   - .github/actions/sibling-deps: clones ALICE-ML / ALICE-Physics next to the
-#     checkout and strips alice-sdf from Cargo.toml. Locally the sibling
-#     checkouts (../ALICE-ML, ../ALICE-Physics, ../ALICE-SDF and its own
-#     siblings) must exist so Cargo can resolve Cargo.toml unmodified.
-#     alice-db comes from crates.io.
 #   - fix128-gpu-matrix / fix128-physics-solver-matrix "Install Vulkan / Mesa":
 #     Linux runner only. The GPU test steps below run on whatever adapter this
 #     machine has (Metal / Vulkan / DX12); the other two adapters in the CI
 #     matrix (Vulkan lavapipe, DX12 WARP) can only be exercised on CI.
-#   - msrv: needs the 1.87 toolchain (`rustup toolchain install 1.87`); run
+#   - msrv: needs the 1.88 toolchain (`rustup toolchain install 1.88`); run
 #     here when it is installed, otherwise reported as skipped.
 #   - security-audit.yml (cargo audit / deny / machete) is not part of this
 #     script; it runs on dependency changes and weekly.
@@ -34,7 +29,7 @@ esac
 
 # the feature set every CI job that builds the crate uses (sdf / cuda are not
 # built in CI; python is linted only)
-CI_FEATURES='ffi,view,voice,fix128-arithmetic,physics-solver,db'
+CI_FEATURES='ffi,view,voice,fix128-arithmetic,physics-solver,db,sdf'
 
 step() { printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1 ($2)" >&2; exit 1; }; }
@@ -61,6 +56,19 @@ python3 scripts/test_no_direct_rkyv.py
 python3 scripts/no_direct_rkyv.py
 python3 scripts/test_cargo_test_gpu.py
 
+step "ci.yml / clippy: lock is current, every alice-* from git, at most one alice-det-math"
+cargo metadata --locked --format-version 1 >/dev/null
+python3 - <<'PY'
+import sys, tomllib
+pk = [p for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"].startswith("alice")]
+bad = [f'{p["name"]} {p["version"]} {p.get("source", "path")}' for p in pk
+       if p["name"] != "alice-trt" and not p.get("source", "").startswith("git+")]
+dm = [p for p in pk if p["name"] == "alice-det-math"]
+print(f"lock: {len(pk) - 1} alice-* dependencies, {len(bad)} not from git, {len(dm)} alice-det-math")
+if len(pk) < 2 or bad or len(dm) > 1:
+    sys.exit("\n".join(bad) or "expected an alice-* dependency and at most one alice-det-math")
+PY
+
 step "ci.yml / clippy (default features, all targets)"
 cargo +1.92.0 clippy --all-targets -- -D warnings
 
@@ -68,18 +76,18 @@ cargo +1.92.0 clippy --all-targets -- -D warnings
 # forward-compatibility switch lets the extension module type-check (CI pins 3.12)
 step "ci.yml / clippy (every feature CI builds, all targets)"
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 \
-  cargo +1.92.0 clippy --all-targets --features "ffi,python,view,voice,fix128-arithmetic,physics-solver,db" -- -D warnings
+  cargo +1.92.0 clippy --all-targets --features "ffi,python,view,voice,fix128-arithmetic,physics-solver,db,sdf" -- -D warnings
 
 step "ci.yml / doc (RUSTDOCFLAGS=-Dwarnings)"
 RUSTDOCFLAGS="-Dwarnings" cargo +1.92.0 doc --lib --no-deps
 RUSTDOCFLAGS="-Dwarnings" cargo +1.92.0 doc --lib --no-deps --features "$CI_FEATURES"
 
-step "ci.yml / msrv (rust-version = 1.87)"
-if has_toolchain 1.87; then
-  cargo +1.87 check --lib
-  cargo +1.87 check --lib --features "$CI_FEATURES"
+step "ci.yml / msrv (rust-version = 1.88)"
+if has_toolchain 1.88; then
+  cargo +1.88 check --lib
+  cargo +1.88 check --lib --features "$CI_FEATURES"
 else
-  echo "skip: toolchain 1.87 not installed (rustup toolchain install 1.87); CI runs this check" >&2
+  echo "skip: toolchain 1.88 not installed (rustup toolchain install 1.88); CI runs this check" >&2
 fi
 
 step "ci.yml / cpu-test (device-free modules + doctests, zero executed is red)"

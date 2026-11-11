@@ -7,7 +7,7 @@
 [English](README.md) | 日本語
 
 [![CI](https://github.com/ext-sakamoro/ALICE-TRT/actions/workflows/ci.yml/badge.svg)](https://github.com/ext-sakamoro/ALICE-TRT/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.87-blue)](#最小サポート-rust-バージョン)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](#最小サポート-rust-バージョン)
 
 三値重み `{-1, 0, +1}` は VRAM 上に 2 枚の bitplane (1 重み 2 bit、`u32` 1 word に
 32 重み) として置かれ、compute shader 内のレジスタで `{-1.0, 0.0, +1.0}` に展開
@@ -43,22 +43,15 @@ overhead (約 1.3 ms) が支配的で、ALICE-ML のような CPU 実装の方�
 
 ## インストール
 
-ALICE-TRT は crates.io に公開していない
-[ALICE-ML](https://github.com/ext-sakamoro/ALICE-ML) に path 依存しているので、
-2 つの repository を並べて checkout する
-
-```sh
-git clone https://github.com/ext-sakamoro/ALICE-ML.git
-git clone https://github.com/ext-sakamoro/ALICE-TRT.git
-```
+ALICE-TRT は crates.io に公開していない git から取る ALICE の依存 (ALICE-ML、
+`physics` / `physics-solver`、`sdf`、`db` feature では ALICE-Physics / ALICE-SDF /
+ALICE-DB) は各 repository の main から git で取り、commit した `Cargo.lock` が
+CI の build する commit を固定する
 
 ```toml
 [dependencies]
-alice-trt = { path = "../ALICE-TRT" }
+alice-trt = { git = "https://github.com/ext-sakamoro/ALICE-TRT", branch = "main" }
 ```
-
-`physics` / `physics-solver`、`sdf` feature はさらに `../ALICE-Physics`、
-`../ALICE-SDF` を必要とする `db` feature は crates.io の `alice-db` 0.5 を使う
 
 ## 使用例
 
@@ -166,8 +159,7 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) が検査するもの
   [security-audit.yml](.github/workflows/security-audit.yml) の `cargo audit` /
   `cargo deny` / `cargo machete`
 
-CI で build しないもの: `cuda` feature と TensorRT plugin (NVIDIA の runner が無い)、
-`sdf` feature (依存先の crate がさらに CI で checkout しない path 依存を持つ)
+CI で build しないもの: `cuda` feature と TensorRT plugin (NVIDIA の runner が無い)
 
 既知の不具合
 
@@ -226,7 +218,7 @@ CPU (ALICE-ML) と GPU
 ## 最小サポート Rust バージョン
 
 <!-- readme-sync: msrv -->
-Rust 1.87 (Cargo.toml の `rust-version`) 下限は ALICE-ML への path 依存で決まる
+Rust 1.88 (Cargo.toml の `rust-version`) 下限は ALICE-SDF への依存で決まる
 CI はちょうどこの toolchain で library を compile する 開発用 toolchain は
 `rust-toolchain.toml` で 1.92.0 に固定している
 

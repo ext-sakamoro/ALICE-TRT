@@ -9,12 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Every job that builds the crate first clones the sibling path dependencies
-# with .github/actions/sibling-deps (ALICE-ML always, ALICE-Physics when the
-# job builds `physics` / `physics-solver`) and removes alice-sdf from
-# Cargo.toml (scripts/strip_sibling_deps.sh). The `sdf` and `cuda` features
-# are therefore not built in CI (`cuda` needs nvcc). alice-db is resolved from
-# crates.io, so the `db` feature is built, linted and tested.
+# The ALICE dependencies (ALICE-ML, ALICE-Physics, ALICE-SDF, ALICE-DB) come from their
+# repositories' main branches by git and are pinned by the committed Cargo.lock; the clippy job
+# checks that the lock is current and that every alice-* in it comes from git (at most one
+# alice-det-math). Every feature but `cuda` (it needs nvcc) is built, linted and documented.
 #
 # scripts/preflight.sh runs the same commands locally.
 
@@ -77,9 +75,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/sibling-deps
-        with:
-          physics: 'true'
       - uses: dtolnay/rust-toolchain@1.92.0
         with:
           components: clippy
@@ -88,10 +83,24 @@ jobs:
         with:
           python-version: '3.12'
       - uses: Swatinem/rust-cache@v2
+      - name: Lock is current, every alice-* from git, at most one alice-det-math
+        shell: bash
+        run: |
+          cargo metadata --locked --format-version 1 >/dev/null
+          python3 - <<'PY'
+          import sys, tomllib
+          pk = [p for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"].startswith("alice")]
+          bad = [f'{p["name"]} {p["version"]} {p.get("source", "path")}' for p in pk
+                 if p["name"] != "alice-trt" and not p.get("source", "").startswith("git+")]
+          dm = [p for p in pk if p["name"] == "alice-det-math"]
+          print(f"lock: {len(pk) - 1} alice-* dependencies, {len(bad)} not from git, {len(dm)} alice-det-math")
+          if len(pk) < 2 or bad or len(dm) > 1:
+              sys.exit("\n".join(bad) or "expected an alice-* dependency and at most one alice-det-math")
+          PY
       - name: Clippy (default features, all targets)
         run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (every feature CI builds, all targets)
-        run: cargo clippy --all-targets --features "ffi,python,view,voice,fix128-arithmetic,physics-solver,db" -- -D warnings
+        run: cargo clippy --all-targets --features "ffi,python,view,voice,fix128-arithmetic,physics-solver,db,sdf" -- -D warnings
 
   # Tests whose modules never create a GPU device (constraint graph colouring,
   # WGSL source checks, the view / voice bridges) plus the doctests. They run on
@@ -105,9 +114,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/sibling-deps
-        with:
-          physics: 'false'
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
       - name: Test (device-free modules, zero executed is red)
@@ -131,9 +137,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/sibling-deps
-        with:
-          physics: 'false'
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (lib, db)
@@ -148,28 +151,22 @@ jobs:
   # prefer dependency versions that support it. Bump `rust-version` and the
   # toolchain below in the same commit.
   msrv:
-    name: MSRV (rust-version = 1.87)
+    name: MSRV (rust-version = 1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/sibling-deps
-        with:
-          physics: 'true'
-      - uses: dtolnay/rust-toolchain@1.87
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - name: cargo check on MSRV (lib, default features)
-        run: cargo +1.87 check --lib
+        run: cargo +1.88 check --lib
       - name: cargo check on MSRV (lib, every feature CI builds except python)
-        run: cargo +1.87 check --lib --features "ffi,view,voice,fix128-arithmetic,physics-solver,db"
+        run: cargo +1.88 check --lib --features "ffi,view,voice,fix128-arithmetic,physics-solver,db,sdf"
 
   doc:
     name: Doc (RUSTDOCFLAGS=-Dwarnings)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/sibling-deps
-        with:
-          physics: 'true'
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc (no-deps, default features)
@@ -177,7 +174,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-Dwarnings"
       - name: cargo doc (no-deps, every feature CI builds except python)
-        run: cargo doc --lib --no-deps --features "ffi,view,voice,fix128-arithmetic,physics-solver,db"
+        run: cargo doc --lib --no-deps --features "ffi,view,voice,fix128-arithmetic,physics-solver,db,sdf"
         env:
           RUSTDOCFLAGS: "-Dwarnings"
 
@@ -186,7 +183,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        # ubuntu pinned to 24.04: lavapipe on the 26.04 image (now ubuntu-latest) crashes these
+        # wgpu runs (SIGSEGV), the same drift other ALICE repositories pinned against
+        os: [macos-latest, ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -195,7 +194,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.92.0
 
       - name: Install Vulkan / Mesa (Linux only, provides the lavapipe software adapter)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -214,9 +213,6 @@ jobs:
           key: ${{ matrix.os }}-cargo-fix128-${{ hashFiles('Cargo.toml') }}
 
       # this lane builds `fix128-arithmetic` alone, without alice-physics
-      - uses: ./.github/actions/sibling-deps
-        with:
-          physics: 'false'
 
       - name: Build (fix128-arithmetic)
         run: cargo build --lib --features fix128-arithmetic
@@ -257,7 +253,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        # ubuntu pinned to 24.04: lavapipe on the 26.04 image (now ubuntu-latest) crashes these
+        # wgpu runs (SIGSEGV), the same drift other ALICE repositories pinned against
+        os: [macos-latest, ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -266,7 +264,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.92.0
 
       - name: Install Vulkan / Mesa (Linux only, provides the lavapipe software adapter)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -284,9 +282,6 @@ jobs:
             target
           key: ${{ matrix.os }}-cargo-physics-solver-${{ hashFiles('Cargo.toml') }}
 
-      - uses: ./.github/actions/sibling-deps
-        with:
-          physics: 'true'
 
       - name: Build (fix128-arithmetic + physics-solver)
         run: cargo build --lib --features fix128-arithmetic,physics-solver

@@ -1,9 +1,7 @@
 # Dependabot: GitHub Actions only, major bumps excluded (they need a manual review)
 #
-# There is no root cargo entry: Cargo.toml declares sibling path dependencies
-# (path = "../ALICE-Xxxx") that Dependabot does not check out, so a cargo update
-# job fails with path_dependencies_not_reachable. Cargo dependencies are
-# updated by hand with `cargo update -p <name>`.
+# There is no root cargo entry: the ALICE dependencies come from git (branch main) and move
+# with `cargo update -p <name>` in a reviewed commit, like the other cargo dependencies.
 version: 2
 updates:
   - package-ecosystem: github-actions

@@ -3,10 +3,10 @@ name = "alice-trt"
 version = "3.2.0"
 edition = "2021"
 # Compiled with exactly this toolchain in CI (ci.yml job `msrv`); the floor is set
-# by the `alice-ml` path dependency (const `Vec::len`, stable since 1.87).
-rust-version = "1.87"
+# by the `alice-sdf` dependency (1.88).
+rust-version = "1.88"
 # MSRV-aware resolution: a fresh lockfile prefers dependency versions that
-# support `rust-version` (Cargo.lock is not committed for this library).
+# support `rust-version` (the committed Cargo.lock pins what CI builds).
 resolver = "3"
 authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 description = "GPU Ternary Inference Engine - Don't move data. Move the law."
@@ -37,10 +37,10 @@ physics-solver = ["physics", "fix128-arithmetic", "alice-physics/gpu-solver-brid
 wgpu = "24"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
-alice-ml = { path = "../ALICE-ML" }
-alice-physics = { path = "../ALICE-Physics/crates/alice-physics", optional = true, default-features = false, features = ["std"] }
-alice-sdf = { path = "../ALICE-SDF", optional = true, default-features = false }
-alice-db = { version = "0.5", optional = true, default-features = false, features = ["fs"] }
+alice-ml = { version = "0.4.0", git = "https://github.com/ext-sakamoro/ALICE-ML", branch = "main" }
+alice-physics = { version = "4.0.0", git = "https://github.com/ext-sakamoro/ALICE-Physics", branch = "main", optional = true, default-features = false, features = ["std"] }
+alice-sdf = { version = "7.0.0", git = "https://github.com/ext-sakamoro/ALICE-SDF", branch = "main", optional = true, default-features = false }
+alice-db = { version = "0.6.0", git = "https://github.com/ext-sakamoro/ALICE-DB", branch = "main", optional = true, default-features = false, features = ["fs"] }
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 
 [build-dependencies]

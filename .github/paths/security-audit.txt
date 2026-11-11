@@ -5,7 +5,6 @@ Cargo.toml
 src/**
 build.rs
 deny.toml
-scripts/strip_sibling_deps.sh
-.github/actions/**
+Cargo.lock
 .github/workflows/security-audit.yml
 .github/paths/security-audit.txt

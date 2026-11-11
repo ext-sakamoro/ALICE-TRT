@@ -13,7 +13,7 @@
 //! relation to the SDF (oracle `tests/analytic_oracle.rs`, sphere RMS error
 //! ≈ radius).  The training path is
 //! alice-train (STE on CPU) → [`crate::GpuTernaryWeight::from_kernel`]; it is
-//! not implemented yet.  [`sample_training_data`] and [`GpuNeuralSdf::eval_batch`]
+//! not implemented yet.  The private `sample_training_data` and [`GpuNeuralSdf::eval_batch`]
 //! are real and stay.
 //!
 //! # Pipeline
