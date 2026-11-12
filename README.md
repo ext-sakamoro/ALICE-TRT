@@ -170,7 +170,8 @@ Not built in CI: the `cuda` feature and the TensorRT plugin (no NVIDIA runner).
 
 Known defects:
 
-- **`GpuNeuralSdf::fit` is not implemented.** It panics with `todo!`. An earlier
+- **`GpuNeuralSdf::fit` is not implemented.** It returns
+  `FitError::NotImplemented`. An earlier
   version returned a network unrelated to the SDF; the oracle
   `neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius` is `#[ignore]`d
   until fitting exists.

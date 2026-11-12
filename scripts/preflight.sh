@@ -115,7 +115,7 @@ step "ci.yml / fix128-gpu-matrix: Fix128 GPU dispatch"
 bash scripts/cargo_test_gpu.sh --lib --features fix128-arithmetic fix128 -- --nocapture --test-threads=1
 
 step "ci.yml / fix128-gpu-matrix: analytic oracles"
-cargo +1.92.0 test --test analytic_oracle --features fix128-arithmetic,voice,view -- --test-threads=1
+bash scripts/cargo_test_nonzero.sh --test analytic_oracle --features fix128-arithmetic,voice,view,sdf -- --test-threads=1
 
 step "ci.yml / fix128-physics-solver-matrix: build"
 cargo +1.92.0 build --lib --features fix128-arithmetic,physics-solver

@@ -6,8 +6,9 @@
 //!
 //! # Status (2026-09-17)
 //!
-//! **Fitting is not implemented.** [`GpuNeuralSdf::fit`] fails fast with
-//! `todo!`; until 2026-09-17 it silently built the network from a fixed
+//! **Fitting is not implemented.** [`GpuNeuralSdf::fit`] returns
+//! [`FitError::NotImplemented`] (a panic with `todo!` until 2026-11-12); until
+//! 2026-09-17 it silently built the network from a fixed
 //! `+1/−1/0` pattern and a hash-based random projection while its doc
 //! claimed to "fit a ternary neural network" — the returned field bore no
 //! relation to the SDF (oracle `tests/analytic_oracle.rs`, sphere RMS error
@@ -38,6 +39,34 @@ pub struct GpuNeuralSdf {
     pub dist_scale: f32,
 }
 
+/// Why [`GpuNeuralSdf::fit`] returned no network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FitError {
+    /// Fitting a ternary network to an SDF is not implemented (the training path,
+    /// alice-train → [`crate::GpuTernaryWeight::from_kernel`], does not exist yet).
+    /// Carries the requested hidden width and layer count.
+    NotImplemented {
+        /// requested hidden layer width
+        hidden_width: usize,
+        /// requested number of hidden layers
+        num_hidden: usize,
+    },
+}
+
+impl core::fmt::Display for FitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotImplemented { hidden_width, num_hidden } => write!(
+                f,
+                "fitting a ternary network to an SDF is not implemented (hidden {hidden_width}x{num_hidden})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FitError {}
+
 /// Configuration for neural SDF training.
 pub struct NeuralSdfConfig {
     /// Number of random sample points for training
@@ -65,27 +94,25 @@ impl GpuNeuralSdf {
     /// evaluates the analytical SDF (the training set), then must fit a
     /// ternary network to it.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Always — the fit is not implemented (see the module docs).  The
-    /// sampled training set is discarded after being computed so that a
-    /// caller at least gets the SDF-evaluation cost profile.
+    /// Always [`FitError::NotImplemented`] — the fit is not implemented (see the
+    /// module docs). The training set is sampled first, so a caller at least
+    /// gets the SDF-evaluation cost profile.
     pub fn fit(
         device: &GpuDevice,
         sdf: &SdfNode,
         bounds_min: Vec3,
         bounds_max: Vec3,
         config: &NeuralSdfConfig,
-    ) -> Self {
+    ) -> Result<Self, FitError> {
         let (_points, _distances) =
             sample_training_data(sdf, bounds_min, bounds_max, config.num_samples);
         let _ = device;
-        todo!(
-            "STUB: GpuNeuralSdf::fit — ternary network fitting (hidden {}×{}) is not implemented; \
-             the previous body built a fixed +1/-1/0 pattern unrelated to the SDF (2026-09-17)",
-            config.hidden_width,
-            config.num_hidden
-        );
+        Err(FitError::NotImplemented {
+            hidden_width: config.hidden_width,
+            num_hidden: config.num_hidden,
+        })
     }
 
     /// Evaluate the neural SDF at a batch of points on the GPU.
