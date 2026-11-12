@@ -1,6 +1,6 @@
 [package]
 name = "alice-trt"
-version = "3.2.0"
+version = "4.0.0"
 edition = "2021"
 # Compiled with exactly this toolchain in CI (ci.yml job `msrv`); the floor is set
 # by the `alice-sdf` dependency (1.88).

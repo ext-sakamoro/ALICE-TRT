@@ -407,9 +407,38 @@ fn view_bridge_internal_resolution_is_output_times_render_scale() {
 
 // ───────────────────────── SDF bridge (feature `sdf`, path dep) ───────────
 
+/// Until fitting exists, `fit` says so with a typed error carrying the requested shape
+/// (it panicked with `todo!` before 2026-11-12).
 #[cfg(feature = "sdf")]
 #[test]
-#[ignore = "GpuNeuralSdf::fit は未実装 (2026-09-17 まで固定 +1/−1/0 pattern を『fit』と称して返していた、今は todo! で fail fast) — fit 実装 (alice-train STE) 後に ignore を外す"]
+fn neural_sdf_fit_reports_that_it_is_not_implemented() {
+    use alice_sdf::prelude::{SdfNode, Vec3};
+    use alice_trt::sdf_bridge::{FitError, GpuNeuralSdf, NeuralSdfConfig};
+    let dev = device();
+    let cfg = NeuralSdfConfig {
+        num_samples: 64,
+        hidden_width: 32,
+        num_hidden: 3,
+    };
+    let r = GpuNeuralSdf::fit(
+        &dev,
+        &SdfNode::sphere(1.0),
+        Vec3::splat(-2.0),
+        Vec3::splat(2.0),
+        &cfg,
+    );
+    assert!(matches!(
+        r,
+        Err(FitError::NotImplemented {
+            hidden_width: 32,
+            num_hidden: 3
+        })
+    ));
+}
+
+#[cfg(feature = "sdf")]
+#[test]
+#[ignore = "GpuNeuralSdf::fit は未実装 (2026-09-17 まで固定 +1/−1/0 pattern を『fit』と称して返していた、今は FitError::NotImplemented を返す) — fit 実装 (alice-train STE) 後に ignore を外す"]
 fn neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius() {
     use alice_sdf::prelude::{SdfNode, Vec3};
     use alice_trt::sdf_bridge::{GpuNeuralSdf, NeuralSdfConfig};
@@ -422,7 +451,8 @@ fn neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius() {
         Vec3::splat(-2.0),
         Vec3::splat(2.0),
         &NeuralSdfConfig::default(),
-    );
+    )
+    .expect("a fitted network");
     // oracle: |p| − 1 on a 9³ grid; a fit worth the name is within r/4 RMS
     let mut pts = Vec::new();
     let mut truth = Vec::new();

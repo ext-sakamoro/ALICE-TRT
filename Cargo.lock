@@ -100,7 +100,7 @@ source = "git+https://github.com/ext-sakamoro/ALICE-Serial?branch=main#16b34ebca
 
 [[package]]
 name = "alice-trt"
-version = "3.2.0"
+version = "4.0.0"
 dependencies = [
  "alice-db",
  "alice-ml",

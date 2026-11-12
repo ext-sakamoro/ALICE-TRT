@@ -163,7 +163,7 @@ CI で build しないもの: `cuda` feature と TensorRT plugin (NVIDIA の run
 
 既知の不具合
 
-- **`GpuNeuralSdf::fit` は未実装** `todo!` で panic する 以前の版は SDF と無関係
+- **`GpuNeuralSdf::fit` は未実装** `FitError::NotImplemented` を返す 以前の版は SDF と無関係
   なネットワークを返していた oracle
   `neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius` は fit が実装される
   まで `#[ignore]`

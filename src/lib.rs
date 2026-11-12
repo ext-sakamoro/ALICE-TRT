@@ -94,6 +94,8 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 
+// unfinished code fails the build instead of panicking at run time
+#![deny(clippy::todo, clippy::unimplemented)]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
