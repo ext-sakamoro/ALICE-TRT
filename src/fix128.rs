@@ -9782,6 +9782,7 @@ mod tests {
     fn rounding_cases() -> Vec<(Fix128Gpu, Fix128Gpu, Fix128Gpu)> {
         let half = Fix128Gpu::from_raw(0, 1 << 63);
         let over_half = Fix128Gpu::from_raw(0, (1 << 63) + 1);
+        let three_quarters = Fix128Gpu::from_raw(0, 0xC000_0000_0000_0000);
         let units = |n: i64| -> Fix128Gpu {
             if n >= 0 {
                 Fix128Gpu::from_raw(0, n as u64)
@@ -9790,14 +9791,16 @@ mod tests {
             }
         };
         vec![
-            (units(1), half, units(0)),        //  0.5 → 0 (even)
-            (units(3), half, units(2)),        //  1.5 → 2 (even)
-            (units(5), half, units(2)),        //  2.5 → 2 (even)
-            (units(-1), half, units(0)),       // −0.5 → 0 (carry into hi)
-            (units(-3), half, units(-2)),      // −1.5 → −2
-            (units(-5), half, units(-2)),      // −2.5 → −2
-            (units(1), over_half, units(1)),   //  0.5 + 2⁻⁶⁴ → 1
-            (units(-1), over_half, units(-1)), // −0.5 − 2⁻⁶⁴ → −1
+            (units(1), half, units(0)),             //  0.5 → 0 (even)
+            (units(3), half, units(2)),             //  1.5 → 2 (even)
+            (units(5), half, units(2)),             //  2.5 → 2 (even)
+            (units(-1), half, units(0)),            // −0.5 → 0 (carry into hi)
+            (units(-3), half, units(-2)),           // −1.5 → −2
+            (units(-5), half, units(-2)),           // −2.5 → −2
+            (units(1), over_half, units(1)),        //  0.5 + 2⁻⁶⁴ → 1
+            (units(-1), over_half, units(-1)),      // −0.5 − 2⁻⁶⁴ → −1
+            (units(1), three_quarters, units(1)),   //  0.75 → 1 (dropped high word above half)
+            (units(-1), three_quarters, units(-1)), // −0.75 → −1
         ]
     }
 
@@ -9834,19 +9837,31 @@ mod tests {
         }
     }
 
-    /// Every shader that multiplies carries the one kernel text: no shader
-    /// holds a second, hand-written `fix128_mul_kernel` that could round
-    /// differently. Compared over the 12 shaders that multiply (0 fails).
+    /// Every shader that multiplies carries the one kernel text: of all the
+    /// `FIX128_*_WGSL` shaders, each one that declares `fix128_mul_kernel`
+    /// declares it once and splices `fix128_mul_kernel_wgsl!`, so no shader holds
+    /// a second, hand-written product that could round differently. 12 of the
+    /// 22 shaders multiply (0 compared fails).
     #[test]
     fn every_multiplying_shader_splices_the_one_kernel() {
         let kernel: &str = fix128_mul_kernel_wgsl!();
         let shaders = [
+            FIX128_ADD_WGSL,
+            FIX128_SUB_WGSL,
             FIX128_MUL_WGSL,
+            FIX128_DIV_WGSL,
+            FIX128_SQRT_WGSL,
             FIX128_DOT_WGSL,
+            FIX128_DOT_FINAL_WGSL,
             FIX128_PGS_INTEGRATE_WGSL,
+            FIX128_PGS_PROJECT_FLOOR_WGSL,
             FIX128_PGS_PROJECT_DISTANCE_RIGID_WGSL,
             FIX128_PGS_PROJECT_DISTANCE_BATCHED_WGSL,
+            FIX128_AABB_HELPERS_WGSL,
             FIX128_MORTON_CODE_WGSL,
+            FIX128_MORTON_SORT_WGSL,
+            FIX128_BVH_BUILD_WGSL,
+            FIX128_BVH_FIND_PAIRS_WGSL,
             FIX128_SPHERE_SPHERE_CONTACT_WGSL,
             FIX128_PGS_CONTACT_SOLVE_WGSL,
             FIX128_PGS_CONTACT_SOLVE_BATCHED_WGSL,
@@ -9854,20 +9869,20 @@ mod tests {
             FIX128_QUAT_ROTATE_VEC_WGSL,
             FIX128_BALL_SOCKET_JOINT_SOLVE_WGSL,
         ];
-        let mut compared = 0;
+        let mut multiplying = 0;
         for (i, src) in shaders.iter().enumerate() {
-            assert_eq!(
-                src.matches("fn fix128_mul_kernel(").count(),
-                1,
-                "shader {i}"
-            );
+            let declared = src.matches("fn fix128_mul_kernel(").count();
+            if declared == 0 {
+                continue;
+            }
+            assert_eq!(declared, 1, "shader {i}");
             assert!(
                 src.contains(kernel),
                 "shader {i} does not splice the kernel"
             );
-            compared += 1;
+            multiplying += 1;
         }
-        assert_eq!(compared, 12);
+        assert_eq!(multiplying, 12);
     }
 
     /// The Fix128 div v1.4.0 shader ships the u128 helpers and the
