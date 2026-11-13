@@ -1022,12 +1022,29 @@ mod solver_bridge {
         }
     }
 
+    /// The identifier of the law [`TrtSolverAdapter`] computes: the SHA-256 of
+    /// `alice-trt TrtSolverAdapter: linear contact projection (positions, inverse
+    /// masses), Fix128 products rounded to nearest even`.
+    ///
+    /// The contact kernel projects body positions along the contact normal with
+    /// the inverse masses only. alice-physics 4.0 solves a contact as a point
+    /// constraint at the contact point through the rotations and the inverse
+    /// inertia, softened by the compliance; the body state of the bridge contract
+    /// is the positions and inverse masses, so the adapter does not compute
+    /// under `alice_physics::PHYSICS_SEMANTICS_ID` and says so: alice-physics
+    /// refuses it with a typed `PeerMismatch` (ALICE-Law G7) instead of running
+    /// a different contact law under its identifier.
+    pub const TRT_SOLVER_ADAPTER_SEMANTICS_ID: [u8; 32] = [
+        0x83, 0x5a, 0x41, 0xd5, 0x2b, 0x0b, 0x72, 0xac, 0xd1, 0x0e, 0xe1, 0x06, 0xd6, 0x5c, 0xc2,
+        0x6e, 0x84, 0x9e, 0x81, 0x9f, 0xda, 0xc8, 0x79, 0xcf, 0xc6, 0x1d, 0xf1, 0xa8, 0x7e, 0x00,
+        0x78, 0xe4,
+    ];
+
     impl GpuSolverBridge for TrtSolverAdapter {
-        /// The kernels reproduce the CPU solver of the alice-physics this crate is
-        /// built against, so the adapter computes under its identifier (alice-physics
-        /// refuses a backend whose identifier is not its own, ALICE-Law G7).
+        /// [`TRT_SOLVER_ADAPTER_SEMANTICS_ID`]: the law the kernels compute, not
+        /// the identifier of the alice-physics this crate is built against.
         fn semantics_id(&self) -> [u8; 32] {
-            alice_physics::PHYSICS_SEMANTICS_ID
+            TRT_SOLVER_ADAPTER_SEMANTICS_ID
         }
 
         fn send_island(&mut self, positions: &[[Fix128; 3]], velocities: &[[Fix128; 3]]) {
@@ -2551,24 +2568,17 @@ mod solver_bridge {
         // v2.8.0 (via alice-physics v0.10.0) PhysicsWorld helper API tests
         // -----------------------------------------------------------------
 
-        /// Byte-exact CPU parity for
-        /// `PhysicsWorld::solve_contact_constraints_with_bridge`
-        /// (alice-physics v0.10.0 opt-in method routing one PGS
-        /// contact-solve iteration through a
-        /// `&mut dyn GpuSolverBridge`). Sets up two identical
-        /// `PhysicsWorld` instances, drives one CPU-only (via
-        /// `world.step(dt)`) and one via the bridge helper composed
-        /// manually alongside CPU-side integrate + distance solve.
-        ///
-        /// Because the bridge helper only replaces the contact-solve
-        /// stage while the surrounding CPU pipeline stays the same,
-        /// the final `bodies` and `contact_constraints` state must
-        /// be byte-identical.
+        /// `PhysicsWorld::step_with_bridge` refuses the adapter on a chain of
+        /// six overlapping spheres: the adapter's contact kernel is the linear
+        /// projection (positions and inverse masses), alice-physics 4.0 solves
+        /// contacts as point constraints, so the adapter reports
+        /// [`super::TRT_SOLVER_ADAPTER_SEMANTICS_ID`] and the world returns a
+        /// `PeerMismatch` naming both identifiers without stepping.
         ///
         /// Skips when no GPU adapter is available (headless CI).
         #[cfg(feature = "physics-solver")]
         #[test]
-        fn physics_world_step_with_bridge_matches_cpu_step_byte_exact() {
+        fn physics_world_step_with_bridge_is_refused_with_both_ids() {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::{PhysicsWorld, RigidBody};
 
@@ -2596,136 +2606,39 @@ mod solver_bridge {
             }
 
             let dt = Fix128::from_ratio(1, 60);
-
-            // CPU-only reference.
-            let mut world_cpu = build_world();
-            world_cpu.step(dt);
-
-            // Bridge-routed replica.
             let mut world_gpu = build_world();
-            world_gpu
-                .step_with_bridge(&mut adapter, dt)
-                .expect("the adapter computes under this build's semantics");
-
-            // Byte-exact match on bodies (positions + velocities).
-            assert_eq!(
-                world_cpu.bodies.len(),
-                world_gpu.bodies.len(),
-                "body count mismatch"
-            );
-            for (i, (cpu_b, gpu_b)) in world_cpu
+            let before: Vec<_> = world_gpu
                 .bodies
                 .iter()
-                .zip(world_gpu.bodies.iter())
-                .enumerate()
-            {
-                assert_eq!(
-                    cpu_b.position.x.hi, gpu_b.position.x.hi,
-                    "body[{i}].position.x.hi mismatch"
-                );
-                assert_eq!(cpu_b.position.x.lo, gpu_b.position.x.lo);
-                assert_eq!(cpu_b.position.y.hi, gpu_b.position.y.hi);
-                assert_eq!(cpu_b.position.y.lo, gpu_b.position.y.lo);
-                assert_eq!(cpu_b.position.z.hi, gpu_b.position.z.hi);
-                assert_eq!(cpu_b.position.z.lo, gpu_b.position.z.lo);
-                assert_eq!(cpu_b.velocity.x.hi, gpu_b.velocity.x.hi);
-                assert_eq!(cpu_b.velocity.x.lo, gpu_b.velocity.x.lo);
-                assert_eq!(cpu_b.velocity.y.hi, gpu_b.velocity.y.hi);
-                assert_eq!(cpu_b.velocity.y.lo, gpu_b.velocity.y.lo);
-                assert_eq!(cpu_b.velocity.z.hi, gpu_b.velocity.z.hi);
-                assert_eq!(cpu_b.velocity.z.lo, gpu_b.velocity.z.lo);
-            }
-            // Byte-exact match on contact_constraints (cached_lambda
-            // is the only field the solve updates; other fields are
-            // caller inputs the kernel does not modify).
-            assert_eq!(
-                world_cpu.contact_constraints.len(),
-                world_gpu.contact_constraints.len(),
-                "contact_constraint count mismatch"
-            );
-            for (i, (cpu_c, gpu_c)) in world_cpu
-                .contact_constraints
+                .map(|b| (b.position, b.velocity))
+                .collect();
+
+            // The adapter computes the linear contact projection, not the
+            // point-constraint contact of this alice-physics: the world refuses
+            // it with both identifiers, and nothing runs.
+            let err = world_gpu
+                .step_with_bridge(&mut adapter, dt)
+                .expect_err("the adapter does not compute under this build's semantics");
+            assert_eq!(err.bridge, "step_with_bridge");
+            assert_eq!(err.peer, "gpu-solver-bridge");
+            assert_eq!(err.found, super::TRT_SOLVER_ADAPTER_SEMANTICS_ID);
+            assert_eq!(err.expected, alice_physics::PHYSICS_SEMANTICS_ID);
+            assert_ne!(err.found, err.expected);
+            let after: Vec<_> = world_gpu
+                .bodies
                 .iter()
-                .zip(world_gpu.contact_constraints.iter())
-                .enumerate()
-            {
-                assert_eq!(
-                    cpu_c.cached_lambda.hi, gpu_c.cached_lambda.hi,
-                    "contact_constraints[{i}].cached_lambda.hi mismatch"
-                );
-                assert_eq!(cpu_c.cached_lambda.lo, gpu_c.cached_lambda.lo);
-            }
+                .map(|b| (b.position, b.velocity))
+                .collect();
+            assert_eq!(before, after, "a refused step changes nothing");
         }
 
-        /// Byte-exact CPU parity over 10 consecutive
-        /// `step_with_bridge` calls (10 frames at 60Hz), validating
-        /// that multi-frame state (body positions, cached_lambda
-        /// warm-start accumulation) stays lock-step with the CPU
-        /// reference across the pipeline.
+        /// The refusal does not depend on the scene: with two bodies far
+        /// apart (no contact for the contact kernel to touch) the world still
+        /// refuses the adapter before anything runs, since the identifier
+        /// names the law, not the contacts of one step.
         #[cfg(feature = "physics-solver")]
         #[test]
-        fn physics_world_step_with_bridge_10_frames_matches_cpu_reference() {
-            use alice_physics::math::{Fix128, Vec3Fix};
-            use alice_physics::solver::{PhysicsWorld, RigidBody};
-
-            let Some(device) = crate::device::test_device() else {
-                return;
-            };
-            let device = std::sync::Arc::new(device);
-            let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
-
-            fn build_world() -> PhysicsWorld {
-                let mut world = PhysicsWorld::new(alice_physics::solver::SolverConfig::default());
-                let radius = Fix128::from_int(1) + Fix128::from_ratio(1, 10);
-                for i in 0..6i64 {
-                    let body = RigidBody::new_dynamic(
-                        Vec3Fix::new(Fix128::from_int(i * 2), Fix128::ZERO, Fix128::ZERO),
-                        Fix128::from_int(1),
-                    );
-                    world.add_body_with_radius(body, radius);
-                }
-                world
-            }
-            let dt = Fix128::from_ratio(1, 60);
-
-            let mut world_cpu = build_world();
-            let mut world_gpu = build_world();
-
-            for frame in 0..10 {
-                world_cpu.step(dt);
-                world_gpu
-                    .step_with_bridge(&mut adapter, dt)
-                    .expect("the adapter computes under this build's semantics");
-
-                // Assert byte-exact match every frame.
-                for (i, (cpu_b, gpu_b)) in world_cpu
-                    .bodies
-                    .iter()
-                    .zip(world_gpu.bodies.iter())
-                    .enumerate()
-                {
-                    assert_eq!(
-                        cpu_b.position.x.hi, gpu_b.position.x.hi,
-                        "frame {frame} body[{i}].position.x.hi drift"
-                    );
-                    assert_eq!(cpu_b.position.x.lo, gpu_b.position.x.lo);
-                    assert_eq!(cpu_b.position.y.hi, gpu_b.position.y.hi);
-                    assert_eq!(cpu_b.position.y.lo, gpu_b.position.y.lo);
-                    assert_eq!(cpu_b.position.z.hi, gpu_b.position.z.hi);
-                    assert_eq!(cpu_b.position.z.lo, gpu_b.position.z.lo);
-                }
-            }
-        }
-
-        /// Byte-exact CPU parity for the "no-collision" degenerate
-        /// case where every constraint's `depth` is exactly zero
-        /// after Stage A. The bridge helper's early-return path
-        /// (`if filtered.is_empty()` inside
-        /// `solve_contact_constraints_with_bridge`) must produce
-        /// state byte-identical to the CPU pipeline's skip.
-        #[cfg(feature = "physics-solver")]
-        #[test]
-        fn physics_world_step_with_bridge_no_contacts_matches_cpu() {
+        fn physics_world_step_with_bridge_no_contacts_is_refused_with_both_ids() {
             use alice_physics::math::{Fix128, Vec3Fix};
             use alice_physics::solver::{PhysicsWorld, RigidBody};
 
@@ -2754,21 +2667,30 @@ mod solver_bridge {
             }
 
             let dt = Fix128::from_ratio(1, 60);
-            let mut world_cpu = build_world();
             let mut world_gpu = build_world();
-            world_cpu.step(dt);
-            world_gpu
-                .step_with_bridge(&mut adapter, dt)
-                .expect("the adapter computes under this build's semantics");
+            let before: Vec<_> = world_gpu
+                .bodies
+                .iter()
+                .map(|b| (b.position, b.velocity))
+                .collect();
 
-            for (cpu_b, gpu_b) in world_cpu.bodies.iter().zip(world_gpu.bodies.iter()) {
-                assert_eq!(cpu_b.position.x.hi, gpu_b.position.x.hi);
-                assert_eq!(cpu_b.position.x.lo, gpu_b.position.x.lo);
-                assert_eq!(cpu_b.position.y.hi, gpu_b.position.y.hi);
-                assert_eq!(cpu_b.position.y.lo, gpu_b.position.y.lo);
-                assert_eq!(cpu_b.position.z.hi, gpu_b.position.z.hi);
-                assert_eq!(cpu_b.position.z.lo, gpu_b.position.z.lo);
-            }
+            // The adapter computes the linear contact projection, not the
+            // point-constraint contact of this alice-physics: the world refuses
+            // it with both identifiers, and nothing runs.
+            let err = world_gpu
+                .step_with_bridge(&mut adapter, dt)
+                .expect_err("the adapter does not compute under this build's semantics");
+            assert_eq!(err.bridge, "step_with_bridge");
+            assert_eq!(err.peer, "gpu-solver-bridge");
+            assert_eq!(err.found, super::TRT_SOLVER_ADAPTER_SEMANTICS_ID);
+            assert_eq!(err.expected, alice_physics::PHYSICS_SEMANTICS_ID);
+            assert_ne!(err.found, err.expected);
+            let after: Vec<_> = world_gpu
+                .bodies
+                .iter()
+                .map(|b| (b.position, b.velocity))
+                .collect();
+            assert_eq!(before, after, "a refused step changes nothing");
         }
 
         // -----------------------------------------------------------------
@@ -3459,7 +3381,7 @@ mod solver_bridge {
 }
 
 #[cfg(feature = "physics-solver")]
-pub use solver_bridge::TrtSolverAdapter;
+pub use solver_bridge::{TrtSolverAdapter, TRT_SOLVER_ADAPTER_SEMANTICS_ID};
 
 // ============================================================================
 // Fix128Gpu ↔ ALICE-Physics scalar operations bridge (v1.0.1)
