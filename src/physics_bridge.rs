@@ -1521,7 +1521,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             let positions = vec![
                 [
@@ -1571,7 +1571,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             let positions = vec![
@@ -1674,7 +1674,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Simple deterministic gravity (avoids the non-deterministic
@@ -1764,7 +1764,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             let gravity = [Fix128::ZERO, Fix128::NEG_ONE, Fix128::ZERO];
@@ -1867,7 +1867,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Two bodies on the X axis; rest length = 2, initial d = 4.
@@ -1931,7 +1931,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Three bodies roughly in an equilateral triangle;
@@ -1993,7 +1993,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             assert_eq!(adapter.distance_constraint_count(), 0);
             assert!(!adapter.has_distance_constraints());
@@ -2025,7 +2025,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             assert!(adapter.parallel_dispatch_enabled());
             adapter.set_parallel_dispatch(false);
@@ -2049,7 +2049,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             let positions = vec![
                 [Fix128::ZERO, Fix128::ZERO, Fix128::ZERO],
@@ -2116,7 +2116,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             // 4-body chain, initial spacing 3 m, rest length 2 m.
             let initial_positions = vec![
@@ -2223,7 +2223,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             // 4-body chain, initial spacing 3 m, rest length 2 m —
             // constraints should pull each pair closer to 2 m.
@@ -2275,7 +2275,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             adapter.push_distance_constraint(0, 1, Fix128::from_int(2));
             adapter.clear_distance_constraints();
@@ -2327,7 +2327,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
@@ -2500,7 +2500,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
             let mut adapter_batched = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
@@ -2585,7 +2585,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Build a chain-6 fixture (bodies at x = 0, 2, 4, 6, 8, 10;
@@ -2645,7 +2645,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
             let mut adapter = TrtSolverAdapter::new(std::sync::Arc::clone(&device));
 
             // Two bodies far apart → no collision → contact_constraints
@@ -2767,7 +2767,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
             let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
@@ -2880,7 +2880,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
             let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
@@ -2990,7 +2990,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             let warm_start_factor = Fix128::from_ratio(85, 100);
             let w_sum_epsilon = Fix128::from_raw(0, 0x0000_0100_0000_0000);
@@ -3177,7 +3177,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             let dt = Fix128::from_ratio(1, 60);
 
@@ -3251,7 +3251,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             let dt = Fix128::from_ratio(1, 60);
             let cpu_positions = vec![
@@ -3322,7 +3322,7 @@ mod solver_bridge {
             let Some(device) = crate::device::test_device() else {
                 return;
             };
-            let (device, _gpu_lock) = device.shared();
+            let device = device.shared();
 
             let dt = Fix128::from_ratio(1, 60);
             let cpu_positions = vec![

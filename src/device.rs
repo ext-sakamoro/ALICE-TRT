@@ -212,9 +212,12 @@ impl std::fmt::Display for GpuDevice {
 /// the Windows runner's adapter (`STATUS_ACCESS_VIOLATION` in the WGSL compile
 /// tests, which ran with the default thread count); Apple Metal shows neither.
 /// `scripts/cargo_test_gpu.sh` still passes `--test-threads=1` as well.
+/// The lock [`test_device`] holds for as long as a test keeps its device
+#[cfg(test)]
+static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 pub(crate) fn test_device() -> Option<TestDevice> {
-    static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // a test that panicked while holding the device leaves the lock poisoned; the next test still runs
     let lock = GPU_TESTS
         .lock()
@@ -254,15 +257,31 @@ pub(crate) struct TestDevice {
 
 #[cfg(all(test, feature = "physics-solver"))]
 impl TestDevice {
-    /// The device in an `Arc` for code that takes shared ownership, and the
-    /// lock, which the test keeps until it is done with the device
-    pub(crate) fn shared(
-        self,
-    ) -> (
-        std::sync::Arc<GpuDevice>,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
-        (std::sync::Arc::new(self.device), self._lock)
+    /// The device in an `Arc` for code that takes shared ownership, still
+    /// holding the lock; the `Arc` is dropped before the lock is released
+    pub(crate) fn shared(self) -> SharedTestDevice<GpuDevice> {
+        SharedTestDevice {
+            device: std::sync::Arc::new(self.device),
+            _lock: self._lock,
+        }
+    }
+}
+
+/// [`TestDevice::shared`]: the device in an `Arc` and the lock, in that field
+/// order so the `Arc` is dropped first (a tuple bound as `let (device, lock)`
+/// would release the lock first, the bindings drop in reverse order)
+#[cfg(all(test, feature = "physics-solver"))]
+pub(crate) struct SharedTestDevice<D> {
+    device: std::sync::Arc<D>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, feature = "physics-solver"))]
+impl<D> std::ops::Deref for SharedTestDevice<D> {
+    type Target = std::sync::Arc<D>;
+
+    fn deref(&self) -> &std::sync::Arc<D> {
+        &self.device
     }
 }
 
@@ -313,6 +332,35 @@ mod test_device_lock_tests {
             MOST.load(Ordering::SeqCst),
             1,
             "devices were held at the same time"
+        );
+    }
+
+    /// The shared form keeps the same guarantee: its `Arc` is dropped while
+    /// the lock is still held. The device is a probe whose drop checks that the
+    /// lock cannot be taken (a field order that released the lock first fails
+    /// here every time, not only when another test happens to be waiting)
+    #[cfg(feature = "physics-solver")]
+    #[test]
+    fn a_shared_device_is_dropped_before_the_lock_is_released() {
+        struct Probe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let held = super::GPU_TESTS.try_lock().is_err();
+                self.0.store(held, Ordering::SeqCst);
+            }
+        }
+        let checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shared = super::SharedTestDevice {
+            device: std::sync::Arc::new(Probe(std::sync::Arc::clone(&checked))),
+            _lock: super::GPU_TESTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        };
+        let _ = &**shared;
+        drop(shared);
+        assert!(
+            checked.load(Ordering::SeqCst),
+            "the lock was released while the device was still alive"
         );
     }
 }
