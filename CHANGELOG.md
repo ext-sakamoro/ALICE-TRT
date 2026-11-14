@@ -67,6 +67,7 @@ release-quality signal for the Tier A/B/S/C progression on 2026-07-08.
 
 ### Changed
 
+- 依存: alice-db を 0.7 に (要求 "0.7"、Cargo.lock は f717243) 併せて lock の alice-sdf (24b7fc6)、alice-zip (0.12、95ef35a)、alice-serial (38f306c)、alice-physics (5e23fdf) を各 main に取り直した alice-det-math は 1 つ
 - **Contact solve kernels follow alice-physics 1.2.0.** Both
   `FIX128_PGS_CONTACT_SOLVE_WGSL` and `FIX128_PGS_CONTACT_SOLVE_BATCHED_WGSL`
   now compute the accumulated contact multiplier

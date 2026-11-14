@@ -19,8 +19,8 @@ dependencies = [
 
 [[package]]
 name = "alice-db"
-version = "0.6.0"
-source = "git+https://github.com/ext-sakamoro/ALICE-DB?branch=main#06cc2af6d2ed1c3722a906ec8169cdecb41beef0"
+version = "0.7.2"
+source = "git+https://github.com/ext-sakamoro/ALICE-DB?branch=main#f717243f9c4045be8df5748271cb231f948cc972"
 dependencies = [
  "alice-det-math",
  "alice-serial",
@@ -60,7 +60,7 @@ dependencies = [
 [[package]]
 name = "alice-physics"
 version = "4.0.0"
-source = "git+https://github.com/ext-sakamoro/ALICE-Physics?branch=main#b659d502071cd058a977058ca9d006242c5c1a99"
+source = "git+https://github.com/ext-sakamoro/ALICE-Physics?branch=main#5e23fdf18315958031418d20111779a9faf2170a"
 dependencies = [
  "alice-physics-core",
 ]
@@ -68,7 +68,7 @@ dependencies = [
 [[package]]
 name = "alice-physics-core"
 version = "4.0.0"
-source = "git+https://github.com/ext-sakamoro/ALICE-Physics?branch=main#b659d502071cd058a977058ca9d006242c5c1a99"
+source = "git+https://github.com/ext-sakamoro/ALICE-Physics?branch=main#5e23fdf18315958031418d20111779a9faf2170a"
 dependencies = [
  "alice-det-math",
  "sha2",
@@ -77,7 +77,7 @@ dependencies = [
 [[package]]
 name = "alice-sdf"
 version = "7.0.0"
-source = "git+https://github.com/ext-sakamoro/ALICE-SDF?branch=main#bee9afe46f9491b19d0847074e5d48907f49bfb0"
+source = "git+https://github.com/ext-sakamoro/ALICE-SDF?branch=main#24b7fc689d119792aa4855d357b855c0ba03af8a"
 dependencies = [
  "alice-det-math",
  "alice-zip",
@@ -96,7 +96,7 @@ dependencies = [
 [[package]]
 name = "alice-serial"
 version = "0.2.0"
-source = "git+https://github.com/ext-sakamoro/ALICE-Serial?branch=main#16b34ebcaf3a195fe6500defb4d1e6002cb3d09d"
+source = "git+https://github.com/ext-sakamoro/ALICE-Serial?branch=main#38f306c2a4fc49d2b89f61494a16f1d0b07dc609"
 
 [[package]]
 name = "alice-trt"
@@ -117,8 +117,8 @@ dependencies = [
 
 [[package]]
 name = "alice-zip"
-version = "0.11.0"
-source = "git+https://github.com/ext-sakamoro/ALICE-Zip?branch=main#f1aa51dada9048753bfea387ce4c6f07863d6070"
+version = "0.12.0"
+source = "git+https://github.com/ext-sakamoro/ALICE-Zip?branch=main#95ef35acd5ae33bc1dfceaf4d3b74925c50775a4"
 dependencies = [
  "alice-det-math",
  "flate2",

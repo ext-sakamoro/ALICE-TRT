@@ -40,7 +40,7 @@ bytemuck = { version = "1", features = ["derive"] }
 alice-ml = { version = "0.4.0", git = "https://github.com/ext-sakamoro/ALICE-ML", branch = "main" }
 alice-physics = { version = "4.0.0", git = "https://github.com/ext-sakamoro/ALICE-Physics", branch = "main", optional = true, default-features = false, features = ["std"] }
 alice-sdf = { version = "7.0.0", git = "https://github.com/ext-sakamoro/ALICE-SDF", branch = "main", optional = true, default-features = false }
-alice-db = { version = "0.6.0", git = "https://github.com/ext-sakamoro/ALICE-DB", branch = "main", optional = true, default-features = false, features = ["fs"] }
+alice-db = { version = "0.7", git = "https://github.com/ext-sakamoro/ALICE-DB", branch = "main", optional = true, default-features = false, features = ["fs"] }
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 
 [build-dependencies]
