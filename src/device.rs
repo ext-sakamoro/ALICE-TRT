@@ -205,12 +205,20 @@ impl std::fmt::Display for GpuDevice {
 /// `TRT_TEST_FORCE_NO_ADAPTER` makes the adapter look missing; CI uses it to
 /// check that the requirement actually fails the run.
 ///
-/// Run the tests that take this device one thread at a time
-/// (`--test-threads=1`): devices created from parallel threads hang the tests
-/// on NVIDIA's proprietary Vulkan driver (A6000 and P5000; Apple Metal does
-/// not hang). `scripts/cargo_test_gpu.sh` always serializes them.
+/// The device holds a process-wide lock for as long as the test keeps it, so
+/// tests that take one run one at a time whatever `--test-threads` says:
+/// devices created and used from parallel threads hang the tests on NVIDIA's
+/// proprietary Vulkan driver (A6000 and P5000) and crashed the test process on
+/// the Windows runner's adapter (`STATUS_ACCESS_VIOLATION` in the WGSL compile
+/// tests, which ran with the default thread count); Apple Metal shows neither.
+/// `scripts/cargo_test_gpu.sh` still passes `--test-threads=1` as well.
 #[cfg(test)]
-pub(crate) fn test_device() -> Option<GpuDevice> {
+pub(crate) fn test_device() -> Option<TestDevice> {
+    static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // a test that panicked while holding the device leaves the lock poisoned; the next test still runs
+    let lock = GPU_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let result = if std::env::var_os("TRT_TEST_FORCE_NO_ADAPTER").is_some() {
         Err("adapter hidden by TRT_TEST_FORCE_NO_ADAPTER".to_string())
     } else {
@@ -219,7 +227,10 @@ pub(crate) fn test_device() -> Option<GpuDevice> {
     match result {
         Ok(device) => {
             eprintln!("[gpu] test device acquired");
-            Some(device)
+            Some(TestDevice {
+                device,
+                _lock: lock,
+            })
         }
         Err(e) => {
             assert!(
@@ -229,5 +240,79 @@ pub(crate) fn test_device() -> Option<GpuDevice> {
             eprintln!("[gpu] test skipped: no GPU adapter ({e})");
             None
         }
+    }
+}
+
+/// A test's GPU device and the lock that keeps other tests from using a device
+/// at the same time (see [`test_device`]); the device is dropped before the
+/// lock is released
+#[cfg(test)]
+pub(crate) struct TestDevice {
+    device: GpuDevice,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, feature = "physics-solver"))]
+impl TestDevice {
+    /// The device in an `Arc` for code that takes shared ownership, and the
+    /// lock, which the test keeps until it is done with the device
+    pub(crate) fn shared(
+        self,
+    ) -> (
+        std::sync::Arc<GpuDevice>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        (std::sync::Arc::new(self.device), self._lock)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestDevice {
+    type Target = GpuDevice;
+
+    fn deref(&self) -> &GpuDevice {
+        &self.device
+    }
+}
+
+#[cfg(test)]
+mod test_device_lock_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Tests that take a GPU device never hold one at the same time, whatever
+    /// the harness's thread count: 4 threads each take a device, note how many
+    /// are held at once, and keep it a moment; the most held at once is 1
+    #[test]
+    fn devices_are_held_one_test_at_a_time() {
+        static HELD: AtomicUsize = AtomicUsize::new(0);
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+        let acquired: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    s.spawn(|| {
+                        let Some(device) = super::test_device() else {
+                            return 0;
+                        };
+                        let now = HELD.fetch_add(1, Ordering::SeqCst) + 1;
+                        MOST.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        let _ = device.device();
+                        HELD.fetch_sub(1, Ordering::SeqCst);
+                        1
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("thread")).sum()
+        });
+        if acquired == 0 {
+            eprintln!("[gpu] test skipped: no GPU adapter");
+            return;
+        }
+        assert_eq!(acquired, 4);
+        assert_eq!(
+            MOST.load(Ordering::SeqCst),
+            1,
+            "devices were held at the same time"
+        );
     }
 }

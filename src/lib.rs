@@ -538,7 +538,7 @@ mod tests {
         let Some(device) = crate::device::test_device() else {
             return;
         };
-        let s = format!("{device}");
+        let s = format!("{}", *device);
         assert!(s.contains("ALICE-TRT"));
     }
 
