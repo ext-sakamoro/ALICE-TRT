@@ -35,11 +35,11 @@ pub struct VoiceEmbedding {
 /// Compute mel filter bank center frequencies
 pub fn mel_center_frequencies(n_mels: usize, sample_rate: u32) -> Vec<f32> {
     let f_max = sample_rate as f32 / 2.0;
-    let mel_max = 2595.0 * (1.0 + f_max / 700.0).log10();
+    let mel_max = 2595.0 * alice_det_math::log10(1.0 + f_max / 700.0);
     (0..n_mels)
         .map(|i| {
             let mel = mel_max * (i as f32 + 1.0) / (n_mels as f32 + 1.0);
-            700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
+            700.0 * (alice_det_math::powf(10.0, mel / 2595.0) - 1.0)
         })
         .collect()
 }
@@ -137,14 +137,18 @@ mod tests {
         let silence = vec![0.0f32; 320];
         assert_eq!(frame_energy(&silence), 0.0);
 
-        let tone: Vec<f32> = (0..320).map(|i| (i as f32 * 0.1).sin()).collect();
+        let tone: Vec<f32> = (0..320)
+            .map(|i| alice_det_math::sin(i as f32 * 0.1))
+            .collect();
         assert!(frame_energy(&tone) > 0.0);
     }
 
     #[test]
     fn test_extract_features() {
         let config = MelConfig::default();
-        let samples: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.01).sin()).collect();
+        let samples: Vec<f32> = (0..1600)
+            .map(|i| alice_det_math::sin(i as f32 * 0.01))
+            .collect();
         let features = extract_features(&samples, &config);
         assert!(!features.is_empty());
         assert_eq!(features.len() % 3, 0); // 3 features per frame
@@ -153,7 +157,9 @@ mod tests {
     #[test]
     fn test_gpu_extractor() {
         let mut ext = GpuVoiceExtractor::new(MelConfig::default());
-        let samples: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.01).sin()).collect();
+        let samples: Vec<f32> = (0..1600)
+            .map(|i| alice_det_math::sin(i as f32 * 0.01))
+            .collect();
         let feat = ext.extract(&samples);
         assert!(!feat.is_empty());
         assert_eq!(ext.frames_processed, 1);

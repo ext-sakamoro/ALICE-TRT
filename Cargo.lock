@@ -103,6 +103,7 @@ name = "alice-trt"
 version = "4.0.0"
 dependencies = [
  "alice-db",
+ "alice-det-math",
  "alice-ml",
  "alice-physics",
  "alice-sdf",

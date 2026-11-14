@@ -91,7 +91,7 @@ fn bench_gpu_batch(c: &mut Criterion) {
 
     for batch_size in [1, 4, 16, 64, 256] {
         let input_data: Vec<f32> = (0..batch_size * size)
-            .map(|i| (i as f32 * 0.001).sin())
+            .map(|i| alice_det_math::sin(i as f32 * 0.001))
             .collect();
         let gpu_input = alice_trt::GpuTensor::from_f32(&device, &input_data, &[batch_size, size]);
 

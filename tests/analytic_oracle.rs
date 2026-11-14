@@ -334,7 +334,9 @@ fn voice_features_of_a_pure_tone_match_their_closed_forms() {
     let (f, amp) = (1000.0f64, 0.8f64);
     let n: usize = 16_000; // 1 s
     let tone: Vec<f32> = (0..n)
-        .map(|i| (amp * (2.0 * std::f64::consts::PI * f * i as f64 / sr).sin()) as f32)
+        .map(|i| {
+            (amp * alice_det_math::sin64(2.0 * std::f64::consts::PI * f * i as f64 / sr)) as f32
+        })
         .collect();
     let feats = extract_features(&tone, &cfg);
     // frame count closed form
@@ -369,6 +371,10 @@ fn voice_features_of_a_pure_tone_match_their_closed_forms() {
     assert_eq!(frame_energy(&[]), 0.0);
     // HTK mel centres: m(f_i) = m(f_max) · (i + 1)/(n + 1), strictly increasing, below Nyquist
     let centres = mel_center_frequencies(cfg.n_mels, cfg.sample_rate);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "independent reference: the HTK mel closed form in the platform log10, compared with a tolerance against the alice_det_math path"
+    )]
     let mel = |hz: f64| 2595.0 * (1.0 + hz / 700.0).log10();
     let m_max = mel(sr / 2.0);
     for (i, &c) in centres.iter().enumerate() {
@@ -473,7 +479,7 @@ fn neural_sdf_fit_of_a_unit_sphere_is_within_a_quarter_radius() {
     let rms = (got
         .iter()
         .zip(&truth)
-        .map(|(a, b)| (a - b).powi(2))
+        .map(|(a, b)| (a - b) * (a - b))
         .sum::<f32>()
         / truth.len() as f32)
         .sqrt();

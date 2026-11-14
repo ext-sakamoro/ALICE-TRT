@@ -164,7 +164,7 @@ fn sample_training_data(
     let range = bounds_max - bounds_min;
 
     // Simple deterministic sampling (grid + jitter via hash)
-    let side = (num_samples as f32).cbrt().ceil() as usize;
+    let side = alice_det_math::cbrt(num_samples as f32).ceil() as usize;
     let mut count = 0;
     for iz in 0..side {
         for iy in 0..side {
